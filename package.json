@@ -1,0 +1,19 @@
+{
+  "name": "@ghost/chromium-extension",
+  "version": "0.0.1",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "MV3 extension that lets a ghost drive one tab of the creator's own signed-in Chromium, over a token-paired localhost WebSocket to ghostd.",
+  "files": [
+    "extension",
+    "contrib"
+  ],
+  "scripts": {
+    "build": "true",
+    "typecheck": "true",
+    "test": "true",
+    "install-extension": "bash contrib/install.sh",
+    "smoke": "node contrib/smoke.mjs"
+  }
+}

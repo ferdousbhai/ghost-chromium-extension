@@ -1,0 +1,272 @@
+/**
+ * The code that runs *inside* the creator's pages.
+ *
+ * Strings, evaluated through CDP `Runtime.evaluate`, for the same reason the
+ * Playwright backend keeps its snippets as strings: they are the one part of the
+ * system with a DOM in scope, and quarantining them in a named file beats smearing
+ * `document` through modules that have no business with it.
+ *
+ * **Refs are a JavaScript expando, not a DOM attribute.** The Playwright backend
+ * stamps `data-ghost-ref="e3"` because it owns the browser and the page is
+ * disposable. This one does not: these are the creator's real pages, mid-session,
+ * with their own CSS and their own scripts. Adding an attribute to a live element
+ * can match an attribute selector, trip a MutationObserver, or desync a framework's
+ * vdom. So a ref is `element.__ghostRef = "e3"` — invisible to CSS, invisible to
+ * `outerHTML`, invisible to anything that is not looking for it by name, and gone
+ * the moment the document is replaced. The technique is Playwright's `_ariaRef`,
+ * by way of oh-my-pi's ARIA-snapshot integration.
+ *
+ * Resolution is therefore a linear scan for the expando rather than a selector
+ * match. That is O(nodes) per click, which on a real page is a fraction of a
+ * millisecond and buys immunity to re-renders that move a node without replacing it.
+ *
+ * Every snippet walks open shadow roots. Half the web's buttons live in one.
+ */
+
+/** Wrap a snippet into an expression that actually runs, with its argument inlined. */
+export function callScript(script, arg) {
+  return `(${script})(${arg === undefined ? "" : JSON.stringify(arg)})`;
+}
+
+/** Shared prelude: walk every element in the document, shadow roots included. */
+const WALK = `
+  const ghostWalk = (visit) => {
+    const scan = (root) => {
+      for (const el of root.querySelectorAll("*")) {
+        visit(el);
+        if (el.shadowRoot) scan(el.shadowRoot);
+      }
+    };
+    scan(document);
+  };
+`;
+
+const DESCRIBE = `
+  const ghostDescribe = (el, ref) => {
+    let visible = false;
+    try {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      visible = rect.width > 0 && rect.height > 0
+        && style.visibility !== "hidden" && style.display !== "none";
+    } catch {}
+    const text = (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+    const attr = (name) => el.getAttribute(name) || undefined;
+    return {
+      ref,
+      tag: el.tagName.toLowerCase(),
+      role: attr("role"),
+      name: attr("aria-label") || attr("placeholder") || attr("name") || attr("title"),
+      href: attr("href"),
+      value: typeof el.value === "string" ? el.value.slice(0, 120) : undefined,
+      text: text.slice(0, 160),
+      visible,
+      disabled: el.disabled === true || el.getAttribute("aria-disabled") === "true",
+    };
+  };
+`;
+
+/**
+ * Readable text for the current page, untruncated — the session layer owns the
+ * budget, and it must be the same budget for both backends. Byte-for-byte the
+ * container preference the Playwright backend uses, so `read` returns the same
+ * shape of thing whichever browser the ghost is driving.
+ */
+export const READ_PAGE_SCRIPT = `() => {
+  const pick = document.querySelector("article")
+    || document.querySelector("main")
+    || document.querySelector("[role=main]")
+    || document.body;
+  const raw = pick ? (pick.innerText || pick.textContent || "") : "";
+  const text = raw
+    .replace(/[ \\t\\u00a0]+/g, " ")
+    .replace(/\\n{3,}/g, "\\n\\n")
+    .trim();
+  return { title: document.title || "", url: location.href, text };
+}`;
+
+/**
+ * Find elements by CSS selector, or — when the query is not a selector that matches
+ * anything — by visible text and accessible attributes. Same two-pass strategy and
+ * same "deepest text match only" rule as the Playwright backend, so `e1` means the
+ * same thing to the model in either mode.
+ */
+export const FIND_ELEMENTS_SCRIPT = `({ query, limit }) => {
+  ${WALK}
+  ${DESCRIBE}
+  // Each find is the new truth: drop every ref the last one minted.
+  ghostWalk((el) => { if (el.__ghostRef) delete el.__ghostRef; });
+
+  const results = [];
+  const seen = new Set();
+  const describe = (el) => {
+    if (!el || seen.has(el) || results.length >= limit) return;
+    seen.add(el);
+    const ref = "e" + (results.length + 1);
+    el.__ghostRef = ref;
+    results.push(ghostDescribe(el, ref));
+  };
+
+  let selectorHit = false;
+  try {
+    const nodes = document.querySelectorAll(query);
+    if (nodes.length > 0) {
+      selectorHit = true;
+      for (const node of nodes) describe(node);
+    }
+  } catch {}
+
+  if (!selectorHit) {
+    const needle = query.toLowerCase();
+    const interactive = (el) =>
+      /^(a|button|input|textarea|select|summary|label|option)$/.test(el.tagName.toLowerCase())
+      || el.hasAttribute("role") || el.hasAttribute("onclick");
+    const hits = [];
+
+    ghostWalk((el) => {
+      const own = el.innerText || el.textContent || "";
+      if (!own.toLowerCase().includes(needle)) return;
+      for (const child of el.children) {
+        const childText = child.innerText || child.textContent || "";
+        if (childText.toLowerCase().includes(needle)) return;
+      }
+      hits.push(el);
+    });
+
+    ghostWalk((el) => {
+      const haystack = [
+        el.getAttribute("aria-label"), el.getAttribute("placeholder"),
+        el.getAttribute("title"), el.getAttribute("name"),
+        typeof el.value === "string" ? el.value : null,
+      ].filter(Boolean).join(" ").toLowerCase();
+      if (haystack !== "" && haystack.includes(needle)) hits.push(el);
+    });
+
+    hits.sort((left, right) => Number(interactive(right)) - Number(interactive(left)));
+    for (const el of hits) describe(el);
+  }
+
+  return results;
+}`;
+
+/**
+ * Resolve a ref or selector to a viewport point that a real mouse event can land
+ * on, and say precisely why not when there isn't one.
+ *
+ * The hit test is the part that earns its keep. Dispatching a trusted click at an
+ * element's centre is only correct if that centre is *actually* the element —
+ * `elementFromPoint` catches the cookie banner, the sticky header, and the
+ * transparent overlay that would otherwise swallow the click and leave the ghost
+ * insisting it pressed the button. The rect is clipped to the viewport first, so a
+ * half-scrolled element still yields a usable point, and a `contains` in either
+ * direction is accepted, which is what makes `<button><svg>` and label-wraps-input
+ * work. Ported from oh-my-pi's `isClickActionable`.
+ */
+export const RESOLVE_SCRIPT = `({ ref, selector, clickable }) => {
+  ${WALK}
+  let el = null;
+  if (ref) {
+    ghostWalk((node) => { if (!el && node.__ghostRef === ref) el = node; });
+    if (!el) return { found: false, reason: "stale-ref" };
+  } else {
+    try { el = document.querySelector(selector); } catch { return { found: false, reason: "bad-selector" }; }
+    if (!el) {
+      ghostWalk((node) => {
+        if (el || !node.shadowRoot) return;
+        try { el = node.shadowRoot.querySelector(selector); } catch {}
+      });
+    }
+    if (!el) return { found: false, reason: "no-match" };
+  }
+
+  // The nearest thing that is actually clickable: a text node's parent span is a
+  // match, but it is not the button the model meant.
+  if (clickable) {
+    const target = el.closest
+      && el.closest('a,button,[role="button"],[role="link"],input,textarea,select,summary,label,[onclick]');
+    if (target) el = target;
+  }
+
+  // One instant scroll, not scrollIntoViewIfNeeded: an IntersectionObserver-based
+  // wait can hang forever on a page that never stops animating.
+  try { el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" }); } catch {}
+
+  const tag = el.tagName.toLowerCase();
+  const style = window.getComputedStyle(el);
+  if (style.display === "none") return { found: true, actionable: false, reason: "display:none", tag };
+  if (style.visibility === "hidden") return { found: true, actionable: false, reason: "visibility:hidden", tag };
+  if (style.pointerEvents === "none") return { found: true, actionable: false, reason: "pointer-events:none", tag };
+  if (Number(style.opacity) === 0) return { found: true, actionable: false, reason: "opacity:0", tag };
+
+  const rect = el.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) return { found: true, actionable: false, reason: "zero-size", tag };
+  const left = Math.max(0, Math.min(window.innerWidth, rect.left));
+  const right = Math.max(0, Math.min(window.innerWidth, rect.right));
+  const top = Math.max(0, Math.min(window.innerHeight, rect.top));
+  const bottom = Math.max(0, Math.min(window.innerHeight, rect.bottom));
+  if (right - left < 1 || bottom - top < 1) {
+    return { found: true, actionable: false, reason: "off-viewport", tag };
+  }
+  const x = Math.floor((left + right) / 2);
+  const y = Math.floor((top + bottom) / 2);
+  if (clickable) {
+    const topEl = document.elementFromPoint(x, y);
+    if (!topEl) return { found: true, actionable: false, reason: "nothing-at-point", tag };
+    const hit = topEl === el || el.contains(topEl) || topEl.contains(el);
+    if (!hit) {
+      const blocker = topEl.tagName.toLowerCase()
+        + (topEl.id ? "#" + topEl.id : "")
+        + (topEl.className && typeof topEl.className === "string"
+          ? "." + topEl.className.trim().split(/\\s+/).slice(0, 2).join(".") : "");
+      return { found: true, actionable: false, reason: "obscured by " + blocker, tag };
+    }
+  }
+  return { found: true, actionable: true, x, y, tag };
+}`;
+
+/**
+ * Focus a field and empty it, the way a framework will believe.
+ *
+ * `el.value = ""` fires no event, so a controlled React/Vue input snaps straight
+ * back to its old value on the next render. Going through the prototype's native
+ * setter and dispatching `input` is the shape those frameworks listen for.
+ */
+export const FOCUS_AND_CLEAR_SCRIPT = `({ ref, selector }) => {
+  ${WALK}
+  let el = null;
+  if (ref) {
+    ghostWalk((node) => { if (!el && node.__ghostRef === ref) el = node; });
+  } else {
+    try { el = document.querySelector(selector); } catch { return { found: false, reason: "bad-selector" }; }
+    if (!el) {
+      ghostWalk((node) => {
+        if (el || !node.shadowRoot) return;
+        try { el = node.shadowRoot.querySelector(selector); } catch {}
+      });
+    }
+  }
+  if (!el) return { found: false, reason: ref ? "stale-ref" : "no-match" };
+
+  const tag = el.tagName.toLowerCase();
+  if (tag === "select") {
+    return { found: true, editable: false, reason: "select", tag };
+  }
+  try { el.focus({ preventScroll: false }); } catch {}
+  if (document.activeElement !== el && !el.isContentEditable) {
+    return { found: true, editable: false, reason: "not-focusable", tag };
+  }
+
+  if (typeof el.value === "string") {
+    const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) setter.call(el, "");
+    else el.value = "";
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  } else if (el.isContentEditable) {
+    el.textContent = "";
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  } else {
+    return { found: true, editable: false, reason: "not-a-field", tag };
+  }
+  return { found: true, editable: true, tag };
+}`;

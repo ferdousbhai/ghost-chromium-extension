@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Ghost browser relay",
+  "version": "0.0.1",
+  "description": "Lets a ghost running in ghostd drive the tabs of this browser — the one you are already signed into.",
+  "minimum_chrome_version": "125",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "storage",
+    "alarms"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Ghost browser relay",
+    "default_popup": "popup.html"
+  }
+}
