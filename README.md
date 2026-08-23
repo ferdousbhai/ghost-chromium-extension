@@ -61,10 +61,12 @@ The token lives at `$XDG_STATE_HOME/ghost/relay-token` (default
 
 ## The security model
 
-The daemon's other routes have no auth at all — anything that can reach
-`127.0.0.1:7717` is already you. The relay cannot borrow that reasoning, because
-the peer is a *browser*, and a browser runs code written by strangers. Any page
-you visit can open `ws://127.0.0.1:7717/relay`. So:
+The daemon's other routes have their own bearer token, read from a `0600` file
+by clients that can read files (CONTRACTS.md). The relay cannot borrow that
+secret, because the peer is a *browser*: pairing means pasting a token into an
+extension popup, which puts it somewhere you do not fully control, and a leak
+there must not also hand out the API. Any page you visit can open
+`ws://127.0.0.1:7717/relay`. So the relay gets a second token of its own:
 
 | Gate | Stops |
 | --- | --- |
