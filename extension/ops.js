@@ -197,7 +197,7 @@ async function adoptExistingAttachment(tabId) {
     return false;
   }
   const target = targets.find((entry) => entry.tabId === tabId);
-  if (!target || target.attached !== true) return false;
+  if (target?.attached !== true) return false;
   try {
     // `sendCommand` succeeds only if this extension is the attached client, and
     // re-enabling Page is idempotent, so it doubles as re-arming dialog handling.
@@ -411,7 +411,7 @@ async function resolveTarget(args, timeoutMs, { clickable }) {
     timeoutMs,
     "locating the element",
   );
-  if (!found || found.found !== true) {
+  if (found?.found !== true) {
     const reason = found?.reason ?? "no-match";
     if (reason === "stale-ref") {
       throw failed(
