@@ -38,6 +38,15 @@ let reconnectDelay = RECONNECT_MIN_MS;
 let pingTimer = null;
 /** The last refusal from the daemon, so the popup can explain itself. */
 let lastError = "";
+/**
+ * Latched when the daemon's `welcome` reports a protocol version this extension
+ * cannot speak. A mismatch does not heal by dialing again — the socket opens
+ * fine every time and only the `welcome` reveals the problem — so retrying is a
+ * permanent 1s reconnect storm. While latched, every reconnect is suppressed;
+ * it is cleared only when the settings change or the extension is re-installed
+ * (either can mean a fixed daemon or a fixed extension).
+ */
+let protocolIncompatible = false;
 
 async function loadSettings() {
   const stored = await chrome.storage.local
@@ -82,12 +91,20 @@ async function refreshBadge() {
 // ------------------------------------------------------------------ the socket
 
 function scheduleReconnect() {
+  if (protocolIncompatible) {
+    // A version mismatch will not fix itself by dialing again. Sit tight until
+    // the creator updates one side and the settings change (or reinstall) clears
+    // the latch, rather than reconnecting every second forever.
+    void setBadge("off");
+    return;
+  }
   const delay = reconnectDelay;
   reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
   setTimeout(() => void connect(), delay);
 }
 
 async function connect() {
+  if (protocolIncompatible) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   const settings = await loadSettings();
   if (!settings.token) {
@@ -113,7 +130,9 @@ async function connect() {
   ws = socket;
 
   socket.onopen = () => {
-    reconnectDelay = RECONNECT_MIN_MS;
+    // The backoff is NOT reset here: a socket opens even against a daemon whose
+    // protocol we cannot speak, and resetting now is exactly what turns that into
+    // a 1s storm. It is reset only once `welcome` is accepted (see handleFrame).
     lastError = "";
     send({
       t: "hello",
@@ -167,11 +186,17 @@ async function handleFrame(raw) {
   }
   if (frame?.t === "welcome") {
     if (frame.protocol !== PROTOCOL_VERSION) {
+      protocolIncompatible = true;
       lastError =
         `ghostd speaks relay protocol ${frame.protocol}; this extension speaks `
         + `${PROTOCOL_VERSION}. Update whichever is older.`;
       ws?.close(4000, lastError);
+      return;
     }
+    // A compatible daemon has greeted us: only now is the connection truly good,
+    // so only now is the backoff safe to reset.
+    protocolIncompatible = false;
+    reconnectDelay = RECONNECT_MIN_MS;
     return;
   }
   if (frame?.t !== "req" || typeof frame.id !== "number") return;
@@ -212,7 +237,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.port || changes.token) {
-    // Re-dial with the new settings rather than waiting for the next alarm.
+    // Re-dial with the new settings rather than waiting for the next alarm. New
+    // settings can mean a fixed daemon, so clear the protocol latch and give it
+    // a fresh chance.
+    protocolIncompatible = false;
     ws?.close(1000, "settings changed");
     ws = null;
     reconnectDelay = RECONNECT_MIN_MS;
@@ -225,7 +253,12 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-chrome.runtime.onInstalled.addListener(() => void connect());
+chrome.runtime.onInstalled.addListener(() => {
+  // A fresh install or update may speak a new protocol version; clear any latch
+  // from a prior version so it can greet the daemon again.
+  protocolIncompatible = false;
+  void connect();
+});
 chrome.runtime.onStartup.addListener(() => void connect());
 
 /** The popup asks for state rather than reaching into the worker's variables. */

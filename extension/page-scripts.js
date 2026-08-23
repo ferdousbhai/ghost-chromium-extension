@@ -6,19 +6,31 @@
  * system with a DOM in scope, and quarantining them in a named file beats smearing
  * `document` through modules that have no business with it.
  *
- * **Refs are a JavaScript expando, not a DOM attribute.** The Playwright backend
- * stamps `data-ghost-ref="e3"` because it owns the browser and the page is
- * disposable. This one does not: these are the creator's real pages, mid-session,
- * with their own CSS and their own scripts. Adding an attribute to a live element
- * can match an attribute selector, trip a MutationObserver, or desync a framework's
- * vdom. So a ref is `element.__ghostRef = "e3"` — invisible to CSS, invisible to
- * `outerHTML`, invisible to anything that is not looking for it by name, and gone
- * the moment the document is replaced. The technique is Playwright's `_ariaRef`,
- * by way of oh-my-pi's ARIA-snapshot integration.
+ * **These snippets run in a per-frame *isolated world*, not the page's main
+ * world.** `ops.js` creates one with `Page.createIsolatedWorld` and evaluates
+ * every snippet against its `executionContextId`. That is a separate JavaScript
+ * realm sharing the same DOM: `document.querySelectorAll`, `elementFromPoint`,
+ * `getBoundingClientRect`, `getComputedStyle`, the `HTMLInputElement.prototype`
+ * value setter — all resolve to the browser's native implementations, which the
+ * page cannot override for us. A hostile page can no longer redefine those to
+ * spoof the hit-test or feed a forged `location`/`title` to the model. The whole
+ * safety of the actionability probe depends on this isolation.
  *
- * Resolution is therefore a linear scan for the expando rather than a selector
- * match. That is O(nodes) per click, which on a real page is a fraction of a
- * millisecond and buys immunity to re-renders that move a node without replacing it.
+ * **Refs live in a `WeakMap` inside that isolated world, not on the elements.**
+ * Earlier this file stamped `element.__ghostRef = "e3"`, a property the page
+ * could both read and *write* — so a page could stamp `__ghostRef="e1"` on a
+ * decoy and steal the next click. The ref table is now `globalThis.__ghostRegistry`
+ * in the isolated world (`byEl`: element → ref, `byRef`: ref → weak element +
+ * descriptor). The page's realm has no handle to that global, so it cannot forge,
+ * read, or overwrite a ref. Nothing is written onto the creator's elements at all,
+ * so there is also nothing for a CSS selector, a `MutationObserver`, or a
+ * framework vdom to trip over. The technique is Playwright's `_ariaRef`, by way of
+ * oh-my-pi, hardened into the isolated world.
+ *
+ * Resolution goes straight through `byRef` (a `WeakRef`), then verifies the node
+ * is still the exact one `find` minted the ref for and still the tag it described,
+ * before anyone acts on it — defense in depth against a re-render repurposing a
+ * surviving node.
  *
  * Every snippet walks open shadow roots. Half the web's buttons live in one.
  */
@@ -67,6 +79,36 @@ const DESCRIBE = `
 `;
 
 /**
+ * The ref table, living on the isolated world's own global. The page's realm
+ * cannot reach `globalThis` here, so it can neither read a ref nor forge one.
+ * `byEl` maps element → ref (so `find` never mints two refs for one node);
+ * `byRef` maps ref → { weak element, descriptor } for O(1), verified resolution.
+ */
+const REGISTRY = `
+  const ghostRegistry = () => {
+    let reg = globalThis.__ghostRegistry;
+    if (!reg || reg.v !== 1) {
+      reg = { v: 1, byEl: new WeakMap(), byRef: new Map() };
+      globalThis.__ghostRegistry = reg;
+    }
+    return reg;
+  };
+  const ghostResolveRef = (ref) => {
+    const reg = ghostRegistry();
+    const entry = reg.byRef.get(ref);
+    if (!entry) return null;
+    const el = entry.el.deref();
+    // The node must still be alive, still carry this exact ref, and still be the
+    // tag find described. A page cannot forge an entry here — the table is in
+    // this isolated world — but a genuine re-render can repurpose a surviving
+    // node, and that must read as a stale ref, not a hijacked click.
+    if (!el || reg.byEl.get(el) !== ref) return null;
+    if (el.tagName.toLowerCase() !== entry.tag) return null;
+    return el;
+  };
+`;
+
+/**
  * Readable text for the current page, untruncated — the session layer owns the
  * budget, and it must be the same budget for both backends. Byte-for-byte the
  * container preference the Playwright backend uses, so `read` returns the same
@@ -94,8 +136,13 @@ export const READ_PAGE_SCRIPT = `() => {
 export const FIND_ELEMENTS_SCRIPT = `({ query, limit }) => {
   ${WALK}
   ${DESCRIBE}
-  // Each find is the new truth: drop every ref the last one minted.
-  ghostWalk((el) => { if (el.__ghostRef) delete el.__ghostRef; });
+  ${REGISTRY}
+  // Each find is the new truth: replace the whole table so a ref the last find
+  // minted can never resolve again. It lives in this isolated world, so the page
+  // cannot pre-seed a ref to steal a later click.
+  const reg = ghostRegistry();
+  reg.byEl = new WeakMap();
+  reg.byRef = new Map();
 
   const results = [];
   const seen = new Set();
@@ -103,8 +150,10 @@ export const FIND_ELEMENTS_SCRIPT = `({ query, limit }) => {
     if (!el || seen.has(el) || results.length >= limit) return;
     seen.add(el);
     const ref = "e" + (results.length + 1);
-    el.__ghostRef = ref;
-    results.push(ghostDescribe(el, ref));
+    const described = ghostDescribe(el, ref);
+    reg.byEl.set(el, ref);
+    reg.byRef.set(ref, { el: new WeakRef(el), tag: described.tag, text: described.text });
+    results.push(described);
   };
 
   let selectorHit = false;
@@ -164,9 +213,10 @@ export const FIND_ELEMENTS_SCRIPT = `({ query, limit }) => {
  */
 export const RESOLVE_SCRIPT = `({ ref, selector, clickable }) => {
   ${WALK}
+  ${REGISTRY}
   let el = null;
   if (ref) {
-    ghostWalk((node) => { if (!el && node.__ghostRef === ref) el = node; });
+    el = ghostResolveRef(ref);
     if (!el) return { found: false, reason: "stale-ref" };
   } else {
     try { el = document.querySelector(selector); } catch { return { found: false, reason: "bad-selector" }; }
@@ -233,9 +283,10 @@ export const RESOLVE_SCRIPT = `({ ref, selector, clickable }) => {
  */
 export const FOCUS_AND_CLEAR_SCRIPT = `({ ref, selector }) => {
   ${WALK}
+  ${REGISTRY}
   let el = null;
   if (ref) {
-    ghostWalk((node) => { if (!el && node.__ghostRef === ref) el = node; });
+    el = ghostResolveRef(ref);
   } else {
     try { el = document.querySelector(selector); } catch { return { found: false, reason: "bad-selector" }; }
     if (!el) {

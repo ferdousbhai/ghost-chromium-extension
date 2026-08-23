@@ -52,6 +52,13 @@ const state = {
   /** Set when attach failed or the creator dismissed the debugger banner. */
   banned: false,
   attaching: null,
+  /**
+   * The `executionContextId` of the per-frame isolated world every page snippet
+   * runs in. Kept across ops so the ref table (which lives on that world's
+   * global) survives from `find` to the `click`/`type` that uses its refs. Reset
+   * to null whenever the world is gone: a navigation, a detach, a new tab.
+   */
+  worldContextId: null,
 };
 
 /** Where the ghost's tab id survives a service-worker restart. */
@@ -76,6 +83,7 @@ function rememberTab(tabId) {
   state.tabId = tabId;
   state.attached = false;
   state.banned = false;
+  state.worldContextId = null;
   void chrome.storage.session.set({ [SESSION_KEY]: tabId }).catch(() => {});
 }
 
@@ -84,6 +92,7 @@ function forgetTab() {
   state.attached = false;
   state.banned = false;
   state.attaching = null;
+  state.worldContextId = null;
   void chrome.storage.session.remove(SESSION_KEY).catch(() => {});
 }
 
@@ -121,6 +130,7 @@ export function installOpsListeners(onNotice) {
     if (source.tabId !== state.tabId) return;
     state.attached = false;
     state.attaching = null;
+    state.worldContextId = null;
     // Any detach is a ban until the tab navigates. Re-attaching immediately would
     // fight the creator for the banner they just dismissed.
     state.banned = true;
@@ -129,6 +139,13 @@ export function installOpsListeners(onNotice) {
 
   chrome.debugger.onEvent.addListener((source, method, params) => {
     if (source.tabId !== state.tabId) return;
+    if (method === "Page.frameNavigated" && !params?.frame?.parentId) {
+      // A main-frame navigation tears down our isolated world and every ref in
+      // it. Drop the cached context id so the next evaluate builds a fresh one
+      // (and a fresh, empty ref table) rather than talking to a dead context.
+      state.worldContextId = null;
+      return;
+    }
     if (method !== "Page.javascriptDialogOpening") return;
     // With `Page.enable` on, Chrome hands dialogs to the debugger instead of the
     // creator, and an unanswered one wedges the renderer forever. Dismiss —
@@ -163,6 +180,34 @@ function requireTab() {
   return state.tabId;
 }
 
+/**
+ * A debugger session can outlive the service-worker instance that opened it,
+ * because Chrome tracks the attachment per-extension. After the worker is reaped
+ * and respawned, `getTargets()` can still report our tab as `attached` while our
+ * in-memory `state.attached` has been reset to false — and re-attaching over that
+ * throws and bans the tab. Prove the surviving session is *ours* with one command
+ * and adopt it; if another extension or DevTools holds it, fall through to a
+ * normal attach (which fails loudly, as it should).
+ */
+async function adoptExistingAttachment(tabId) {
+  let targets;
+  try {
+    targets = await chrome.debugger.getTargets();
+  } catch {
+    return false;
+  }
+  const target = targets.find((entry) => entry.tabId === tabId);
+  if (!target || target.attached !== true) return false;
+  try {
+    // `sendCommand` succeeds only if this extension is the attached client, and
+    // re-enabling Page is idempotent, so it doubles as re-arming dialog handling.
+    await chrome.debugger.sendCommand({ tabId }, "Page.enable", {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function ensureAttached() {
   const tabId = requireTab();
   if (state.attached) return tabId;
@@ -190,6 +235,15 @@ async function ensureAttached() {
     return tabId;
   }
   state.attaching = (async () => {
+    // A `chrome.debugger` session is attached per-extension, not per-worker, so
+    // it can outlive the service-worker instance that opened it. After a worker
+    // restart `state.attached` is false but Chrome still lists us as attached;
+    // a plain `attach()` would then throw "Another debugger is already attached"
+    // and ban the tab forever. Adopt the surviving session instead.
+    if (await adoptExistingAttachment(tabId)) {
+      state.attached = true;
+      return;
+    }
     await chrome.debugger.attach({ tabId }, CDP_VERSION);
     state.attached = true;
     // Page domain: dialog interception (above) and `Page.stopLoading` recovery.
@@ -199,6 +253,7 @@ async function ensureAttached() {
     await state.attaching;
   } catch (error) {
     state.attached = false;
+    state.worldContextId = null;
     // Any attach failure bans the tab rather than looping: the causes (DevTools,
     // another extension's debugger, a policy-blocked page) do not fix themselves
     // between two retries, and each retry costs the creator a banner flash.
@@ -218,16 +273,63 @@ function cdp(method, params) {
   return chrome.debugger.sendCommand({ tabId: requireTab() }, method, params ?? {});
 }
 
-async function evaluate(script, arg, timeoutMs, what) {
-  const response = await withTimeout(
-    cdp("Runtime.evaluate", {
-      expression: callScript(script, arg),
-      returnByValue: true,
-      awaitPromise: true,
-    }),
-    timeoutMs,
-    what,
-  );
+/**
+ * Get — creating once, then reusing — the isolated world our snippets run in.
+ * `Page.createIsolatedWorld` hands back an `executionContextId` for a realm that
+ * shares the tab's DOM but has its own globals and its own native copies of the
+ * DOM APIs, so a hostile page cannot override `querySelectorAll`/`elementFromPoint`
+ * to spoof the hit-test, and the ref table on its global is out of the page's
+ * reach. The same context is reused across ops so refs survive `find` → `click`.
+ */
+async function ensureIsolatedWorld() {
+  if (state.worldContextId !== null) return state.worldContextId;
+  const tree = await cdp("Page.getFrameTree");
+  const frameId = tree?.frameTree?.frame?.id;
+  if (typeof frameId !== "string") {
+    throw failed(FAILURES.navigationFailed, "The page has no main frame to inspect.");
+  }
+  const world = await cdp("Page.createIsolatedWorld", { frameId, worldName: "ghost-relay" });
+  const contextId = world?.executionContextId;
+  if (typeof contextId !== "number") {
+    throw failed(FAILURES.navigationFailed, "Chromium would not open an isolated world to inspect the page.");
+  }
+  state.worldContextId = contextId;
+  return contextId;
+}
+
+/** Does this rejection mean the isolated world is gone (navigation between ops)? */
+function isStaleWorld(error) {
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  return message.includes("context")
+    && (message.includes("cannot find") || message.includes("not found")
+      || message.includes("destroyed") || message.includes("no longer"));
+}
+
+async function evaluate(script, arg, timeoutMs, what, allowRebuild = true) {
+  const contextId = await ensureIsolatedWorld();
+  let response;
+  try {
+    response = await withTimeout(
+      cdp("Runtime.evaluate", {
+        expression: callScript(script, arg),
+        returnByValue: true,
+        awaitPromise: true,
+        // Pin the evaluation to our isolated world — never the page's main world.
+        contextId,
+      }),
+      timeoutMs,
+      what,
+    );
+  } catch (error) {
+    // A navigation can destroy the world between the `find` and this op; the
+    // frameNavigated hook usually clears it first, but if we raced it, rebuild
+    // the world once and retry so the ghost meets a fresh page, not an error.
+    if (isStaleWorld(error)) {
+      if (state.worldContextId === contextId) state.worldContextId = null;
+      if (allowRebuild) return evaluate(script, arg, timeoutMs, what, false);
+    }
+    throw error;
+  }
   if (response?.exceptionDetails) {
     const text = response.exceptionDetails.exception?.description
       ?? response.exceptionDetails.text
@@ -370,6 +472,9 @@ const ops = {
       // screenshot are allowed to take the creator's focus.
       tab = await chrome.tabs.update(state.tabId, { url }).catch(() => null);
       if (!tab) forgetTab();
+      // Navigating the tab tears down whatever isolated world we had on the old
+      // document, along with its refs.
+      else state.worldContextId = null;
     }
     if (!tab) {
       try {
@@ -546,6 +651,7 @@ export async function releaseTab() {
   }
   state.attached = false;
   state.attaching = null;
+  state.worldContextId = null;
 }
 
 /** Run one op. Throws `RelayOpError` for anything the ghost should be told about. */
