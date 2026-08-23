@@ -12,7 +12,7 @@
   "scripts": {
     "build": "true",
     "typecheck": "true",
-    "test": "true",
+    "test": "node --test test/*.test.mjs",
     "install-extension": "bash contrib/install.sh",
     "smoke": "node contrib/smoke.mjs"
   }

@@ -34,6 +34,15 @@ const RECONNECT_MAX_MS = 10_000;
 const KEEPALIVE_ALARM = "ghost-relay-keepalive";
 
 let ws = null;
+/**
+ * Covers the whole prepare-and-dial sequence, not just `new WebSocket()`. MV3
+ * lifecycle events can call `connect()` together while storage and session
+ * restoration are still awaiting; without this latch each caller reaches the
+ * constructor before any of them assigns `ws`.
+ */
+let connectInFlight = null;
+/** Invalidates settings captured by an attempt that is already awaiting. */
+let connectEpoch = 0;
 let reconnectDelay = RECONNECT_MIN_MS;
 let pingTimer = null;
 /** The last refusal from the daemon, so the popup can explain itself. */
@@ -103,10 +112,11 @@ function scheduleReconnect() {
   setTimeout(() => void connect(), delay);
 }
 
-async function connect() {
+async function connectOnce(epoch) {
   if (protocolIncompatible) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   const settings = await loadSettings();
+  if (epoch !== connectEpoch) return;
   if (!settings.token) {
     lastError = "Not paired yet — run `ghostd relay-token` and paste the token below.";
     await setBadge("off");
@@ -114,6 +124,7 @@ async function connect() {
   }
 
   await restoreTabFromSession();
+  if (epoch !== connectEpoch) return;
 
   // A browser WebSocket cannot set headers, so the token rides in the one field
   // it can set. The daemon accepts it there, or in a query string for non-browser
@@ -175,6 +186,31 @@ async function connect() {
     void releaseTab();
     scheduleReconnect();
   };
+}
+
+function connect() {
+  if (protocolIncompatible) return Promise.resolve();
+  if (connectInFlight !== null) return connectInFlight;
+
+  const epoch = connectEpoch;
+  const attempt = connectOnce(epoch).catch((error) => {
+    // `loadSettings()` and session restoration are expected to contain their
+    // own recoverable failures. Keep this boundary anyway: a future async setup
+    // step must not leave the single-flight latch permanently rejected.
+    if (epoch !== connectEpoch) return;
+    lastError = `Could not prepare the relay connection: ${error?.message ?? error}`;
+    void setBadge("off");
+    scheduleReconnect();
+  });
+  connectInFlight = attempt;
+  void attempt.finally(() => {
+    if (connectInFlight !== attempt) return;
+    connectInFlight = null;
+    // Pairing may have changed while this attempt was awaiting. Its epoch
+    // checks prevent a stale dial; this follow-up uses the latest settings.
+    if (epoch !== connectEpoch) void connect();
+  });
+  return attempt;
 }
 
 async function handleFrame(raw) {
@@ -240,6 +276,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     // Re-dial with the new settings rather than waiting for the next alarm. New
     // settings can mean a fixed daemon, so clear the protocol latch and give it
     // a fresh chance.
+    connectEpoch += 1;
     protocolIncompatible = false;
     ws?.close(1000, "settings changed");
     ws = null;
