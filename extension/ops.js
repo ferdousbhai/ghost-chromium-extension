@@ -597,6 +597,23 @@ async function stopLoading() {
   await cdp("Page.stopLoading").catch(() => {});
 }
 
+/**
+ * Shared body of `back`/`forward`: run the history move, and report whether it
+ * changed the page. Chrome rejects when there is nowhere to go, which is a
+ * `moved: false` answer rather than a failure.
+ */
+async function historyNav(tabId, timeoutMs, navigate) {
+  const before = await summary();
+  try {
+    await navigate(tabId);
+  } catch {
+    return { page: before, moved: false };
+  }
+  await settle(tabId, timeoutMs);
+  const after = await summary();
+  return { page: after, moved: after.url !== before.url };
+}
+
 async function resolveTarget(args, timeoutMs, { clickable }) {
   const found = await evaluate(
     clickable ? RESOLVE_SCRIPT : FOCUS_AND_CLEAR_SCRIPT,
@@ -821,40 +838,11 @@ const ops = {
   },
 
   async back(_args, timeoutMs) {
-    const tabId = requireTab();
-    const before = await summary();
-    let moved = true;
-    try {
-      await chrome.tabs.goBack(tabId);
-    } catch {
-      // Chrome rejects when there is nothing behind this page. That is an answer,
-      // not a failure — the seam has a `moved: false` for exactly this.
-      moved = false;
-    }
-    if (moved) {
-      await settle(tabId, timeoutMs);
-      const after = await summary();
-      return { page: after, moved: after.url !== before.url };
-    }
-    return { page: before, moved: false };
+    return historyNav(requireTab(), timeoutMs, (id) => chrome.tabs.goBack(id));
   },
 
   async forward(_args, timeoutMs) {
-    // The mirror of `back`, over `chrome.tabs.goForward`.
-    const tabId = requireTab();
-    const before = await summary();
-    let moved = true;
-    try {
-      await chrome.tabs.goForward(tabId);
-    } catch {
-      moved = false;
-    }
-    if (moved) {
-      await settle(tabId, timeoutMs);
-      const after = await summary();
-      return { page: after, moved: after.url !== before.url };
-    }
-    return { page: before, moved: false };
+    return historyNav(requireTab(), timeoutMs, (id) => chrome.tabs.goForward(id));
   },
 
   async scroll(args, timeoutMs) {
@@ -1017,14 +1005,12 @@ const ops = {
       throw failed(FAILURES.invalidInput, "resize needs a positive width and height.");
     }
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    let applied = false;
-    if (tab) {
-      const updated = await chrome.windows
-        .update(tab.windowId, { width, height })
-        .then(() => true)
-        .catch(() => false);
-      applied = updated;
-    }
+    const applied = tab
+      ? await chrome.windows
+          .update(tab.windowId, { width, height })
+          .then(() => true)
+          .catch(() => false)
+      : false;
     return { page: await summary(), applied };
   },
 
