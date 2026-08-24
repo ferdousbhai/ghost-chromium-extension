@@ -321,3 +321,28 @@ export const FOCUS_AND_CLEAR_SCRIPT = `({ ref, selector }) => {
   }
   return { found: true, editable: true, tag };
 }`;
+
+/**
+ * Resolve a ref or selector to *the element itself*, so a caller evaluating this
+ * with `returnByValue: false` gets a CDP `objectId` for the node — which is what
+ * `DOM.setFileInputFiles` needs to set files on a file input. Returns `null` when
+ * nothing matches; the caller turns that into a stale-ref / not-found failure.
+ *
+ * Same isolated-world resolution as the other snippets: a ref goes through the
+ * hardened registry (so the page cannot forge one), a selector is tried against
+ * the document and every open shadow root.
+ */
+export const RESOLVE_NODE_SCRIPT = `({ ref, selector }) => {
+  ${WALK}
+  ${REGISTRY}
+  if (ref) return ghostResolveRef(ref);
+  let el = null;
+  try { el = document.querySelector(selector); } catch { return null; }
+  if (!el) {
+    ghostWalk((node) => {
+      if (el || !node.shadowRoot) return;
+      try { el = node.shadowRoot.querySelector(selector); } catch {}
+    });
+  }
+  return el;
+}`;

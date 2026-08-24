@@ -18,9 +18,17 @@ export const TOKEN_SUBPROTOCOL_PREFIX = "ghost-token.";
 export const RELAY_PATH = "/relay";
 
 /**
- * Every operation this extension will perform. A closed set: there is no "run
- * this script" op, so a daemon that got compromised still cannot execute
- * arbitrary code in the pages you are signed into.
+ * Every operation this extension will perform — a closed set, kept in lockstep
+ * with the daemon's `RELAY_OPS` and its `RelayBrowserBackend` methods (a test in
+ * `packages/daemon/test/relay-extension.test.ts` asserts this array and the ops.js
+ * handlers still agree).
+ *
+ * There is exactly one script-running op, `javascript`, and it is deliberate:
+ * the creator's own ghost, on the creator's own machine, may run page script
+ * through CDP `Runtime.evaluate`. It is the only op that carries a code string;
+ * every other verb is a fixed action the extension implements itself, so a
+ * compromised daemon socket still cannot smuggle script through, say, `find`.
+ * A visitor never reaches this backend at all (the scope locks live daemon-side).
  */
 export const OPS = [
   "status",
@@ -33,6 +41,16 @@ export const OPS = [
   "screenshot",
   "back",
   "close",
+  "forward",
+  "scroll",
+  "drag",
+  "key",
+  "javascript",
+  "console",
+  "network",
+  "upload",
+  "resize",
+  "tabs",
 ];
 
 /**

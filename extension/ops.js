@@ -1,13 +1,14 @@
 /**
- * The eight verbs, against real tabs in the creator's real browser.
+ * The verbs, against real tabs in the creator's real browser.
  *
  * Three rules run through this file.
  *
- * **One tab, and it is ours.** The ghost gets exactly one tab, created on the
- * first `open` and remembered in `chrome.storage.session` so a service-worker
- * restart does not orphan it. It never touches a tab the creator opened. `close`
- * closes that tab and detaches the debugger; it does *not* close the browser,
- * which has the rest of the creator's day in it.
+ * **The ghost owns a set of tabs, and drives one at a time.** The one-tab
+ * invariant is relaxed: `state.tabs` is the set of tab ids the ghost created, and
+ * `state.activeTabId` is the one every page op acts on. Switching tabs just moves
+ * `activeTabId`; the ghost never touches a tab the creator opened. `close` shuts
+ * *all* of the ghost's tabs and detaches; the `tabs` op's `close` shuts one. Neither
+ * closes the browser, which has the rest of the creator's day in it.
  *
  * **`chrome.debugger` is the only way in.** There is no `chrome.scripting`, no
  * content script, and no `host_permissions` in the manifest — which means this
@@ -15,15 +16,15 @@
  * on a page while a `chrome.debugger` session is attached, and Chrome puts its own
  * un-suppressable "is being debugged" banner across the top of any tab in that
  * state. The creator's evidence that the ghost is looking is a browser-drawn
- * banner rather than our promise. (The brief suggested `scripting` + host
- * permissions; this is a deliberate departure, taking oh-my-pi's permission set.)
+ * banner rather than our promise.
  *
- * **Input is real input.** Clicks are `Input.dispatchMouseEvent` at a
- * hit-tested point and typing is `Input.insertText` into a focused field, not
- * `element.click()` and not `element.value = x`. Synthetic DOM events have
- * `isTrusted: false`, which a meaningful number of real sites check, and — more
- * to the point — a ghost that can only drive a page the way a person could is a
- * ghost whose behaviour a person can predict.
+ * **Input is real input.** Clicks, scrolls, drags, and keys go through
+ * `Input.dispatch*` at hit-tested points, not `element.click()` and not
+ * `element.value = x`. The one script-running op, `javascript`, runs in the page's
+ * *main* world through `Runtime.evaluate` — that is the capability; the page and
+ * the value it returns are untrusted data, and the tool description says so. Every
+ * *other* page snippet (find/click/type/resolve, and the upload node lookup) runs
+ * in a hardened isolated world the page cannot reach.
  *
  * The attach state machine (`attached` / `banned` / `attaching`, ban on any attach
  * failure, ban cleared by navigation) is ported from the MIT-licensed
@@ -35,6 +36,7 @@ import {
   FIND_ELEMENTS_SCRIPT,
   FOCUS_AND_CLEAR_SCRIPT,
   READ_PAGE_SCRIPT,
+  RESOLVE_NODE_SCRIPT,
   RESOLVE_SCRIPT,
 } from "./page-scripts.js";
 
@@ -45,9 +47,14 @@ const INELIGIBLE_URL = /^(chrome|devtools|edge|view-source|chrome-extension|chro
 const SETTLE_WATCH_MS = 900;
 /** Chrome's own texture limits; a taller capture comes back blank or fails. */
 const MAX_CAPTURE_PX = 16_384;
+/** How many console / network entries a ring keeps before dropping the oldest. */
+const RING_LIMIT = 200;
 
 const state = {
-  tabId: null,
+  /** The chrome tab ids the ghost owns. Relaxed from the old one-tab invariant. */
+  tabs: new Set(),
+  /** The owned tab every page op acts on, or null when the ghost owns none. */
+  activeTabId: null,
   attached: false,
   /** Set when attach failed or the creator dismissed the debugger banner. */
   banned: false,
@@ -56,52 +63,193 @@ const state = {
    * The `executionContextId` of the per-frame isolated world every page snippet
    * runs in. Kept across ops so the ref table (which lives on that world's
    * global) survives from `find` to the `click`/`type` that uses its refs. Reset
-   * to null whenever the world is gone: a navigation, a detach, a new tab.
+   * to null whenever the world is gone: a navigation, a detach, a new active tab.
    */
   worldContextId: null,
+  /** Whether Runtime/Network/DOM have been enabled on the current attachment. */
+  domainsEnabled: false,
 };
 
-/** Where the ghost's tab id survives a service-worker restart. */
-const SESSION_KEY = "ghostTabId";
+/** Console and network rings, tagged with the tab they came from, drained per op. */
+const consoleRing = [];
+const networkRing = [];
+/** requestId → the ring entry, so a response can fill the request it answered. */
+const netPending = new Map();
+
+/** Where the ghost's tab ids survive a service-worker restart. */
+const SESSION_KEY = "ghostTabs";
+
+function persist() {
+  void chrome.storage.session
+    .set({ [SESSION_KEY]: { tabs: [...state.tabs], active: state.activeTabId } })
+    .catch(() => {});
+}
 
 export async function restoreTabFromSession() {
   try {
     const stored = await chrome.storage.session.get({ [SESSION_KEY]: null });
-    const tabId = stored[SESSION_KEY];
-    if (typeof tabId !== "number") return;
-    // Only adopt it if it is still there. A worker restart plus a closed tab
-    // would otherwise leave us driving a tab id Chrome has reused.
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab) state.tabId = tabId;
-    else await chrome.storage.session.remove(SESSION_KEY);
+    const saved = stored[SESSION_KEY];
+    if (!saved || !Array.isArray(saved.tabs)) return;
+    // Only adopt tabs that still exist. A worker restart plus a closed tab would
+    // otherwise leave us driving a tab id Chrome has reused.
+    for (const id of saved.tabs) {
+      if (typeof id !== "number") continue;
+      const tab = await chrome.tabs.get(id).catch(() => null);
+      if (tab) state.tabs.add(id);
+    }
+    if (state.tabs.has(saved.active)) state.activeTabId = saved.active;
+    else state.activeTabId = state.tabs.values().next().value ?? null;
+    persist();
   } catch {
     // Session storage is a convenience; a fresh `open` recovers either way.
   }
 }
 
-function rememberTab(tabId) {
-  state.tabId = tabId;
-  state.attached = false;
-  state.banned = false;
-  state.worldContextId = null;
-  void chrome.storage.session.set({ [SESSION_KEY]: tabId }).catch(() => {});
-}
-
-function forgetTab() {
-  state.tabId = null;
+/** Reset the attach machinery for a new active tab; the old attachment is left be. */
+function resetAttachment() {
   state.attached = false;
   state.banned = false;
   state.attaching = null;
   state.worldContextId = null;
-  void chrome.storage.session.remove(SESSION_KEY).catch(() => {});
+  state.domainsEnabled = false;
+}
+
+/** Add a tab, make it active, and start fresh on the attach machinery. */
+function rememberTab(tabId) {
+  state.tabs.add(tabId);
+  state.activeTabId = tabId;
+  resetAttachment();
+  persist();
+}
+
+/** Point the ghost at an already-owned tab. */
+function setActive(tabId) {
+  state.activeTabId = tabId;
+  resetAttachment();
+  persist();
+}
+
+/** Drop one tab from the owned set, choosing a new active if it was the active one. */
+function dropTab(tabId) {
+  const wasActive = tabId === state.activeTabId;
+  state.tabs.delete(tabId);
+  if (wasActive) {
+    state.activeTabId = state.tabs.values().next().value ?? null;
+    resetAttachment();
+  }
+  persist();
+}
+
+/** Forget every tab — used by the full-teardown `close` and lost-tab recovery. */
+function forgetTab() {
+  state.tabs.clear();
+  state.activeTabId = null;
+  resetAttachment();
+  persist();
 }
 
 export function currentTabId() {
-  return state.tabId;
+  return state.activeTabId;
 }
 
 export function isAttached() {
   return state.attached;
+}
+
+// ------------------------------------------------------------------- ring buffers
+
+function pushRing(ring, entry) {
+  ring.push(entry);
+  if (ring.length > RING_LIMIT) {
+    const dropped = ring.shift();
+    if (dropped && dropped.__reqId !== undefined) netPending.delete(dropped.__reqId);
+  }
+}
+
+function bufferConsole(tabId, params, isException) {
+  let level = "log";
+  let text = "";
+  let url;
+  let line;
+  if (isException) {
+    level = "error";
+    const details = params?.exceptionDetails ?? {};
+    text = details.exception?.description ?? details.text ?? "Uncaught exception";
+    url = details.url || undefined;
+    line = typeof details.lineNumber === "number" ? details.lineNumber : undefined;
+  } else {
+    level = typeof params?.type === "string" ? params.type : "log";
+    text = (Array.isArray(params?.args) ? params.args : [])
+      .map((arg) => {
+        if (arg == null) return "";
+        if (arg.value !== undefined) return String(arg.value);
+        if (typeof arg.description === "string") return arg.description;
+        if (typeof arg.unserializableValue === "string") return arg.unserializableValue;
+        return arg.type ?? "";
+      })
+      .join(" ");
+    const frame = params?.stackTrace?.callFrames?.[0];
+    if (frame) {
+      url = frame.url || undefined;
+      line = typeof frame.lineNumber === "number" ? frame.lineNumber : undefined;
+    }
+  }
+  pushRing(consoleRing, {
+    tabId,
+    level,
+    text,
+    ...(url ? { url } : {}),
+    ...(line === undefined ? {} : { line }),
+  });
+}
+
+function bufferRequest(tabId, params) {
+  const entry = {
+    tabId,
+    __reqId: params?.requestId,
+    method: params?.request?.method ?? "GET",
+    url: params?.request?.url ?? "",
+    ...(params?.type ? { type: params.type } : {}),
+  };
+  pushRing(networkRing, entry);
+  if (params?.requestId !== undefined) netPending.set(params.requestId, entry);
+}
+
+function fillResponse(params) {
+  const entry = netPending.get(params?.requestId);
+  if (!entry) return;
+  const response = params?.response ?? {};
+  if (typeof response.status === "number") entry.status = response.status;
+  if (!entry.type && params?.type) entry.type = params.type;
+  if (typeof response.encodedDataLength === "number" && response.encodedDataLength > 0) {
+    entry.bodyBytes = response.encodedDataLength;
+  }
+}
+
+function fillFinished(params) {
+  const entry = netPending.get(params?.requestId);
+  if (entry && typeof params?.encodedDataLength === "number" && params.encodedDataLength > 0) {
+    entry.bodyBytes = params.encodedDataLength;
+  }
+  netPending.delete(params?.requestId);
+}
+
+/** Drain a ring of the active tab's entries, stripping the internal bookkeeping. */
+function drainRing(ring) {
+  const active = state.activeTabId;
+  const out = [];
+  const keep = [];
+  for (const entry of ring) {
+    if (entry.tabId === active) {
+      const { tabId, __reqId, ...rest } = entry;
+      out.push(rest);
+    } else {
+      keep.push(entry);
+    }
+  }
+  ring.length = 0;
+  for (const entry of keep) ring.push(entry);
+  return out;
 }
 
 // ------------------------------------------------------------------ listeners
@@ -112,25 +260,25 @@ export function isAttached() {
  */
 export function installOpsListeners(onNotice) {
   chrome.tabs.onRemoved.addListener((tabId) => {
-    if (tabId !== state.tabId) return;
-    forgetTab();
-    onNotice?.("tab_closed", {});
+    if (!state.tabs.has(tabId)) return;
+    dropTab(tabId);
+    onNotice?.("tab_closed", { tabId });
   });
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (tabId !== state.tabId) return;
+    if (tabId !== state.activeTabId) return;
     // A navigation is the one thing that can un-wedge a banned tab: the creator
     // dismissed the debugger banner, the page moved on, and attaching is worth
-    // trying again. oh-my-pi's rule, and it is the difference between "the relay
-    // stopped working forever" and "the relay recovered by itself".
+    // trying again.
     if (changeInfo.url && state.banned) state.banned = false;
   });
 
   chrome.debugger.onDetach.addListener((source, reason) => {
-    if (source.tabId !== state.tabId) return;
+    if (source.tabId !== state.activeTabId) return;
     state.attached = false;
     state.attaching = null;
     state.worldContextId = null;
+    state.domainsEnabled = false;
     // Any detach is a ban until the tab navigates. Re-attaching immediately would
     // fight the creator for the banner they just dismissed.
     state.banned = true;
@@ -138,7 +286,30 @@ export function installOpsListeners(onNotice) {
   });
 
   chrome.debugger.onEvent.addListener((source, method, params) => {
-    if (source.tabId !== state.tabId) return;
+    if (!state.tabs.has(source.tabId)) return;
+    // Console and network events are buffered for any owned tab, so a later
+    // `console`/`network` op on the active tab has something to drain.
+    if (method === "Runtime.consoleAPICalled") {
+      bufferConsole(source.tabId, params, false);
+      return;
+    }
+    if (method === "Runtime.exceptionThrown") {
+      bufferConsole(source.tabId, params, true);
+      return;
+    }
+    if (method === "Network.requestWillBeSent") {
+      bufferRequest(source.tabId, params);
+      return;
+    }
+    if (method === "Network.responseReceived") {
+      fillResponse(params);
+      return;
+    }
+    if (method === "Network.loadingFinished") {
+      fillFinished(params);
+      return;
+    }
+    if (source.tabId !== state.activeTabId) return;
     if (method === "Page.frameNavigated" && !params?.frame?.parentId) {
       // A main-frame navigation tears down our isolated world and every ref in
       // it. Drop the cached context id so the next evaluate builds a fresh one
@@ -174,10 +345,10 @@ function withTimeout(promise, timeoutMs, what) {
 }
 
 function requireTab() {
-  if (state.tabId === null) {
+  if (state.activeTabId === null) {
     throw failed(FAILURES.noPage, "No page is loaded. Use action \"open\" with a URL first.");
   }
-  return state.tabId;
+  return state.activeTabId;
 }
 
 /**
@@ -208,9 +379,28 @@ async function adoptExistingAttachment(tabId) {
   }
 }
 
+/**
+ * Enable the CDP domains the extra capabilities need, once per attachment. Each is
+ * best-effort: a page that refuses one domain should not sink an attach. `Page` is
+ * dialog interception and stop-loading; `Runtime` feeds the console ring and the
+ * isolated-world evaluate; `Network` feeds the network ring; `DOM` backs
+ * `DOM.setFileInputFiles` for uploads.
+ */
+async function enableDomains(tabId) {
+  if (state.domainsEnabled) return;
+  state.domainsEnabled = true;
+  await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
+  await chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {}).catch(() => {});
+  await chrome.debugger.sendCommand({ tabId }, "Network.enable", {}).catch(() => {});
+  await chrome.debugger.sendCommand({ tabId }, "DOM.enable", {}).catch(() => {});
+}
+
 async function ensureAttached() {
   const tabId = requireTab();
-  if (state.attached) return tabId;
+  if (state.attached) {
+    await enableDomains(tabId);
+    return tabId;
+  }
   if (state.banned) {
     throw failed(
       FAILURES.browserUnavailable,
@@ -221,7 +411,7 @@ async function ensureAttached() {
   }
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) {
-    forgetTab();
+    dropTab(tabId);
     throw failed(FAILURES.noPage, "The ghost's tab is gone. Open a page again.");
   }
   if (tab.url && INELIGIBLE_URL.test(tab.url)) {
@@ -242,18 +432,21 @@ async function ensureAttached() {
     // and ban the tab forever. Adopt the surviving session instead.
     if (await adoptExistingAttachment(tabId)) {
       state.attached = true;
+      state.domainsEnabled = false;
+      await enableDomains(tabId);
       return;
     }
     await chrome.debugger.attach({ tabId }, CDP_VERSION);
     state.attached = true;
-    // Page domain: dialog interception (above) and `Page.stopLoading` recovery.
-    await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
+    state.domainsEnabled = false;
+    await enableDomains(tabId);
   })();
   try {
     await state.attaching;
   } catch (error) {
     state.attached = false;
     state.worldContextId = null;
+    state.domainsEnabled = false;
     // Any attach failure bans the tab rather than looping: the causes (DevTools,
     // another extension's debugger, a policy-blocked page) do not fix themselves
     // between two retries, and each retry costs the creator a banner flash.
@@ -343,7 +536,7 @@ async function summary() {
   const tabId = requireTab();
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) {
-    forgetTab();
+    dropTab(tabId);
     throw failed(FAILURES.noPage, "The ghost's tab was closed.");
   }
   return { url: tab.url ?? "", title: tab.title ?? "" };
@@ -431,24 +624,47 @@ async function resolveTarget(args, timeoutMs, { clickable }) {
   return found;
 }
 
+/** The CDP modifier bitmask from names: Alt=1, Ctrl=2, Meta=4, Shift=8. */
+function modifierMask(modifiers) {
+  if (!Array.isArray(modifiers)) return 0;
+  let mask = 0;
+  for (const raw of modifiers) {
+    switch (String(raw).toLowerCase()) {
+      case "alt": mask |= 1; break;
+      case "control": case "ctrl": mask |= 2; break;
+      case "meta": case "command": case "cmd": mask |= 4; break;
+      case "shift": mask |= 8; break;
+    }
+  }
+  return mask;
+}
+
+/** Windows virtual key codes for the non-printable keys worth naming. */
+const VIRTUAL_KEYS = {
+  Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46,
+  ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+  Home: 36, End: 35, PageUp: 33, PageDown: 34, " ": 32,
+};
+
 // --------------------------------------------------------------------- the ops
 
 const ops = {
   async status() {
-    const tabId = state.tabId;
+    const tabId = state.activeTabId;
     const tab = tabId === null ? null : await chrome.tabs.get(tabId).catch(() => null);
     return {
       tab: tab ? { id: tab.id, url: tab.url ?? "", title: tab.title ?? "" } : null,
       attached: state.attached,
       banned: state.banned,
+      tabs: [...state.tabs],
     };
   },
 
   async current() {
-    if (state.tabId === null) return { page: null };
-    const tab = await chrome.tabs.get(state.tabId).catch(() => null);
+    if (state.activeTabId === null) return { page: null };
+    const tab = await chrome.tabs.get(state.activeTabId).catch(() => null);
     if (!tab) {
-      forgetTab();
+      dropTab(state.activeTabId);
       return { page: null };
     }
     const url = tab.url ?? "";
@@ -467,13 +683,12 @@ const ops = {
     }
 
     let tab = null;
-    if (state.tabId !== null) {
-      // Reuse the ghost's tab without raising it: only the first `open` and a
-      // screenshot are allowed to take the creator's focus.
-      tab = await chrome.tabs.update(state.tabId, { url }).catch(() => null);
-      if (!tab) forgetTab();
-      // Navigating the tab tears down whatever isolated world we had on the old
-      // document, along with its refs.
+    if (state.activeTabId !== null) {
+      // Reuse the ghost's active tab without raising it: only the first `open` and
+      // a screenshot are allowed to take the creator's focus.
+      tab = await chrome.tabs.update(state.activeTabId, { url }).catch(() => null);
+      if (!tab) dropTab(state.activeTabId);
+      // Navigating tears down whatever isolated world we had on the old document.
       else state.worldContextId = null;
     }
     if (!tab) {
@@ -486,17 +701,13 @@ const ops = {
         );
       }
       rememberTab(tab.id);
-      // A brand-new tab is a brand-new page: whatever the debugger was attached
-      // to is gone.
-      state.attached = false;
-      state.banned = false;
     }
 
     if (tab.status !== "complete") {
       const loaded = await waitForLoad(tab.id, timeoutMs);
       if (!loaded) await stopLoading();
     }
-    return { page: await summary() };
+    return { page: await summary(), id: String(state.activeTabId) };
   },
 
   async read(_args, timeoutMs) {
@@ -628,30 +839,310 @@ const ops = {
     return { page: before, moved: false };
   },
 
-  async close() {
-    const tabId = state.tabId;
-    if (tabId === null) return { closed: false };
-    if (state.attached) {
-      await chrome.debugger.detach({ tabId }).catch(() => {});
+  async forward(_args, timeoutMs) {
+    // The mirror of `back`, over `chrome.tabs.goForward`.
+    const tabId = requireTab();
+    const before = await summary();
+    let moved = true;
+    try {
+      await chrome.tabs.goForward(tabId);
+    } catch {
+      moved = false;
     }
-    const removed = await chrome.tabs
-      .remove(tabId)
-      .then(() => true)
-      .catch(() => false);
+    if (moved) {
+      await settle(tabId, timeoutMs);
+      const after = await summary();
+      return { page: after, moved: after.url !== before.url };
+    }
+    return { page: before, moved: false };
+  },
+
+  async scroll(args, timeoutMs) {
+    await ensureAttached();
+    let x = typeof args.x === "number" ? args.x : undefined;
+    let y = typeof args.y === "number" ? args.y : undefined;
+    if (x === undefined || y === undefined) {
+      // Anchor the wheel at the viewport centre when the caller did not aim it.
+      const vp = await evaluate(
+        "() => ({ w: window.innerWidth, h: window.innerHeight })",
+        undefined,
+        timeoutMs,
+        "measuring the viewport",
+      );
+      x = Math.floor((vp?.w ?? 800) / 2);
+      y = Math.floor((vp?.h ?? 600) / 2);
+    }
+    await cdp("Input.dispatchMouseEvent", {
+      type: "mouseWheel",
+      x, y,
+      deltaX: Number(args.deltaX) || 0,
+      deltaY: Number(args.deltaY) || 0,
+    });
+    return { page: await summary() };
+  },
+
+  async drag(args, timeoutMs) {
+    const tabId = await ensureAttached();
+    const fromX = Number(args.fromX) || 0;
+    const fromY = Number(args.fromY) || 0;
+    const toX = Number(args.toX) || 0;
+    const toY = Number(args.toY) || 0;
+    const steps = Math.max(1, Number.isInteger(args.steps) ? args.steps : 5);
+    await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: fromX, y: fromY, buttons: 0 });
+    await cdp("Input.dispatchMouseEvent", {
+      type: "mousePressed", x: fromX, y: fromY, button: "left", buttons: 1, clickCount: 1,
+    });
+    for (let i = 1; i <= steps; i += 1) {
+      const x = Math.round(fromX + ((toX - fromX) * i) / steps);
+      const y = Math.round(fromY + ((toY - fromY) * i) / steps);
+      await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "left", buttons: 1 });
+    }
+    await cdp("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: toX, y: toY, button: "left", buttons: 0, clickCount: 1,
+    });
+    await settle(tabId, timeoutMs);
+    return { page: await summary() };
+  },
+
+  async key(args, timeoutMs) {
+    const tabId = await ensureAttached();
+    const keyName = typeof args.key === "string" ? args.key : "";
+    if (keyName === "") throw failed(FAILURES.invalidInput, "key needs a key name.");
+    const modifiers = modifierMask(args.modifiers);
+    const vk = VIRTUAL_KEYS[keyName];
+    const base = {
+      key: keyName,
+      ...(typeof args.code === "string" && args.code ? { code: args.code } : {}),
+      ...(vk === undefined ? {} : { windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk }),
+      modifiers,
+    };
+    await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base });
+    // A char event actually types the character — but only when no non-shift
+    // modifier is held (Ctrl+A selects, it does not insert an "a").
+    const text = typeof args.text === "string" ? args.text : (keyName.length === 1 ? keyName : undefined);
+    const printable = text !== undefined && (modifiers === 0 || modifiers === 8);
+    if (printable) {
+      await cdp("Input.dispatchKeyEvent", { type: "char", ...base, text, unmodifiedText: text });
+    }
+    await cdp("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+    if (keyName === "Enter") await settle(tabId, timeoutMs);
+    return { page: await summary() };
+  },
+
+  async javascript(args, timeoutMs) {
+    await ensureAttached();
+    const code = typeof args.code === "string" ? args.code : "";
+    if (code.trim() === "") throw failed(FAILURES.invalidInput, "javascript needs code to run.");
+    // The one script-running op. No `contextId`, so this evaluates in the page's
+    // MAIN world — the capability the creator asked for. Both the code and the
+    // value it returns are untrusted; the fencing lives in the tool description.
+    const response = await withTimeout(
+      cdp("Runtime.evaluate", {
+        expression: code,
+        returnByValue: true,
+        awaitPromise: true,
+        userGesture: true,
+      }),
+      timeoutMs,
+      "running javascript",
+    );
+    if (response?.exceptionDetails) {
+      const text = response.exceptionDetails.exception?.description
+        ?? response.exceptionDetails.text
+        ?? "the page threw";
+      throw failed(FAILURES.navigationFailed, `javascript failed in the page: ${text}`);
+    }
+    const value = response?.result?.value ?? null;
+    return { value, type: typeof value };
+  },
+
+  async console(_args, _timeoutMs) {
+    // Attach so the Runtime domain is enabled and events flow; then hand over
+    // whatever the active tab has buffered since, and empty its slice of the ring.
+    await ensureAttached();
+    return { entries: drainRing(consoleRing) };
+  },
+
+  async network(_args, _timeoutMs) {
+    await ensureAttached();
+    return { entries: drainRing(networkRing) };
+  },
+
+  async upload(args, timeoutMs) {
+    await ensureAttached();
+    const paths = Array.isArray(args.paths)
+      ? args.paths.filter((p) => typeof p === "string" && p !== "")
+      : [];
+    if (paths.length === 0) throw failed(FAILURES.invalidInput, "upload needs at least one path.");
+    const contextId = await ensureIsolatedWorld();
+    // Resolve the file input to a live node, keeping the handle (returnByValue:
+    // false) so we get an objectId the browser process can act on.
+    const response = await withTimeout(
+      cdp("Runtime.evaluate", {
+        expression: callScript(RESOLVE_NODE_SCRIPT, {
+          ref: args.ref ?? null,
+          selector: args.selector ?? null,
+        }),
+        returnByValue: false,
+        contextId,
+      }),
+      timeoutMs,
+      "locating the file input",
+    );
+    const objectId = response?.result?.objectId;
+    if (!objectId || response.result.subtype === "null") {
+      if (args.ref) {
+        throw failed(
+          FAILURES.unknownRef,
+          `${args.ref} is not on this page any more. Run find again — the page has changed.`,
+          { ref: args.ref },
+        );
+      }
+      throw failed(
+        FAILURES.elementNotFound,
+        `Nothing matched ${args.selector ?? "(no target)"}. Run find again — the page may have changed.`,
+      );
+    }
+    // The browser process reads the paths from disk; the extension never touches
+    // the files itself.
+    await cdp("DOM.setFileInputFiles", { objectId, files: paths });
+    return { page: await summary() };
+  },
+
+  async resize(args) {
+    const tabId = requireTab();
+    const width = Math.round(Number(args.width));
+    const height = Math.round(Number(args.height));
+    if (!(width > 0) || !(height > 0)) {
+      throw failed(FAILURES.invalidInput, "resize needs a positive width and height.");
+    }
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    let applied = false;
+    if (tab) {
+      const updated = await chrome.windows
+        .update(tab.windowId, { width, height })
+        .then(() => true)
+        .catch(() => false);
+      applied = updated;
+    }
+    return { page: await summary(), applied };
+  },
+
+  async tabs(args, timeoutMs) {
+    const op = typeof args.op === "string" ? args.op : "list";
+
+    const infos = async () => {
+      const out = [];
+      for (const id of [...state.tabs]) {
+        const tab = await chrome.tabs.get(id).catch(() => null);
+        if (!tab) {
+          dropTab(id);
+          continue;
+        }
+        out.push({
+          id: String(id),
+          url: tab.url ?? "",
+          title: tab.title ?? "",
+          active: id === state.activeTabId,
+        });
+      }
+      return out;
+    };
+    const activeStr = () => (state.activeTabId === null ? null : String(state.activeTabId));
+
+    if (op === "list") {
+      const tabs = await infos();
+      return { tabs, active: activeStr() };
+    }
+
+    if (op === "create") {
+      const url = typeof args.url === "string" ? args.url.trim() : "";
+      // The session layer vets a create URL like an open; recheck the scheme here
+      // too, unless it is the blank page a tab may legitimately start on.
+      if (url !== "" && url !== "about:blank" && !/^https?:\/\//i.test(url)) {
+        throw failed(FAILURES.blockedUrl, "The relay only opens http and https URLs.");
+      }
+      let tab;
+      try {
+        tab = await chrome.tabs.create({
+          ...(url === "" ? {} : { url }),
+          active: true,
+        });
+      } catch (error) {
+        throw failed(
+          FAILURES.navigationFailed,
+          `Chromium would not open a tab: ${error?.message ?? error}`,
+        );
+      }
+      rememberTab(tab.id);
+      if (tab.status !== "complete" && url !== "" && url !== "about:blank") {
+        const loaded = await waitForLoad(tab.id, timeoutMs);
+        if (!loaded) await stopLoading();
+      }
+      const tabs = await infos();
+      return { tabs, active: activeStr(), id: String(tab.id), page: await summary() };
+    }
+
+    const id = args.id === undefined ? state.activeTabId : Number(args.id);
+    if (!state.tabs.has(id)) {
+      throw failed(FAILURES.invalidInput, `${args.id ?? "(no id)"} is not one of the ghost's tabs.`);
+    }
+
+    if (op === "switch") {
+      setActive(id);
+      await chrome.tabs.update(id, { active: true }).catch(() => {});
+      const tabs = await infos();
+      return { tabs, active: activeStr(), page: await summary() };
+    }
+
+    if (op === "close") {
+      if (state.attached && id === state.activeTabId) {
+        await chrome.debugger.detach({ tabId: id }).catch(() => {});
+      }
+      await chrome.tabs.remove(id).catch(() => {});
+      dropTab(id);
+      const tabs = await infos();
+      return {
+        tabs,
+        active: activeStr(),
+        ...(state.activeTabId === null ? {} : { page: await summary() }),
+      };
+    }
+
+    throw failed(FAILURES.invalidInput, `Unknown tabs op "${op}".`);
+  },
+
+  async close() {
+    // Full teardown: detach and close *every* tab the ghost owns. The tool's
+    // `close` action, the idle timeout, and shutdown all route here; per-tab
+    // closing is the `tabs` op's job.
+    const owned = [...state.tabs];
+    let closedAny = false;
+    if (state.attached && state.activeTabId !== null) {
+      await chrome.debugger.detach({ tabId: state.activeTabId }).catch(() => {});
+    }
+    for (const id of owned) {
+      const removed = await chrome.tabs.remove(id).then(() => true).catch(() => false);
+      closedAny = closedAny || removed;
+    }
     forgetTab();
-    return { closed: removed };
+    consoleRing.length = 0;
+    networkRing.length = 0;
+    netPending.clear();
+    return { closed: closedAny, tabs: [], active: null };
   },
 };
 
-/** Detach and drop the tab without closing it — used when the socket goes away. */
+/** Detach and drop the active tab without closing it — used when the socket goes away. */
 export async function releaseTab() {
-  const tabId = state.tabId;
+  const tabId = state.activeTabId;
   if (tabId !== null && state.attached) {
     await chrome.debugger.detach({ tabId }).catch(() => {});
   }
   state.attached = false;
   state.attaching = null;
   state.worldContextId = null;
+  state.domainsEnabled = false;
 }
 
 /** Run one op. Throws `RelayOpError` for anything the ghost should be told about. */
