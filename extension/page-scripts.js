@@ -42,19 +42,35 @@ export function callScript(script, arg) {
 
 /** Shared prelude: walk every element in the document, shadow roots included. */
 const WALK = `
-  const ghostWalk = (visit) => {
-    const scan = (root) => {
-      for (const el of root.querySelectorAll("*")) {
-        visit(el);
-        if (el.shadowRoot) scan(el.shadowRoot);
+  const ghostWalk = (visit, maxVisits = Number.POSITIVE_INFINITY) => {
+    // TreeWalker advances one node at a time, so the visit budget is enforced
+    // before the browser materializes an unbounded NodeList. Keep a walker stack
+    // so an open shadow root is visited immediately after its host, matching the
+    // old recursive querySelectorAll order.
+    const walkers = [{ root: document, walker: document.createTreeWalker(document, 1) }];
+    let visits = 0;
+    while (walkers.length > 0 && visits < maxVisits) {
+      const current = walkers[walkers.length - 1];
+      const el = current.walker.nextNode();
+      if (!el) {
+        walkers.pop();
+        continue;
       }
-    };
-    scan(document);
+      visits += 1;
+      if (visit(el, current.root === document) === false) break;
+      if (el.shadowRoot) {
+        walkers.push({
+          root: el.shadowRoot,
+          walker: document.createTreeWalker(el.shadowRoot, 1),
+        });
+      }
+    }
+    return visits;
   };
 `;
 
 const DESCRIBE = `
-  const ghostDescribe = (el, ref) => {
+  const ghostDescribe = (el, ref, cachedText) => {
     let visible = false;
     try {
       const rect = el.getBoundingClientRect();
@@ -62,7 +78,10 @@ const DESCRIBE = `
       visible = rect.width > 0 && rect.height > 0
         && style.visibility !== "hidden" && style.display !== "none";
     } catch {}
-    const text = (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+    const rawText = cachedText === undefined
+      ? (el.innerText || el.textContent || "")
+      : cachedText;
+    const text = rawText.replace(/\\s+/g, " ").trim();
     const attr = (name) => el.getAttribute(name) || undefined;
     return {
       ref,
@@ -77,6 +96,45 @@ const DESCRIBE = `
     };
   };
 `;
+
+/** Relay-side caps: the daemon is paired, but it is still a separate trust boundary. */
+export const DEFAULT_FIND_RESULTS = 20;
+export const MAX_FIND_RESULTS = 100;
+export const MAX_FIND_SCAN_ELEMENTS = 10_000;
+
+/**
+ * Syntax that cannot safely cross the document-querySelectorAll → bounded
+ * Element.matches boundary. Quotes are opaque, so attribute values containing
+ * these characters keep working; comments and escapes outside them are CSS-token
+ * transformations and would require a complete CSS parser to classify safely.
+ */
+export function unsupportedFindSyntax(query) {
+  let quote = "";
+  for (let index = 0; index < query.length; index += 1) {
+    const char = query[index];
+    if (quote !== "") {
+      if (char === "\\") {
+        index += 1;
+      } else if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "\\") return "CSS escapes outside quoted strings";
+    if (char === "/" && query[index + 1] === "*") return "CSS comments";
+    if (char === "&") return "the CSS nesting selector &, which aliases document scope";
+    const pseudo = query.slice(index, index + 6);
+    const next = query[index + 6] || "";
+    if (pseudo.toLowerCase() === ":scope" && !/[a-z0-9_-]/i.test(next)) {
+      return "the document-scoped :scope pseudo-class";
+    }
+  }
+  return null;
+}
 
 /**
  * The ref table, living on the isolated world's own global. The page's realm
@@ -144,55 +202,97 @@ export const FIND_ELEMENTS_SCRIPT = `({ query, limit }) => {
   reg.byEl = new WeakMap();
   reg.byRef = new Map();
 
+  const resultLimit = Math.min(
+    ${MAX_FIND_RESULTS},
+    Math.max(1, Number.isInteger(limit) ? limit : ${DEFAULT_FIND_RESULTS}),
+  );
   const results = [];
   const seen = new Set();
-  const describe = (el) => {
-    if (!el || seen.has(el) || results.length >= limit) return;
+  const describe = (el, cachedText) => {
+    if (!el || seen.has(el) || results.length >= resultLimit) return;
     seen.add(el);
     const ref = "e" + (results.length + 1);
-    const described = ghostDescribe(el, ref);
+    const described = ghostDescribe(el, ref, cachedText);
     reg.byEl.set(el, ref);
     reg.byRef.set(ref, { el: new WeakRef(el), tag: described.tag, text: described.text });
     results.push(described);
   };
 
-  let selectorHit = false;
+  let selectorValid = false;
   try {
-    const nodes = document.querySelectorAll(query);
-    if (nodes.length > 0) {
-      selectorHit = true;
-      for (const node of nodes) describe(node);
-    }
+    // Element.matches validates without allocating a page-sized NodeList.
+    document.documentElement.matches(query);
+    selectorValid = true;
   } catch {}
 
-  if (!selectorHit) {
+  const elements = [];
+  const selectorHits = [];
+  ghostWalk((el, inDocument) => {
+    elements.push(el);
+    // querySelectorAll on document did not cross shadow boundaries; retain that
+    // selector behavior while the text fallback continues to search open roots.
+    if (selectorValid && inDocument && el.matches(query)) {
+      selectorHits.push(el);
+      if (selectorHits.length >= resultLimit) return false;
+    }
+  }, ${MAX_FIND_SCAN_ELEMENTS});
+
+  if (selectorHits.length > 0) {
+    for (const el of selectorHits) describe(el);
+  } else {
     const needle = query.toLowerCase();
     const interactive = (el) =>
       /^(a|button|input|textarea|select|summary|label|option)$/.test(el.tagName.toLowerCase())
       || el.hasAttribute("role") || el.hasAttribute("onclick");
-    const hits = [];
-
-    ghostWalk((el) => {
-      const own = el.innerText || el.textContent || "";
-      if (!own.toLowerCase().includes(needle)) return;
-      for (const child of el.children) {
-        const childText = child.innerText || child.textContent || "";
-        if (childText.toLowerCase().includes(needle)) return;
-      }
-      hits.push(el);
-    });
-
-    ghostWalk((el) => {
+    const records = [];
+    const byElement = new Map();
+    for (const el of elements) {
+      // innerText can force layout. Read it exactly once per scanned element,
+      // then reuse it for deepest-match filtering and the returned descriptor.
+      const text = el.innerText || el.textContent || "";
       const haystack = [
         el.getAttribute("aria-label"), el.getAttribute("placeholder"),
         el.getAttribute("title"), el.getAttribute("name"),
         typeof el.value === "string" ? el.value : null,
       ].filter(Boolean).join(" ").toLowerCase();
-      if (haystack !== "" && haystack.includes(needle)) hits.push(el);
-    });
+      const record = { el, text, lowerText: text.toLowerCase(), haystack };
+      records.push(record);
+      byElement.set(el, record);
+    }
 
-    hits.sort((left, right) => Number(interactive(right)) - Number(interactive(left)));
-    for (const el of hits) describe(el);
+    const hits = [];
+    const hitElements = new Set();
+    const addHit = (record) => {
+      if (hitElements.has(record.el)) return;
+      hitElements.add(record.el);
+      hits.push(record);
+    };
+
+    // Keep the old ordering exactly: deepest text hits in document order first,
+    // attribute hits second, then stable-sort interactive elements ahead of the
+    // rest. Deduplicating before the sort is equivalent because interactivity is
+    // an element property, and keeps the candidate list bounded by the scan cap.
+    for (const record of records) {
+      if (!record.lowerText.includes(needle)) continue;
+      let childMatches = false;
+      for (const child of record.el.children) {
+        const childText = byElement.get(child)?.lowerText;
+        if (childText?.includes(needle)) {
+          childMatches = true;
+          break;
+        }
+      }
+      if (!childMatches) addHit(record);
+    }
+    for (const record of records) {
+      if (record.haystack !== "" && record.haystack.includes(needle)) addHit(record);
+    }
+
+    hits.sort((left, right) => Number(interactive(right.el)) - Number(interactive(left.el)));
+    for (const record of hits) {
+      describe(record.el, record.text);
+      if (results.length >= resultLimit) break;
+    }
   }
 
   return results;

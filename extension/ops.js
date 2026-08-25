@@ -33,11 +33,14 @@
 import { failed, FAILURES } from "./protocol.js";
 import {
   callScript,
+  DEFAULT_FIND_RESULTS,
   FIND_ELEMENTS_SCRIPT,
   FOCUS_AND_CLEAR_SCRIPT,
+  MAX_FIND_RESULTS,
   READ_PAGE_SCRIPT,
   RESOLVE_NODE_SCRIPT,
   RESOLVE_SCRIPT,
+  unsupportedFindSyntax,
 } from "./page-scripts.js";
 
 const CDP_VERSION = "1.3";
@@ -68,6 +71,8 @@ const state = {
   worldContextId: null,
   /** Whether Runtime/Network/DOM have been enabled on the current attachment. */
   domainsEnabled: false,
+  /** Invalidates attach work captured before a release, reset, or tab switch. */
+  attachGeneration: 0,
 };
 
 /** Console and network rings, tagged with the tab they came from, drained per op. */
@@ -75,6 +80,8 @@ const consoleRing = [];
 const networkRing = [];
 /** requestId → the ring entry, so a response can fill the request it answered. */
 const netPending = new Map();
+/** Captured-tab attach/cleanup work that a newer same-tab generation must await. */
+const attachBarriers = new Map();
 
 /** Where the ghost's tab ids survive a service-worker restart. */
 const SESSION_KEY = "ghostTabs";
@@ -107,6 +114,7 @@ export async function restoreTabFromSession() {
 
 /** Reset the attach machinery for a new active tab; the old attachment is left be. */
 function resetAttachment() {
+  state.attachGeneration += 1;
   state.attached = false;
   state.banned = false;
   state.attaching = null;
@@ -275,10 +283,7 @@ export function installOpsListeners(onNotice) {
 
   chrome.debugger.onDetach.addListener((source, reason) => {
     if (source.tabId !== state.activeTabId) return;
-    state.attached = false;
-    state.attaching = null;
-    state.worldContextId = null;
-    state.domainsEnabled = false;
+    resetAttachment();
     // Any detach is a ban until the tab navigates. Re-attaching immediately would
     // fight the owner for the banner they just dismissed.
     state.banned = true;
@@ -395,6 +400,24 @@ async function enableDomains(tabId) {
   await chrome.debugger.sendCommand({ tabId }, "DOM.enable", {}).catch(() => {});
 }
 
+function invalidatedAttach(tabId) {
+  return failed(
+    FAILURES.browserUnavailable,
+    `The active ghost tab changed while Chromium was attaching to tab ${tabId}. Try the action again.`,
+  );
+}
+
+function isCurrentAttach(attempt) {
+  return state.attaching === attempt
+    && state.attachGeneration === attempt.generation
+    && state.activeTabId === attempt.tabId;
+}
+
+/** A stale successful attach owns removing exactly the captured tab's debugger. */
+async function detachStale(tabId) {
+  await chrome.debugger.detach({ tabId }).catch(() => {});
+}
+
 async function ensureAttached() {
   const tabId = requireTab();
   if (state.attached) {
@@ -420,44 +443,78 @@ async function ensureAttached() {
       `Chromium does not allow automation of ${tab.url.split(":")[0]}: pages.`,
     );
   }
-  if (state.attaching) {
-    await state.attaching;
-    return tabId;
-  }
-  state.attaching = (async () => {
-    // A `chrome.debugger` session is attached per-extension, not per-worker, so
-    // it can outlive the service-worker instance that opened it. After a worker
-    // restart `state.attached` is false but Chrome still lists us as attached;
-    // a plain `attach()` would then throw "Another debugger is already attached"
-    // and ban the tab forever. Adopt the surviving session instead.
-    if (await adoptExistingAttachment(tabId)) {
+  if (!state.attaching) {
+    const barrier = attachBarriers.get(tabId);
+    if (barrier) {
+      // A reset can make the current state forget an attempt before Chrome has
+      // settled it. Never attach the same tab again until that attempt has either
+      // failed or succeeded and detached itself, or its cleanup could detach this
+      // newer generation by tab id.
+      await barrier.catch(() => {});
+      if (state.activeTabId !== tabId) throw invalidatedAttach(tabId);
+      return ensureAttached();
+    }
+    const attempt = {
+      tabId,
+      generation: state.attachGeneration,
+      promise: null,
+    };
+    attempt.promise = (async () => {
+      // A `chrome.debugger` session is attached per-extension, not per-worker, so
+      // it can outlive the service-worker instance that opened it. After a worker
+      // restart `state.attached` is false but Chrome still lists us as attached;
+      // a plain `attach()` would then throw "Another debugger is already attached"
+      // and ban the tab forever. Adopt the surviving session instead.
+      if (await adoptExistingAttachment(tabId)) {
+        // The surviving session belongs to this extension, so stale cleanup owns
+        // detaching it just as it would a session opened below.
+      } else {
+        await chrome.debugger.attach({ tabId }, CDP_VERSION);
+      }
+      if (!isCurrentAttach(attempt)) {
+        await detachStale(tabId);
+        throw invalidatedAttach(tabId);
+      }
       state.attached = true;
       state.domainsEnabled = false;
       await enableDomains(tabId);
-      return;
-    }
-    await chrome.debugger.attach({ tabId }, CDP_VERSION);
-    state.attached = true;
-    state.domainsEnabled = false;
-    await enableDomains(tabId);
-  })();
+      if (!isCurrentAttach(attempt)) {
+        await detachStale(tabId);
+        throw invalidatedAttach(tabId);
+      }
+    })().catch((error) => {
+      if (!isCurrentAttach(attempt)) {
+        if (error?.failure === FAILURES.browserUnavailable) throw error;
+        throw invalidatedAttach(tabId);
+      }
+      state.attached = false;
+      state.worldContextId = null;
+      state.domainsEnabled = false;
+      // Any attach failure bans the tab rather than looping: the causes (DevTools,
+      // another extension's debugger, a policy-blocked page) do not fix themselves
+      // between two retries, and each retry costs the owner a banner flash. The
+      // normalization lives on the shared promise so its owner and every concurrent
+      // waiter receive the same typed failure.
+      state.banned = true;
+      if (error?.failure === FAILURES.browserUnavailable) throw error;
+      throw failed(
+        FAILURES.browserUnavailable,
+        `Chromium refused to attach its debugger to the ghost's tab: ${error?.message ?? error}. `
+        + "Close DevTools on that tab, or any other extension driving it, and try again.",
+      );
+    });
+    attempt.promise = attempt.promise.finally(() => {
+      if (attachBarriers.get(tabId) === attempt.promise) attachBarriers.delete(tabId);
+    });
+    attachBarriers.set(tabId, attempt.promise);
+    state.attaching = attempt;
+  }
+  const attempt = state.attaching;
   try {
-    await state.attaching;
-  } catch (error) {
-    state.attached = false;
-    state.worldContextId = null;
-    state.domainsEnabled = false;
-    // Any attach failure bans the tab rather than looping: the causes (DevTools,
-    // another extension's debugger, a policy-blocked page) do not fix themselves
-    // between two retries, and each retry costs the owner a banner flash.
-    state.banned = true;
-    throw failed(
-      FAILURES.browserUnavailable,
-      `Chromium refused to attach its debugger to the ghost's tab: ${error?.message ?? error}. `
-      + "Close DevTools on that tab, or any other extension driving it, and try again.",
-    );
+    await attempt.promise;
+    if (!isCurrentAttach(attempt)) throw invalidatedAttach(attempt.tabId);
   } finally {
-    state.attaching = null;
+    if (state.attaching === attempt) state.attaching = null;
   }
   return tabId;
 }
@@ -738,9 +795,18 @@ const ops = {
   },
 
   async find(args, timeoutMs) {
-    await ensureAttached();
     const query = typeof args.query === "string" ? args.query : "";
-    const limit = Number.isInteger(args.limit) ? args.limit : 20;
+    const unsupported = unsupportedFindSyntax(query);
+    if (unsupported !== null) {
+      throw failed(
+        FAILURES.invalidInput,
+        `The relay find query uses ${unsupported}, which its bounded selector scan cannot safely interpret. `
+        + "Use an ordinary selector or visible text without that syntax.",
+      );
+    }
+    await ensureAttached();
+    const requestedLimit = Number.isInteger(args.limit) ? args.limit : DEFAULT_FIND_RESULTS;
+    const limit = Math.min(MAX_FIND_RESULTS, Math.max(1, requestedLimit));
     const matches = await evaluate(
       FIND_ELEMENTS_SCRIPT,
       { query, limit },
@@ -1125,10 +1191,7 @@ export async function releaseTab() {
   if (tabId !== null && state.attached) {
     await chrome.debugger.detach({ tabId }).catch(() => {});
   }
-  state.attached = false;
-  state.attaching = null;
-  state.worldContextId = null;
-  state.domainsEnabled = false;
+  resetAttachment();
 }
 
 /** Run one op. Throws `RelayOpError` for anything the ghost should be told about. */

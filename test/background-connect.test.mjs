@@ -28,7 +28,7 @@ function eventHook() {
       listeners.push(listener);
     },
     emit(...args) {
-      for (const listener of listeners) listener(...args);
+      return listeners.map((listener) => listener(...args));
     },
   };
 }
@@ -48,7 +48,9 @@ function chromeMock({ loadSettings, restoreSession = async () => ({ ghostTabId: 
       onEvent: eventHook(),
     },
     runtime: {
+      id: "ghost-relay-test",
       getManifest: () => ({ version: "test" }),
+      getURL: (path = "") => `chrome-extension://ghost-relay-test/${path}`,
       onInstalled: eventHook(),
       onMessage: eventHook(),
       onStartup: eventHook(),
@@ -180,4 +182,57 @@ test("a settings change invalidates an awaiting attempt before it can dial", asy
 
   assert.equal(settingsReads, 2);
   assert.deepEqual(sockets, ["ws://127.0.0.1:8828/relay"]);
+});
+
+test("only this extension's popup can read live relay status", async () => {
+  let settingsReads = 0;
+  globalThis.chrome = chromeMock({
+    loadSettings: async () => {
+      settingsReads += 1;
+      return { port: 7717, token: "", enabled: true };
+    },
+  });
+
+  await import(`../extension/background.js?sender=${Date.now()}`);
+  await settle();
+  const startupReads = settingsReads;
+  const leaked = [];
+  const popupUrl = chrome.runtime.getURL("popup.html");
+
+  for (const sender of [
+    { id: "another-extension", url: popupUrl },
+    { id: chrome.runtime.id, url: "https://attacker.example/", tab: { id: 7 } },
+    { id: chrome.runtime.id, url: chrome.runtime.getURL("future-page.html") },
+  ]) {
+    const returns = chrome.runtime.onMessage.emit(
+      { type: "ghost-relay-status" },
+      sender,
+      (status) => leaked.push(status),
+    );
+    assert.deepEqual(returns, [undefined]);
+  }
+  await settle();
+  assert.deepEqual(leaked, []);
+  assert.equal(settingsReads, startupReads);
+
+  let status;
+  const returns = chrome.runtime.onMessage.emit(
+    { type: "ghost-relay-status" },
+    { id: chrome.runtime.id, url: popupUrl },
+    (value) => {
+      status = value;
+    },
+  );
+  assert.deepEqual(returns, [true]);
+  await settle();
+
+  assert.equal(settingsReads, startupReads + 1);
+  assert.deepEqual(status, {
+    connected: false,
+    paired: false,
+    enabled: true,
+    port: 7717,
+    lastError: "Not paired yet — run `ghostd relay-token` and paste the token below.",
+    tab: null,
+  });
 });

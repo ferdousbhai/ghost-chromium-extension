@@ -298,9 +298,17 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 chrome.runtime.onStartup.addListener(() => void connect());
 
+/** Only the installed popup is allowed to read live relay state. */
+function isPopupSender(sender) {
+  return sender?.id === chrome.runtime.id
+    && sender?.url === chrome.runtime.getURL("popup.html")
+    && sender.tab === undefined;
+}
+
 /** The popup asks for state rather than reaching into the worker's variables. */
-chrome.runtime.onMessage.addListener((message, _sender, respond) => {
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (message?.type !== "ghost-relay-status") return undefined;
+  if (!isPopupSender(sender)) return undefined;
   void (async () => {
     const settings = await loadSettings();
     let tab = null;

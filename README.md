@@ -121,6 +121,14 @@ roots included. (The technique is Playwright's `_ariaRef`, via oh-my-pi.)
 Refs are invalidated by the session layer on navigation, exactly as in the other
 backend, so `e3` never means two different things.
 
+The relay keeps `find` bounded by walking at most 10,000 elements and returning
+at most 100. Its CSS-selector path deliberately rejects `:scope`, the CSS nesting
+selector `&`, CSS comments, and CSS escapes outside quoted strings: those forms
+can change token identity or document scoping in ways a lazy per-element match
+cannot reproduce without a full CSS parser. Quoted attribute values remain
+opaque, so selectors such as `[data-label=":scope"]` and `[data-label="&"]`
+still work. Use an ordinary selector or visible text for the rejected forms.
+
 ## Provenance
 
 The relay shape — MV3 extension dialing out over WebSocket, the reconnect and
