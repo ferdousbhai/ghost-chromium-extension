@@ -1,21 +1,21 @@
 /**
- * The verbs, against real tabs in the creator's real browser.
+ * The verbs, against real tabs in the owner's real browser.
  *
  * Three rules run through this file.
  *
  * **The ghost owns a set of tabs, and drives one at a time.** The one-tab
  * invariant is relaxed: `state.tabs` is the set of tab ids the ghost created, and
  * `state.activeTabId` is the one every page op acts on. Switching tabs just moves
- * `activeTabId`; the ghost never touches a tab the creator opened. `close` shuts
+ * `activeTabId`; the ghost never touches a tab the owner opened. `close` shuts
  * *all* of the ghost's tabs and detaches; the `tabs` op's `close` shuts one. Neither
- * closes the browser, which has the rest of the creator's day in it.
+ * closes the browser, which has the rest of the owner's day in it.
  *
  * **`chrome.debugger` is the only way in.** There is no `chrome.scripting`, no
  * content script, and no `host_permissions` in the manifest — which means this
  * extension has *no standing access to any page at all*. It can only read or act
  * on a page while a `chrome.debugger` session is attached, and Chrome puts its own
  * un-suppressable "is being debugged" banner across the top of any tab in that
- * state. The creator's evidence that the ghost is looking is a browser-drawn
+ * state. The owner's evidence that the ghost is looking is a browser-drawn
  * banner rather than our promise.
  *
  * **Input is real input.** Clicks, scrolls, drags, and keys go through
@@ -56,7 +56,7 @@ const state = {
   /** The owned tab every page op acts on, or null when the ghost owns none. */
   activeTabId: null,
   attached: false,
-  /** Set when attach failed or the creator dismissed the debugger banner. */
+  /** Set when attach failed or the owner dismissed the debugger banner. */
   banned: false,
   attaching: null,
   /**
@@ -267,7 +267,7 @@ export function installOpsListeners(onNotice) {
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (tabId !== state.activeTabId) return;
-    // A navigation is the one thing that can un-wedge a banned tab: the creator
+    // A navigation is the one thing that can un-wedge a banned tab: the owner
     // dismissed the debugger banner, the page moved on, and attaching is worth
     // trying again.
     if (changeInfo.url && state.banned) state.banned = false;
@@ -280,7 +280,7 @@ export function installOpsListeners(onNotice) {
     state.worldContextId = null;
     state.domainsEnabled = false;
     // Any detach is a ban until the tab navigates. Re-attaching immediately would
-    // fight the creator for the banner they just dismissed.
+    // fight the owner for the banner they just dismissed.
     state.banned = true;
     onNotice?.("detached", { reason });
   });
@@ -319,7 +319,7 @@ export function installOpsListeners(onNotice) {
     }
     if (method !== "Page.javascriptDialogOpening") return;
     // With `Page.enable` on, Chrome hands dialogs to the debugger instead of the
-    // creator, and an unanswered one wedges the renderer forever. Dismiss —
+    // owner, and an unanswered one wedges the renderer forever. Dismiss —
     // except `beforeunload`, where dismissing is what *blocks* the navigation.
     void chrome.debugger
       .sendCommand({ tabId: source.tabId }, "Page.handleJavaScriptDialog", {
@@ -404,7 +404,7 @@ async function ensureAttached() {
   if (state.banned) {
     throw failed(
       FAILURES.browserUnavailable,
-      "Chromium will not let the relay inspect this tab — the creator dismissed "
+      "Chromium will not let the relay inspect this tab — the owner dismissed "
       + "the \"is being debugged\" banner, or DevTools is open on it. It will work "
       + "again after the tab navigates somewhere.",
     );
@@ -449,7 +449,7 @@ async function ensureAttached() {
     state.domainsEnabled = false;
     // Any attach failure bans the tab rather than looping: the causes (DevTools,
     // another extension's debugger, a policy-blocked page) do not fix themselves
-    // between two retries, and each retry costs the creator a banner flash.
+    // between two retries, and each retry costs the owner a banner flash.
     state.banned = true;
     throw failed(
       FAILURES.browserUnavailable,
@@ -702,7 +702,7 @@ const ops = {
     let tab = null;
     if (state.activeTabId !== null) {
       // Reuse the ghost's active tab without raising it: only the first `open` and
-      // a screenshot are allowed to take the creator's focus.
+      // a screenshot are allowed to take the owner's focus.
       tab = await chrome.tabs.update(state.activeTabId, { url }).catch(() => null);
       if (!tab) dropTab(state.activeTabId);
       // Navigating tears down whatever isolated world we had on the old document.
@@ -806,7 +806,7 @@ const ops = {
     // `Page.captureScreenshot` reads the compositor surface, which follows the
     // *active* target: capturing a backgrounded tab either stalls waiting for a
     // frame that never comes or hands back a sibling tab's pixels. Raising the
-    // tab is the one place the relay is allowed to take the creator's focus, and
+    // tab is the one place the relay is allowed to take the owner's focus, and
     // it is the one place where doing so is also what they asked for.
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (tab) {
@@ -922,7 +922,7 @@ const ops = {
     const code = typeof args.code === "string" ? args.code : "";
     if (code.trim() === "") throw failed(FAILURES.invalidInput, "javascript needs code to run.");
     // The one script-running op. No `contextId`, so this evaluates in the page's
-    // MAIN world — the capability the creator asked for. Both the code and the
+    // MAIN world — the capability the owner asked for. Both the code and the
     // value it returns are untrusted; the fencing lives in the tool description.
     const response = await withTimeout(
       cdp("Runtime.evaluate", {

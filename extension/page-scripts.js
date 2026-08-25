@@ -1,5 +1,5 @@
 /**
- * The code that runs *inside* the creator's pages.
+ * The code that runs *inside* the owner's pages.
  *
  * Strings, evaluated through CDP `Runtime.evaluate`, for the same reason the
  * Playwright backend keeps its snippets as strings: they are the one part of the
@@ -22,7 +22,7 @@
  * decoy and steal the next click. The ref table is now `globalThis.__ghostRegistry`
  * in the isolated world (`byEl`: element → ref, `byRef`: ref → weak element +
  * descriptor). The page's realm has no handle to that global, so it cannot forge,
- * read, or overwrite a ref. Nothing is written onto the creator's elements at all,
+ * read, or overwrite a ref. Nothing is written onto the owner's elements at all,
  * so there is also nothing for a CSS selector, a `MutationObserver`, or a
  * framework vdom to trip over. The technique is Playwright's `_ariaRef`, by way of
  * oh-my-pi, hardened into the isolated world.

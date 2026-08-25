@@ -10,7 +10,7 @@
  *     node packages/chromium-extension/contrib/smoke.mjs
  *
  * It launches its **own** Chromium against a throwaway `--user-data-dir`, never
- * the creator's profile, and cleans both up. A window appears for a few seconds.
+ * the owner's profile, and cleans both up. A window appears for a few seconds.
  * Pass `--headless` to skip the window (note that `chrome.debugger` and real
  * input work fine in Chrome's headless mode, but the screenshot compositor is
  * happier headed).
@@ -127,7 +127,7 @@ try {
     "--use-mock-keychain",
     "--disable-background-timer-throttling",
     // Only so this script can type the pairing token into chrome.storage for
-    // the creator; the shipped relay uses none of this.
+    // the owner; the shipped relay uses none of this.
     "--remote-debugging-port=0",
     ...(headless ? ["--headless=new"] : []),
     "about:blank",
@@ -226,7 +226,7 @@ try {
   const closed = await session.close();
   record("close the tab", closed, "the browser itself stayed open");
 
-  // 6. The popup is the only way a creator ever pairs, so a syntax error in it
+  // 6. The popup is the only way an owner ever pairs, so a syntax error in it
   //    is a ship-blocker that no unit test would catch.
   const popup = await checkPopup(base, extensionId);
   record("popup renders and reports the connection", popup.ok, popup.detail);
@@ -249,7 +249,7 @@ process.stdout.write(`\n${steps.length - failed.length}/${steps.length} steps pa
 process.exit(failed.length === 0 ? 0 : 1);
 
 /**
- * Type the token into the extension for the creator, over the browser's own
+ * Type the token into the extension for the owner, over the browser's own
  * debugging port. This is the smoke test standing in for four clicks in the
  * popup; nothing in the shipped path uses it.
  */

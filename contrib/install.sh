@@ -14,7 +14,7 @@
 # already-running profile from the command line: `--load-extension` only applies
 # to the profile a fresh process starts with, and Chrome ≥ 137 ignores it entirely
 # for the default profile unless the extension is also allowlisted by policy. So
-# the honest instruction for the creator's real, signed-in browser is the manual
+# the honest instruction for the owner's real, signed-in browser is the manual
 # one — chrome://extensions, Developer mode, "Load unpacked" — and this script
 # gets the files to a permanent path and prints exactly what to click.
 set -euo pipefail

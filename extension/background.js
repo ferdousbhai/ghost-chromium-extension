@@ -4,7 +4,7 @@
  * **The extension dials out.** A service worker cannot listen on a socket, so
  * somebody has to be the server and it is the daemon. This is also what makes the
  * whole arrangement survive normal life: ghostd restarts and the extension
- * reconnects; the creator closes Chromium and the daemon simply reports the relay
+ * reconnects; the owner closes Chromium and the daemon simply reports the relay
  * as disconnected. Nothing has to be started in a particular order.
  *
  * **Staying alive is the hard part of MV3.** A background service worker is killed
@@ -102,7 +102,7 @@ async function refreshBadge() {
 function scheduleReconnect() {
   if (protocolIncompatible) {
     // A version mismatch will not fix itself by dialing again. Sit tight until
-    // the creator updates one side and the settings change (or reinstall) clears
+    // the owner updates one side and the settings change (or reinstall) clears
     // the latch, rather than reconnecting every second forever.
     void setBadge("off");
     return;
@@ -181,7 +181,7 @@ async function connectOnce(epoch) {
       lastError = "ghostd is not answering on that port. Is it running?";
     }
     void setBadge("off");
-    // Let go of the debugger so the creator's tab is not left with a banner over
+    // Let go of the debugger so the owner's tab is not left with a banner over
     // a relay that is no longer there.
     void releaseTab();
     scheduleReconnect();
@@ -246,7 +246,7 @@ async function handleFrame(raw) {
       error: {
         failure: "browser_unavailable",
         message:
-          "The Ghost relay is paused. The creator can resume it from the "
+          "The Ghost relay is paused. The owner can resume it from the "
           + "extension's popup in Chromium.",
       },
     });

@@ -24,7 +24,7 @@ export const RELAY_PATH = "/relay";
  * handlers still agree).
  *
  * There is exactly one script-running op, `javascript`, and it is deliberate:
- * the creator's own ghost, on the creator's own machine, may run page script
+ * the owner's ghost, on the owner's machine, may run page script
  * through CDP `Runtime.evaluate`. It is the only op that carries a code string;
  * every other verb is a fixed action the extension implements itself, so a
  * compromised daemon socket still cannot smuggle script through, say, `find`.
