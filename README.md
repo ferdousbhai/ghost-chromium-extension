@@ -1,7 +1,8 @@
 # Ghost browser relay (Chromium extension)
 
-"My browser" mode: the ghost drives **one tab of the browser you are already
-signed into**, instead of a separate profile of its own.
+"My browser" mode: the ghost drives **tabs it created in the browser you are
+already signed into**, instead of a separate profile of its own. It acts through
+one selected ghost-owned tab at a time and can switch among the rest.
 
 The other mode — "Ghost's browser", a dedicated Playwright Chromium profile under
 the ghost home — stays the default and is the right choice for anything
@@ -16,8 +17,8 @@ ghost tool call
   → GhostBrowserSession        url policy, ref bookkeeping, read budget, idle timer
     → RelayBrowserBackend      packages/extensions/.../browser-relay-backend.ts
       → RelayHub               packages/daemon/src/relay.ts, ws://127.0.0.1:7717/relay
-        → this extension       background.js dials OUT, ops.js drives the tab
-          → chrome.debugger    real CDP input into a real tab
+        → this extension       background.js dials OUT, ops.js drives the selected tab
+          → chrome.debugger    real CDP input into a ghost-owned tab
 ```
 
 The extension **dials out**. A service worker cannot listen on a socket, so
@@ -54,10 +55,16 @@ ghostd relay-token --rotate # mint a new one; the old one stops working
 
 Click the extension, paste the token, **Save & connect**. It is kept in
 `chrome.storage.local`, so this is a once-per-browser step. The badge reads `on`
-when it is paired and ghostd is up, `||` when you have paused it, `off` otherwise.
+only after a compatible ghostd has answered the protocol handshake, `||` when
+that authenticated connection is paused, and `off` otherwise.
 
 The token lives at `$XDG_STATE_HOME/ghost/relay-token` (default
 `~/.local/state/ghost/relay-token`), mode `0600`.
+The pasted copy lives in Chromium's profile under `chrome.storage.local`;
+Chromium owns that on-disk layout and the extension cannot assign it a separate
+POSIX mode. Anyone who can read the browser profile should be treated as able to
+recover the relay token. It authorizes only this loopback relay, not the daemon
+HTTP API, and `--rotate` invalidates both copies immediately.
 
 ## The security model
 
@@ -73,20 +80,21 @@ there must not also hand out the API. Any page you visit can open
 | Bound to `127.0.0.1` | Anything off this machine. |
 | `Origin` must be `chrome-extension://…` or absent | A web page opening the socket from a tab you are visiting. |
 | 32-byte token, compared in constant time | Everything else, including another extension. |
-| One connection at a time | A second browser interleaving clicks on the same tab. |
-| Closed op set — no `eval` frame | A compromised daemon running arbitrary script in your signed-in pages. |
+| One connection at a time | A second browser interleaving actions across the ghost-owned tabs. |
+| Closed, validated op set | Arbitrary CDP frames and script hidden in another verb; `javascript` remains one explicit capability. |
 
 And on the extension side:
 
-- **No `host_permissions`, no `chrome.scripting`, no content scripts.** The
-  extension has *no standing access to any page*. It can only read or act on a
-  page while `chrome.debugger` is attached — and Chrome draws its own
-  un-suppressable "is being debugged" banner across any tab in that state. Your
-  evidence that the ghost is looking is a browser-drawn banner, not our promise.
-  Dismissing that banner detaches the debugger and locks the relay out of the tab
-  until it navigates.
-- **One tab, created by the ghost.** It never touches a tab you opened. `close`
-  closes that tab; the browser stays open.
+- **No `tabs`, no `activeTab`, no `host_permissions`, no `chrome.scripting`, no
+  content scripts.** The required `debugger` permission can enumerate target
+  URL/title metadata even before attachment; the relay uses that capability only
+  to describe and validate tab ids it created. Page content and actions require
+  an attached debugger session, where Chrome draws its own un-suppressable "is
+  being debugged" banner. Dismissing that banner detaches the debugger and locks
+  the relay out of the tab until it navigates.
+- **Only tabs created by the ghost.** It never adopts a tab you opened. The
+  `tabs` operation can create, select, or close one of those tabs; session `close`
+  closes all of them while the browser stays open.
 - **Pause** in the popup refuses every request instantly, without unpairing.
 - The extension re-checks the URL scheme itself: it does not have to trust the
   daemon in order to be safe to install.
@@ -99,27 +107,32 @@ for anything you would not do yourself.
 
 | File | What it is |
 | --- | --- |
-| `extension/manifest.json` | MV3. Permissions: `debugger`, `tabs`, `storage`, `alarms`. That is all. |
+| `extension/manifest.json` | MV3. Permissions: `debugger`, `storage`, `alarms`. That is all. |
+| `extension/icons/` | Chrome's required icon sizes, derived from the same Lucide ghost mascot and amber token as the shell. |
 | `extension/background.js` | The outbound socket, reconnect loop, MV3 keepalive, frame dispatch. |
-| `extension/ops.js` | The eight verbs against real tabs; the `chrome.debugger` attach state machine. |
+| `extension/ops.js` | The 20 protocol operations against ghost-owned tabs; the `chrome.debugger` attach state machine. |
 | `extension/page-scripts.js` | The snippets that run inside the page (read, find, resolve, focus-and-clear). |
 | `extension/protocol.js` | Frame shapes and the failure vocabulary; mirrors the TypeScript side. |
 | `extension/popup.{html,js}` | Status, pairing, pause. |
 
 No build step. It is plain ES modules; edit and hit reload in `chrome://extensions`.
 
+Each relay request carries a deadline. The extension applies it around the whole
+operation and drops a late result if the socket that requested it has gone away.
+Chromium's `chrome.debugger.sendCommand()` Promise has no cancellation signal,
+and relay protocol v1 has no cancel frame, so a deadline bounds the reply but
+does not claim to abort a CDP command already accepted by Chromium.
+
 ## Element refs
 
-`find` mints `e1`, `e2`, … the same way both backends do — but where the
-Playwright backend stamps a `data-ghost-ref` attribute, this one sets a JavaScript
-expando (`element.__ghostRef`). These are your real pages, mid-session: an
-attribute can match a CSS selector, trip a `MutationObserver`, or desync a
-framework's vdom. An expando is invisible to all of that and gone when the
-document is replaced. Resolution is a linear scan for the expando, open shadow
-roots included. (The technique is Playwright's `_ariaRef`, via oh-my-pi.)
-
-Refs are invalidated by the session layer on navigation, exactly as in the other
-backend, so `e3` never means two different things.
+`find` mints `e1`, `e2`, … without writing attributes or expandos onto the
+owner's DOM. Its isolated world keeps element → ref in a `WeakMap` and ref →
+element in a `Map` of `WeakRef` records. Resolution is an O(1) lookup followed by
+identity and tag checks: a collected, different, or tag-changed node cannot take
+over a ref. A page can still semantically change the same surviving same-tag
+element, as with any live DOM. Each `find` replaces the registry, and navigation
+destroys the isolated world; only refs from the current results on the current
+document resolve.
 
 The relay keeps `find` bounded by walking at most 10,000 elements and returning
 at most 100. Its CSS-selector path deliberately rejects `:scope`, the CSS nesting
@@ -130,6 +143,11 @@ opaque, so selectors such as `[data-label=":scope"]` and `[data-label="&"]`
 still work. Use an ordinary selector or visible text for the rejected forms.
 
 ## Provenance
+
+The icon assets are raster sizes of Lucide's ISC-licensed `ghost` glyph, already
+used as the shell mascot, in the shell's fixed `ghostAmber` brand colour. The
+required copyright and permission text is in the root
+[`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md#lucide).
 
 The relay shape — MV3 extension dialing out over WebSocket, the reconnect and
 service-worker-keepalive loop, the `attached`/`banned`/`attaching` attach state

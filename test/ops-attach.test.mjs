@@ -36,14 +36,31 @@ function eventHook() {
   };
 }
 
-function chromeMock({ attach, detach = async () => {}, sendCommand = async () => ({}) }) {
+function chromeMock({
+  attach,
+  detach = async () => {},
+  getTargets,
+  sendCommand = async () => ({}),
+}) {
   const tabs = new Map();
   let nextTabId = 17;
+  const redacted = (tab) => tab && ({
+    id: tab.id,
+    windowId: tab.windowId,
+    status: tab.status,
+    active: tab.active,
+  });
   return {
     debugger: {
       attach,
       detach,
-      getTargets: async () => [],
+      getTargets: getTargets ?? (async () => [...tabs.values()].map((tab) => ({
+        tabId: tab.id,
+        type: "page",
+        attached: false,
+        url: tab.url,
+        title: tab.title,
+      }))),
       onDetach: eventHook(),
       onEvent: eventHook(),
       sendCommand,
@@ -65,9 +82,9 @@ function chromeMock({ attach, detach = async () => {}, sendCommand = async () =>
         };
         nextTabId += 1;
         tabs.set(tab.id, tab);
-        return tab;
+        return redacted(tab);
       },
-      get: async (id) => tabs.get(id) ?? null,
+      get: async (id) => redacted(tabs.get(id)) ?? null,
       onRemoved: eventHook(),
       onUpdated: eventHook(),
       remove: async (id) => {
@@ -77,7 +94,7 @@ function chromeMock({ attach, detach = async () => {}, sendCommand = async () =>
         const tab = tabs.get(id);
         if (!tab) throw new Error("missing tab");
         Object.assign(tab, update);
-        return tab;
+        return redacted(tab);
       },
     },
     windows: { update: async () => {} },
@@ -175,6 +192,15 @@ test("release invalidates an in-flight attach and the stale success detaches its
     (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
   );
   assert.deepEqual(attachTargets, [17, 17], "a genuine detach must not be suppressed");
+
+  chrome.tabs.onUpdated.emit(17, { status: "loading" });
+  const afterNavigation = await runOp("read", {}, 1_000);
+  assert.equal(afterNavigation.text, "ok");
+  assert.deepEqual(
+    attachTargets,
+    [17, 17, 17],
+    "permission-free loading status must clear the post-detach ban",
+  );
 });
 
 test("switch invalidates an in-flight attach without resurrecting the old tab", async () => {
@@ -270,4 +296,46 @@ test("find clamps relay-provided limits before evaluating page code", async () =
   assert.equal(attachCalls, 1);
   assert.match(expressions[0], /\)\(\{"query":"needle","limit":100\}\)$/);
   assert.match(expressions[1], /\)\(\{"query":"needle","limit":1\}\)$/);
+});
+
+test("owned tab metadata comes from debugger targets without the tabs permission", async () => {
+  globalThis.chrome = chromeMock({ attach: async () => {} });
+  const { runOp } = await import(`../extension/ops.js?target-metadata=${Date.now()}`);
+
+  const opened = await runOp("open", { url: "https://example.com/path" }, 1_000);
+  assert.deepEqual(opened.page, {
+    url: "https://example.com/path",
+    title: "Tab 17",
+  });
+
+  const listed = await runOp("tabs", { op: "list" }, 1_000);
+  assert.deepEqual(listed.tabs, [{
+    id: "17",
+    url: "https://example.com/path",
+    title: "Tab 17",
+    active: true,
+  }]);
+});
+
+test("the relay operation deadline bounds CDP work without claiming to cancel it", async () => {
+  const attaching = deferred();
+  globalThis.chrome = chromeMock({ attach: () => attaching.promise });
+  const { runOp } = await import(`../extension/ops.js?operation-deadline=${Date.now()}`);
+  await runOp("open", { url: "https://example.com/" }, 1_000);
+
+  const started = Date.now();
+  await assert.rejects(
+    runOp("read", {}, 1_000),
+    (error) => error instanceof RelayOpError
+      && error.failure === "timeout"
+      && /running read/.test(error.message),
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 900 && elapsed < 2_000, `deadline fired after ${elapsed}ms`);
+
+  // The Chrome API has no AbortSignal. A late transport result is still observed
+  // and cleaned up by the attach generation rather than producing an unhandled
+  // rejection or a second relay result.
+  attaching.reject(new Error("late CDP failure"));
+  await new Promise((resolve) => setImmediate(resolve));
 });

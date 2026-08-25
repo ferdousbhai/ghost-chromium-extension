@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * Live smoke test: a real ghostd, a real Chromium, a real page.
  *
@@ -7,7 +7,7 @@
  * actually attaches, whether a dispatched mouse event lands on the link the model
  * asked for, or whether `Page.captureScreenshot` returns pixels. This does.
  *
- *     node packages/chromium-extension/contrib/smoke.mjs
+ *     bun packages/chromium-extension/contrib/smoke.mjs
  *
  * It launches its **own** Chromium against a throwaway `--user-data-dir`, never
  * the owner's profile, and cleans both up. A window appears for a few seconds.

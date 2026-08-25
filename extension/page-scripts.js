@@ -29,8 +29,9 @@
  *
  * Resolution goes straight through `byRef` (a `WeakRef`), then verifies the node
  * is still the exact one `find` minted the ref for and still the tag it described,
- * before anyone acts on it — defense in depth against a re-render repurposing a
- * surviving node.
+ * before anyone acts on it. That rejects a collected, different, or tag-changed
+ * node; it cannot detect a page semantically changing the same surviving same-tag
+ * element, which remains ordinary live-DOM behavior.
  *
  * Every snippet walks open shadow roots. Half the web's buttons live in one.
  */
@@ -158,8 +159,8 @@ const REGISTRY = `
     const el = entry.el.deref();
     // The node must still be alive, still carry this exact ref, and still be the
     // tag find described. A page cannot forge an entry here — the table is in
-    // this isolated world — but a genuine re-render can repurpose a surviving
-    // node, and that must read as a stale ref, not a hijacked click.
+    // this isolated world. A collected, different, or tag-changed node is stale;
+    // the same surviving same-tag node remains live even if its meaning changed.
     if (!el || reg.byEl.get(el) !== ref) return null;
     if (el.tagName.toLowerCase() !== entry.tag) return null;
     return el;

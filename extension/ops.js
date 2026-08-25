@@ -11,12 +11,11 @@
  * closes the browser, which has the rest of the owner's day in it.
  *
  * **`chrome.debugger` is the only way in.** There is no `chrome.scripting`, no
- * content script, and no `host_permissions` in the manifest — which means this
- * extension has *no standing access to any page at all*. It can only read or act
- * on a page while a `chrome.debugger` session is attached, and Chrome puts its own
- * un-suppressable "is being debugged" banner across the top of any tab in that
- * state. The owner's evidence that the ghost is looking is a browser-drawn
- * banner rather than our promise.
+ * content script, and no `host_permissions` in the manifest. The debugger grant
+ * can enumerate target URL/title metadata, which we use only for ghost-owned tab
+ * ids. Reading page content or acting on it requires an attached debugger session,
+ * and Chrome puts its own un-suppressable "is being debugged" banner across the
+ * top of that tab.
  *
  * **Input is real input.** Clicks, scrolls, drags, and keys go through
  * `Input.dispatch*` at hit-tested points, not `element.click()` and not
@@ -278,7 +277,9 @@ export function installOpsListeners(onNotice) {
     // A navigation is the one thing that can un-wedge a banned tab: the owner
     // dismissed the debugger banner, the page moved on, and attaching is worth
     // trying again.
-    if (changeInfo.url && state.banned) state.banned = false;
+    // `changeInfo.url` is redacted without the named `tabs` permission. Loading
+    // status is permission-free and is the navigation edge this state needs.
+    if (changeInfo.status === "loading" && state.banned) state.banned = false;
   });
 
   chrome.debugger.onDetach.addListener((source, reason) => {
@@ -357,6 +358,26 @@ function requireTab() {
 }
 
 /**
+ * `tabs.get()` itself needs no permission, but Chrome redacts URL/title unless an
+ * extension also has `tabs`, a matching host grant, or a temporary activeTab
+ * grant. The debugger permission we already need exposes that metadata through
+ * `getTargets()`, without the separate standing `tabs` grant. Restrict the lookup
+ * to a tab id already present in the ghost-owned set.
+ */
+async function tabSnapshot(tabId, targets = null) {
+  if (!state.tabs.has(tabId)) return null;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return null;
+  const targetList = targets ?? await chrome.debugger.getTargets().catch(() => []);
+  const target = targetList.find((entry) => entry.tabId === tabId);
+  return {
+    ...tab,
+    url: target?.url ?? tab.url ?? "",
+    title: target?.title ?? tab.title ?? "",
+  };
+}
+
+/**
  * A debugger session can outlive the service-worker instance that opened it,
  * because Chrome tracks the attachment per-extension. After the worker is reaped
  * and respawned, `getTargets()` can still report our tab as `attached` while our
@@ -432,7 +453,7 @@ async function ensureAttached() {
       + "again after the tab navigates somewhere.",
     );
   }
-  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const tab = await tabSnapshot(tabId);
   if (!tab) {
     dropTab(tabId);
     throw failed(FAILURES.noPage, "The ghost's tab is gone. Open a page again.");
@@ -591,7 +612,7 @@ async function evaluate(script, arg, timeoutMs, what, allowRebuild = true) {
 
 async function summary() {
   const tabId = requireTab();
-  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const tab = await tabSnapshot(tabId);
   if (!tab) {
     dropTab(tabId);
     throw failed(FAILURES.noPage, "The ghost's tab was closed.");
@@ -725,7 +746,7 @@ const VIRTUAL_KEYS = {
 const ops = {
   async status() {
     const tabId = state.activeTabId;
-    const tab = tabId === null ? null : await chrome.tabs.get(tabId).catch(() => null);
+    const tab = tabId === null ? null : await tabSnapshot(tabId);
     return {
       tab: tab ? { id: tab.id, url: tab.url ?? "", title: tab.title ?? "" } : null,
       attached: state.attached,
@@ -736,7 +757,7 @@ const ops = {
 
   async current() {
     if (state.activeTabId === null) return { page: null };
-    const tab = await chrome.tabs.get(state.activeTabId).catch(() => null);
+    const tab = await tabSnapshot(state.activeTabId);
     if (!tab) {
       dropTab(state.activeTabId);
       return { page: null };
@@ -1085,8 +1106,9 @@ const ops = {
 
     const infos = async () => {
       const out = [];
+      const targets = await chrome.debugger.getTargets().catch(() => []);
       for (const id of [...state.tabs]) {
-        const tab = await chrome.tabs.get(id).catch(() => null);
+        const tab = await tabSnapshot(id, targets);
         if (!tab) {
           dropTab(id);
           continue;
@@ -1200,5 +1222,15 @@ export async function runOp(op, args, timeoutMs) {
   if (!handler) {
     throw failed(FAILURES.invalidInput, `The relay extension does not implement "${op}".`);
   }
-  return handler(args ?? {}, Math.max(1_000, timeoutMs || 30_000));
+  const budget = Math.max(1_000, timeoutMs || 30_000);
+  // The relay protocol has a request deadline but no cancellation frame, and
+  // chrome.debugger.sendCommand has no AbortSignal. Bound the response lifecycle
+  // here so even ops made of several CDP calls answer on time. The late Chrome
+  // promise remains observed by Promise.race; it is not falsely presented as a
+  // transport cancellation.
+  return withTimeout(
+    handler(args ?? {}, budget),
+    budget,
+    `running ${op}`,
+  );
 }

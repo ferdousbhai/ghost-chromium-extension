@@ -14,6 +14,6 @@
     "typecheck": "true",
     "test": "node --test test/*.test.mjs",
     "install-extension": "bash contrib/install.sh",
-    "smoke": "node contrib/smoke.mjs"
+    "smoke": "bun contrib/smoke.mjs"
   }
 }

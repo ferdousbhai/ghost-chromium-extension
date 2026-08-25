@@ -4,6 +4,8 @@ import { afterEach, test } from "node:test";
 const originalChrome = globalThis.chrome;
 const originalWebSocket = globalThis.WebSocket;
 const originalSetTimeout = globalThis.setTimeout;
+const originalSetInterval = globalThis.setInterval;
+const originalClearInterval = globalThis.clearInterval;
 
 afterEach(() => {
   if (originalChrome === undefined) delete globalThis.chrome;
@@ -11,6 +13,8 @@ afterEach(() => {
   if (originalWebSocket === undefined) delete globalThis.WebSocket;
   else globalThis.WebSocket = originalWebSocket;
   globalThis.setTimeout = originalSetTimeout;
+  globalThis.setInterval = originalSetInterval;
+  globalThis.clearInterval = originalClearInterval;
 });
 
 function deferred() {
@@ -33,10 +37,16 @@ function eventHook() {
   };
 }
 
-function chromeMock({ loadSettings, restoreSession = async () => ({ ghostTabId: null }) }) {
+function chromeMock({
+  badges = [],
+  debuggerTargets = async () => [],
+  loadSettings,
+  restoreSession = async () => ({ ghostTabId: null }),
+  tabApi = {},
+}) {
   return {
     action: {
-      setBadgeText: async () => {},
+      setBadgeText: async ({ text }) => badges.push(text),
       setBadgeBackgroundColor: async () => {},
     },
     alarms: {
@@ -44,6 +54,7 @@ function chromeMock({ loadSettings, restoreSession = async () => ({ ghostTabId: 
       onAlarm: eventHook(),
     },
     debugger: {
+      getTargets: debuggerTargets,
       onDetach: eventHook(),
       onEvent: eventHook(),
     },
@@ -68,6 +79,7 @@ function chromeMock({ loadSettings, restoreSession = async () => ({ ghostTabId: 
       get: async () => null,
       onRemoved: eventHook(),
       onUpdated: eventHook(),
+      ...tabApi,
     },
   };
 }
@@ -226,7 +238,7 @@ test("only this extension's popup can read live relay status", async () => {
   assert.deepEqual(returns, [true]);
   await settle();
 
-  assert.equal(settingsReads, startupReads + 1);
+  assert.equal(settingsReads, startupReads);
   assert.deepEqual(status, {
     connected: false,
     paired: false,
@@ -235,4 +247,188 @@ test("only this extension's popup can read live relay status", async () => {
     lastError: "Not paired yet — run `ghostd relay-token` and paste the token below.",
     tab: null,
   });
+});
+
+test("a transient storage read failure is not cached as an unpaired configuration", async () => {
+  let settingsReads = 0;
+  globalThis.chrome = chromeMock({
+    loadSettings: async () => {
+      settingsReads += 1;
+      if (settingsReads === 1) throw new Error("storage worker restarting");
+      return { port: 8828, token: "recovered", enabled: true };
+    },
+  });
+
+  await import(`../extension/background.js?storage-retry=${Date.now()}`);
+  await settle();
+  assert.equal(settingsReads, 1);
+
+  const statuses = [];
+  const popupUrl = chrome.runtime.getURL("popup.html");
+  chrome.runtime.onMessage.emit(
+    { type: "ghost-relay-status" },
+    { id: chrome.runtime.id, url: popupUrl },
+    (status) => statuses.push(status),
+  );
+  await settle();
+  chrome.runtime.onMessage.emit(
+    { type: "ghost-relay-status" },
+    { id: chrome.runtime.id, url: popupUrl },
+    (status) => statuses.push(status),
+  );
+  await settle();
+
+  assert.equal(settingsReads, 2);
+  assert.deepEqual(statuses.map(({ paired, port }) => ({ paired, port })), [
+    { paired: true, port: 8828 },
+    { paired: true, port: 8828 },
+  ]);
+});
+
+test("settings are cached and an open socket stays off until a compatible welcome", async () => {
+  const badges = [];
+  const sockets = [];
+  let settingsReads = 0;
+  let stored = { port: 7717, token: "paired", enabled: true };
+  globalThis.chrome = chromeMock({
+    badges,
+    loadSettings: async () => {
+      settingsReads += 1;
+      return stored;
+    },
+  });
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.sent = [];
+      sockets.push(this);
+    }
+
+    send(raw) {
+      this.sent.push(JSON.parse(raw));
+    }
+
+    close() {
+      this.readyState = 3;
+    }
+  };
+
+  await import(`../extension/background.js?welcome=${Date.now()}`);
+  await settle();
+  assert.equal(settingsReads, 1);
+  const socket = sockets[0];
+  socket.readyState = WebSocket.OPEN;
+  socket.onopen();
+  await settle();
+  assert.deepEqual(socket.sent.map((frame) => frame.t), ["hello"]);
+  assert.equal(badges.at(-1), "off");
+
+  // Requests are not accepted merely because TCP/WebSocket setup completed.
+  socket.onmessage({ data: JSON.stringify({ t: "req", id: 1, op: "status", args: {} }) });
+  await settle();
+  assert.deepEqual(socket.sent.map((frame) => frame.t), ["hello"]);
+
+  socket.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 1, daemon: "ghostd" }) });
+  await settle();
+  assert.equal(badges.at(-1), "on");
+
+  socket.onmessage({ data: JSON.stringify({ t: "req", id: 2, op: "status", args: {} }) });
+  await settle();
+  assert.equal(socket.sent.at(-1).t, "res");
+  assert.equal(socket.sent.at(-1).id, 2);
+  assert.equal(settingsReads, 1, "requests reuse the cached settings snapshot");
+
+  stored = { ...stored, enabled: false };
+  chrome.storage.onChanged.emit({ enabled: { oldValue: true, newValue: false } }, "local");
+  await settle();
+  assert.equal(settingsReads, 2, "a storage change invalidates the cached snapshot");
+  assert.equal(badges.at(-1), "||");
+
+  socket.onmessage({ data: JSON.stringify({ t: "req", id: 3, op: "read", args: {} }) });
+  await settle();
+  assert.equal(socket.sent.at(-1).id, 3);
+  assert.equal(socket.sent.at(-1).ok, false);
+  assert.equal(socket.sent.at(-1).error.failure, "browser_unavailable");
+  assert.equal(settingsReads, 2);
+});
+
+test("a late operation result cannot cross into a replacement socket", async () => {
+  const statusRead = deferred();
+  const sockets = [];
+  let tabReads = 0;
+  let stored = { port: 7717, token: "first-token", enabled: true };
+  const tab = { id: 17, windowId: 4, status: "complete" };
+  globalThis.chrome = chromeMock({
+    debuggerTargets: async () => [{
+      tabId: 17,
+      type: "page",
+      attached: false,
+      url: "https://example.com/",
+      title: "Example",
+    }],
+    loadSettings: async () => stored,
+    restoreSession: async () => ({ ghostTabs: { tabs: [17], active: 17 } }),
+    tabApi: {
+      get: async () => {
+        tabReads += 1;
+        return tabReads === 2 ? statusRead.promise : tab;
+      },
+      remove: async () => {},
+    },
+  });
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.sent = [];
+      sockets.push(this);
+    }
+
+    send(raw) {
+      this.sent.push(JSON.parse(raw));
+    }
+
+    close() {
+      this.readyState = 3;
+    }
+  };
+
+  await import(`../extension/background.js?socket-generation=${Date.now()}`);
+  await settle();
+  const first = sockets[0];
+  first.readyState = WebSocket.OPEN;
+  first.onopen();
+  first.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 1, daemon: "ghostd" }) });
+  await settle();
+
+  first.onmessage({
+    data: JSON.stringify({ t: "req", id: 41, op: "status", args: {}, timeoutMs: 1_000 }),
+  });
+  await settle();
+  stored = { ...stored, token: "second-token" };
+  chrome.storage.onChanged.emit({ token: { oldValue: "first-token", newValue: "second-token" } }, "local");
+  await settle();
+  const second = sockets[1];
+  second.readyState = WebSocket.OPEN;
+  second.onopen();
+  second.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 1, daemon: "ghostd" }) });
+
+  statusRead.resolve(tab);
+  await settle();
+  assert.equal(first.sent.some((frame) => frame.id === 41), false);
+  assert.equal(second.sent.some((frame) => frame.id === 41), false);
+
+  // Leave the shared ops module without a remembered tab for later test files.
+  second.onmessage({ data: JSON.stringify({ t: "req", id: 42, op: "close", args: {} }) });
+  await settle();
+  assert.equal(second.sent.at(-1).id, 42);
 });

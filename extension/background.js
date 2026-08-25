@@ -43,8 +43,18 @@ let ws = null;
 let connectInFlight = null;
 /** Invalidates settings captured by an attempt that is already awaiting. */
 let connectEpoch = 0;
+/**
+ * Settings are read once per service-worker lifetime, then invalidated by the
+ * storage change event. The generation makes an already-running read retry
+ * rather than publishing values that changed while it was awaiting Chrome.
+ */
+let settingsGeneration = 0;
+let settingsCache = null;
+let settingsInFlight = null;
 let reconnectDelay = RECONNECT_MIN_MS;
 let pingTimer = null;
+/** The current socket only becomes connected after its compatible welcome. */
+let welcomedSocket = null;
 /** The last refusal from the daemon, so the popup can explain itself. */
 let lastError = "";
 /**
@@ -57,15 +67,44 @@ let lastError = "";
  */
 let protocolIncompatible = false;
 
-async function loadSettings() {
-  const stored = await chrome.storage.local
-    .get({ port: DEFAULT_PORT, token: "", enabled: true })
-    .catch(() => ({ port: DEFAULT_PORT, token: "", enabled: true }));
+function normalizeSettings(stored = {}) {
   return {
     port: Number(stored.port) || DEFAULT_PORT,
     token: typeof stored.token === "string" ? stored.token.trim() : "",
     enabled: stored.enabled !== false,
   };
+}
+
+function loadSettings() {
+  if (settingsCache !== null) return Promise.resolve(settingsCache);
+  if (settingsInFlight !== null) return settingsInFlight;
+
+  const generation = settingsGeneration;
+  const attempt = chrome.storage.local
+    .get({ port: DEFAULT_PORT, token: "", enabled: true })
+    .then(
+      (stored) => ({ settings: normalizeSettings(stored), cacheable: true }),
+      () => ({ settings: normalizeSettings(), cacheable: false }),
+    )
+    .then(({ settings, cacheable }) => {
+      if (generation !== settingsGeneration) return loadSettings();
+      // A transient Chrome storage failure must not pin unpaired defaults for
+      // the rest of this worker's lifetime; retry on the next caller instead.
+      if (cacheable) settingsCache = settings;
+      return settings;
+    });
+  settingsInFlight = attempt;
+  const clearAttempt = () => {
+    if (settingsInFlight === attempt) settingsInFlight = null;
+  };
+  void attempt.then(clearAttempt, clearAttempt);
+  return attempt;
+}
+
+function invalidateSettings() {
+  settingsGeneration += 1;
+  settingsCache = null;
+  settingsInFlight = null;
 }
 
 /** The badge is the whole status UI at a glance; never let it break the relay. */
@@ -83,8 +122,12 @@ async function setBadge(status) {
   }
 }
 
+function sendTo(socket, frame) {
+  if (ws === socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
+}
+
 function send(frame) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
+  if (welcomedSocket !== null && welcomedSocket === ws) sendTo(welcomedSocket, frame);
 }
 
 function notice(event, data) {
@@ -93,7 +136,7 @@ function notice(event, data) {
 
 async function refreshBadge() {
   const { enabled } = await loadSettings();
-  const connected = ws !== null && ws.readyState === WebSocket.OPEN;
+  const connected = ws !== null && welcomedSocket === ws && ws.readyState === WebSocket.OPEN;
   await setBadge(connected ? (enabled ? "on" : "paused") : "off");
 }
 
@@ -139,13 +182,17 @@ async function connectOnce(epoch) {
     return;
   }
   ws = socket;
+  welcomedSocket = null;
 
   socket.onopen = () => {
+    if (ws !== socket) {
+      socket.close(1000, "superseded");
+      return;
+    }
     // The backoff is NOT reset here: a socket opens even against a daemon whose
     // protocol we cannot speak, and resetting now is exactly what turns that into
     // a 1s storm. It is reset only once `welcome` is accepted (see handleFrame).
-    lastError = "";
-    send({
+    sendTo(socket, {
       t: "hello",
       protocol: PROTOCOL_VERSION,
       agent: `ghost-relay/${chrome.runtime.getManifest().version}`,
@@ -155,11 +202,11 @@ async function connectOnce(epoch) {
     // Not liveness — this is what keeps the service worker from being reaped
     // between two of the ghost's tool calls.
     pingTimer = setInterval(() => notice("ping", null), PING_INTERVAL_MS);
-    void refreshBadge();
+    void setBadge("off");
   };
 
   socket.onmessage = (event) => {
-    if (typeof event.data === "string") void handleFrame(event.data);
+    if (typeof event.data === "string") void handleFrame(socket, event.data);
   };
 
   socket.onerror = () => {
@@ -171,6 +218,7 @@ async function connectOnce(epoch) {
     // A newer socket already took over: this close belongs to a dead one.
     if (ws !== socket) return;
     ws = null;
+    if (welcomedSocket === socket) welcomedSocket = null;
     if (pingTimer !== null) {
       clearInterval(pingTimer);
       pingTimer = null;
@@ -213,7 +261,8 @@ function connect() {
   return attempt;
 }
 
-async function handleFrame(raw) {
+async function handleFrame(socket, raw) {
+  if (ws !== socket) return;
   let frame;
   try {
     frame = JSON.parse(raw);
@@ -226,20 +275,24 @@ async function handleFrame(raw) {
       lastError =
         `ghostd speaks relay protocol ${frame.protocol}; this extension speaks `
         + `${PROTOCOL_VERSION}. Update whichever is older.`;
-      ws?.close(4000, lastError);
+      socket.close(4000, lastError);
       return;
     }
     // A compatible daemon has greeted us: only now is the connection truly good,
     // so only now is the backoff safe to reset.
     protocolIncompatible = false;
     reconnectDelay = RECONNECT_MIN_MS;
+    welcomedSocket = socket;
+    lastError = "";
+    void refreshBadge();
     return;
   }
   if (frame?.t !== "req" || typeof frame.id !== "number") return;
+  if (welcomedSocket !== socket) return;
 
   const { enabled } = await loadSettings();
   if (!enabled && frame.op !== "status") {
-    send({
+    sendTo(socket, {
       t: "res",
       id: frame.id,
       ok: false,
@@ -255,9 +308,9 @@ async function handleFrame(raw) {
 
   try {
     const result = await runOp(frame.op, frame.args ?? {}, frame.timeoutMs ?? 30_000);
-    send({ t: "res", id: frame.id, ok: true, result });
+    sendTo(socket, { t: "res", id: frame.id, ok: true, result });
   } catch (error) {
-    send(toErrorFrame(frame.id, error));
+    sendTo(socket, toErrorFrame(frame.id, error));
   }
 }
 
@@ -272,14 +325,22 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
+  if (changes.port || changes.token || changes.enabled) invalidateSettings();
   if (changes.port || changes.token) {
     // Re-dial with the new settings rather than waiting for the next alarm. New
     // settings can mean a fixed daemon, so clear the protocol latch and give it
     // a fresh chance.
     connectEpoch += 1;
     protocolIncompatible = false;
-    ws?.close(1000, "settings changed");
+    const oldSocket = ws;
     ws = null;
+    if (welcomedSocket === oldSocket) welcomedSocket = null;
+    oldSocket?.close(1000, "settings changed");
+    if (pingTimer !== null) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+    }
+    void releaseTab();
     reconnectDelay = RECONNECT_MIN_MS;
     void connect();
     return;
@@ -319,7 +380,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       // No tab yet is the normal case.
     }
     respond({
-      connected: ws !== null && ws.readyState === WebSocket.OPEN,
+      connected: ws !== null && welcomedSocket === ws && ws.readyState === WebSocket.OPEN,
       paired: settings.token !== "",
       enabled: settings.enabled,
       port: settings.port,
