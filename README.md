@@ -75,7 +75,6 @@ there must not also hand out the API. Any page you visit can open
 | 32-byte token, compared in constant time | Everything else, including another extension. |
 | One connection at a time | A second browser interleaving clicks on the same tab. |
 | Closed op set — no `eval` frame | A compromised daemon running arbitrary script in your signed-in pages. |
-| Visitor scope refused at the backend *factory* | A visitor conversation ever reaching this at all. |
 
 And on the extension side:
 

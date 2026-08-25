@@ -28,7 +28,6 @@ export const RELAY_PATH = "/relay";
  * through CDP `Runtime.evaluate`. It is the only op that carries a code string;
  * every other verb is a fixed action the extension implements itself, so a
  * compromised daemon socket still cannot smuggle script through, say, `find`.
- * A visitor never reaches this backend at all (the scope locks live daemon-side).
  */
 export const OPS = [
   "status",
@@ -68,7 +67,6 @@ export const FAILURES = {
   unknownRef: "unknown_ref",
   elementNotFound: "element_not_found",
   invalidInput: "invalid_input",
-  forbiddenScope: "forbidden_scope",
 };
 
 /** A failure that should travel back to the ghost as a structured refusal. */
