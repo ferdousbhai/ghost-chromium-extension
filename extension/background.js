@@ -354,6 +354,7 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 chrome.runtime.onStartup.addListener(() => void connect());
 
+// Restrict live relay state to this extension's installed popup.
 function isPopupSender(sender) {
   return sender?.id === chrome.runtime.id
     && sender?.url === chrome.runtime.getURL("popup.html")
