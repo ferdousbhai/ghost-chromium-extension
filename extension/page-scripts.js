@@ -36,12 +36,10 @@
  * Every snippet walks open shadow roots. Half the web's buttons live in one.
  */
 
-/** Wrap a snippet into an expression that actually runs, with its argument inlined. */
 export function callScript(script, arg) {
   return `(${script})(${arg === undefined ? "" : JSON.stringify(arg)})`;
 }
 
-/** Shared prelude: walk every element in the document, shadow roots included. */
 const WALK = `
   const ghostWalk = (visit, maxVisits = Number.POSITIVE_INFINITY) => {
     // TreeWalker advances one node at a time, so the visit budget is enforced

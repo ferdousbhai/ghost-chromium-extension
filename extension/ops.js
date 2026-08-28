@@ -45,17 +45,14 @@ import {
 const CDP_VERSION = "1.3";
 /** URLs `chrome.debugger` cannot attach to. */
 const INELIGIBLE_URL = /^(chrome|devtools|edge|view-source|chrome-extension|chrome-untrusted|chrome-search|about):/i;
-/** How long to watch for a click to turn into a navigation before calling it settled. */
 const SETTLE_WATCH_MS = 900;
 /** Chrome's own texture limits; a taller capture comes back blank or fails. */
 const MAX_CAPTURE_PX = 16_384;
-/** How many console / network entries a ring keeps before dropping the oldest. */
 const RING_LIMIT = 200;
 
 const state = {
   /** The chrome tab ids the ghost owns. Relaxed from the old one-tab invariant. */
   tabs: new Set(),
-  /** The owned tab every page op acts on, or null when the ghost owns none. */
   activeTabId: null,
   attached: false,
   /** Set when attach failed or the owner dismissed the debugger banner. */
@@ -68,21 +65,15 @@ const state = {
    * to null whenever the world is gone: a navigation, a detach, a new active tab.
    */
   worldContextId: null,
-  /** Whether Runtime/Network/DOM have been enabled on the current attachment. */
   domainsEnabled: false,
-  /** Invalidates attach work captured before a release, reset, or tab switch. */
   attachGeneration: 0,
 };
 
-/** Console and network rings, tagged with the tab they came from, drained per op. */
 const consoleRing = [];
 const networkRing = [];
-/** requestId → the ring entry, so a response can fill the request it answered. */
 const netPending = new Map();
-/** Captured-tab attach/cleanup work that a newer same-tab generation must await. */
 const attachBarriers = new Map();
 
-/** Where the ghost's tab ids survive a service-worker restart. */
 const SESSION_KEY = "ghostTabs";
 
 function persist() {
@@ -111,7 +102,6 @@ export async function restoreTabFromSession() {
   }
 }
 
-/** Reset the attach machinery for a new active tab; the old attachment is left be. */
 function resetAttachment() {
   state.attachGeneration += 1;
   state.attached = false;
@@ -121,7 +111,6 @@ function resetAttachment() {
   state.domainsEnabled = false;
 }
 
-/** Add a tab, make it active, and start fresh on the attach machinery. */
 function rememberTab(tabId) {
   state.tabs.add(tabId);
   state.activeTabId = tabId;
@@ -129,14 +118,12 @@ function rememberTab(tabId) {
   persist();
 }
 
-/** Point the ghost at an already-owned tab. */
 function setActive(tabId) {
   state.activeTabId = tabId;
   resetAttachment();
   persist();
 }
 
-/** Drop one tab from the owned set, choosing a new active if it was the active one. */
 function dropTab(tabId) {
   const wasActive = tabId === state.activeTabId;
   state.tabs.delete(tabId);
@@ -147,7 +134,6 @@ function dropTab(tabId) {
   persist();
 }
 
-/** Forget every tab — used by the full-teardown `close` and lost-tab recovery. */
 function forgetTab() {
   state.tabs.clear();
   state.activeTabId = null;
@@ -163,7 +149,6 @@ export function isAttached() {
   return state.attached;
 }
 
-// ------------------------------------------------------------------- ring buffers
 
 function pushRing(ring, entry) {
   ring.push(entry);
@@ -241,7 +226,6 @@ function fillFinished(params) {
   netPending.delete(params?.requestId);
 }
 
-/** Drain a ring of the active tab's entries, stripping the internal bookkeeping. */
 function drainRing(ring) {
   const active = state.activeTabId;
   const out = [];
@@ -259,7 +243,6 @@ function drainRing(ring) {
   return out;
 }
 
-// ------------------------------------------------------------------ listeners
 
 /**
  * Wire the tab and debugger events. Called once from the service worker; every
@@ -335,7 +318,6 @@ export function installOpsListeners(onNotice) {
   });
 }
 
-// ------------------------------------------------------------------- plumbing
 
 function withTimeout(promise, timeoutMs, what) {
   let timer;
@@ -434,7 +416,6 @@ function isCurrentAttach(attempt) {
     && state.activeTabId === attempt.tabId;
 }
 
-/** A stale successful attach owns removing exactly the captured tab's debugger. */
 async function detachStale(tabId) {
   await chrome.debugger.detach({ tabId }).catch(() => {});
 }
@@ -568,7 +549,6 @@ async function ensureIsolatedWorld() {
   return contextId;
 }
 
-/** Does this rejection mean the isolated world is gone (navigation between ops)? */
 function isStaleWorld(error) {
   const message = String(error?.message ?? error ?? "").toLowerCase();
   return message.includes("context")
@@ -620,7 +600,6 @@ async function summary() {
   return { url: tab.url ?? "", title: tab.title ?? "" };
 }
 
-/** Resolve once the tab reports `complete`, or once the budget runs out. */
 function waitForLoad(tabId, timeoutMs) {
   return new Promise((resolve) => {
     let settled = false;
@@ -719,7 +698,6 @@ async function resolveTarget(args, timeoutMs, { clickable }) {
   return found;
 }
 
-/** The CDP modifier bitmask from names: Alt=1, Ctrl=2, Meta=4, Shift=8. */
 function modifierMask(modifiers) {
   if (!Array.isArray(modifiers)) return 0;
   let mask = 0;
@@ -734,14 +712,12 @@ function modifierMask(modifiers) {
   return mask;
 }
 
-/** Windows virtual key codes for the non-printable keys worth naming. */
 const VIRTUAL_KEYS = {
   Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46,
   ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
   Home: 36, End: 35, PageUp: 33, PageDown: 34, " ": 32,
 };
 
-// --------------------------------------------------------------------- the ops
 
 const ops = {
   async status() {
@@ -1207,7 +1183,6 @@ const ops = {
   },
 };
 
-/** Detach and drop the active tab without closing it — used when the socket goes away. */
 export async function releaseTab() {
   const tabId = state.activeTabId;
   if (tabId !== null && state.attached) {
@@ -1216,7 +1191,6 @@ export async function releaseTab() {
   resetAttachment();
 }
 
-/** Run one op. Throws `RelayOpError` for anything the ghost should be told about. */
 export async function runOp(op, args, timeoutMs) {
   const handler = ops[op];
   if (!handler) {

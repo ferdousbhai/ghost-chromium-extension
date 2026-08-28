@@ -41,7 +41,6 @@ let ws = null;
  * constructor before any of them assigns `ws`.
  */
 let connectInFlight = null;
-/** Invalidates settings captured by an attempt that is already awaiting. */
 let connectEpoch = 0;
 /**
  * Settings are read once per service-worker lifetime, then invalidated by the
@@ -55,7 +54,6 @@ let reconnectDelay = RECONNECT_MIN_MS;
 let pingTimer = null;
 /** The current socket only becomes connected after its compatible welcome. */
 let welcomedSocket = null;
-/** The last refusal from the daemon, so the popup can explain itself. */
 let lastError = "";
 /**
  * Latched when the daemon's `welcome` reports a protocol version this extension
@@ -107,7 +105,6 @@ function invalidateSettings() {
   settingsInFlight = null;
 }
 
-/** The badge is the whole status UI at a glance; never let it break the relay. */
 async function setBadge(status) {
   const look = {
     on: { text: "on", color: "#1a7f37" },
@@ -140,7 +137,6 @@ async function refreshBadge() {
   await setBadge(connected ? (enabled ? "on" : "paused") : "off");
 }
 
-// ------------------------------------------------------------------ the socket
 
 function scheduleReconnect() {
   if (protocolIncompatible) {
@@ -314,7 +310,6 @@ async function handleFrame(socket, raw) {
   }
 }
 
-// -------------------------------------------------------------------- lifecycle
 
 installOpsListeners(notice);
 
@@ -359,14 +354,12 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 chrome.runtime.onStartup.addListener(() => void connect());
 
-/** Only the installed popup is allowed to read live relay state. */
 function isPopupSender(sender) {
   return sender?.id === chrome.runtime.id
     && sender?.url === chrome.runtime.getURL("popup.html")
     && sender.tab === undefined;
 }
 
-/** The popup asks for state rather than reaching into the worker's variables. */
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (message?.type !== "ghost-relay-status") return undefined;
   if (!isPopupSender(sender)) return undefined;

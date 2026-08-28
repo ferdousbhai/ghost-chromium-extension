@@ -82,7 +82,6 @@ export class RelayOpError extends Error {
 export const failed = (failure, message, details) =>
   new RelayOpError(failure, message, details);
 
-/** Anything that is not a `RelayOpError` is a bug here, not a page problem. */
 export function toErrorFrame(id, error) {
   if (error instanceof RelayOpError) {
     return {
