@@ -25,7 +25,7 @@
  * the one field a browser `WebSocket` lets you set: the subprotocol list.
  */
 import { PROTOCOL_VERSION, RELAY_PATH, SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX, toErrorFrame } from "./protocol.js";
-import { installOpsListeners, releaseTab, restoreTabFromSession, runOp } from "./ops.js";
+import { installOpsListeners, releaseAllTabs, restoreTabsFromSession, runOp } from "./ops.js";
 
 const DEFAULT_PORT = 7717;
 const PING_INTERVAL_MS = 20_000;
@@ -162,7 +162,7 @@ async function connectOnce(epoch) {
     return;
   }
 
-  await restoreTabFromSession();
+  await restoreTabsFromSession();
   if (epoch !== connectEpoch) return;
 
   // A browser WebSocket cannot set headers, so the token rides in the one field
@@ -227,7 +227,7 @@ async function connectOnce(epoch) {
     void setBadge("off");
     // Let go of the debugger so the owner's tab is not left with a banner over
     // a relay that is no longer there.
-    void releaseTab();
+    void releaseAllTabs();
     scheduleReconnect();
   };
 }
@@ -335,7 +335,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
       clearInterval(pingTimer);
       pingTimer = null;
     }
-    void releaseTab();
+    void releaseAllTabs();
     reconnectDelay = RECONNECT_MIN_MS;
     void connect();
     return;
@@ -366,10 +366,10 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (!isPopupSender(sender)) return undefined;
   void (async () => {
     const settings = await loadSettings();
-    let tab = null;
+    let tabs = [];
     try {
       const status = await runOp("status", {}, 2_000);
-      tab = status.tab;
+      if (Array.isArray(status.tabs)) tabs = status.tabs;
     } catch {
       // No tab yet is the normal case.
     }
@@ -379,7 +379,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       enabled: settings.enabled,
       port: settings.port,
       lastError,
-      tab,
+      tabs,
     });
   })();
   return true;

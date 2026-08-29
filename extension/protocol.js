@@ -11,8 +11,11 @@
  */
 
 /** Bumped when a frame shape changes incompatibly. */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
+// The handshake name, deliberately frozen while PROTOCOL_VERSION moves: it
+// identifies the socket, and the `hello`/`welcome` exchange negotiates the
+// version. Renaming it would unpair every installed browser.
 export const SUBPROTOCOL = "ghost-relay.v1";
 export const TOKEN_SUBPROTOCOL_PREFIX = "ghost-token.";
 export const RELAY_PATH = "/relay";

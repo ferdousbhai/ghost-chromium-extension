@@ -41,6 +41,7 @@ function chromeMock({
   detach = async () => {},
   getTargets,
   sendCommand = async () => ({}),
+  tabRemove = () => {},
 }) {
   const tabs = new Map();
   let nextTabId = 17;
@@ -88,6 +89,7 @@ function chromeMock({
       onRemoved: eventHook(),
       onUpdated: eventHook(),
       remove: async (id) => {
+        tabRemove(id);
         tabs.delete(id);
       },
       update: async (id, update) => {
@@ -111,10 +113,10 @@ test("every concurrent attach waiter receives browser_unavailable", async () => 
     },
   });
   const { runOp } = await import(`../extension/ops.js?attach-failure=${Date.now()}`);
-  await runOp("open", { url: "https://example.com/" }, 1_000);
+  await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
 
-  const first = runOp("read", {}, 1_000);
-  const waiter = runOp("read", {}, 1_000);
+  const first = runOp("read", { session: "s1", tab: "17" }, 1_000);
+  const waiter = runOp("read", { session: "s1", tab: "17" }, 1_000);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(attachCalls, 1);
 
@@ -129,7 +131,7 @@ test("every concurrent attach waiter receives browser_unavailable", async () => 
   }
 
   await assert.rejects(
-    runOp("read", {}, 1_000),
+    runOp("read", { session: "s1", tab: "17" }, 1_000),
     (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
   );
   assert.equal(attachCalls, 1);
@@ -156,17 +158,17 @@ test("release invalidates an in-flight attach and the stale success detaches its
       return {};
     },
   });
-  const { installOpsListeners, isAttached, releaseTab, runOp } = await import(
+  const { installOpsListeners, isAttached, releaseAllTabs, runOp } = await import(
     `../extension/ops.js?release-attach=${Date.now()}`
   );
   installOpsListeners();
-  await runOp("open", { url: "https://example.com/" }, 1_000);
+  await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
 
-  const read = runOp("read", {}, 1_000);
+  const read = runOp("read", { session: "s1", tab: "17" }, 1_000);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(attachTargets, [17]);
-  await releaseTab();
-  const retry = runOp("read", {}, 1_000);
+  await releaseAllTabs();
+  const retry = runOp("read", { session: "s1", tab: "17" }, 1_000);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(attachTargets, [17], "same-tab retry must wait for stale cleanup");
 
@@ -175,26 +177,26 @@ test("release invalidates an in-flight attach and the stale success detaches its
     read,
     (error) => error instanceof RelayOpError
       && error.failure === "browser_unavailable"
-      && /active ghost tab changed/.test(error.message),
+      && /Tab 17 was released while Chromium was attaching/.test(error.message),
   );
   assert.deepEqual(detachTargets, [17]);
-  assert.equal(isAttached(), false);
+  assert.equal(isAttached(17), false);
 
   const retried = await retry;
   assert.equal(retried.text, "ok");
   assert.deepEqual(attachTargets, [17, 17]);
-  assert.equal(isAttached(), true);
+  assert.equal(isAttached(17), true);
 
   chrome.debugger.onDetach.emit({ tabId: 17 }, "canceled_by_user");
-  assert.equal(isAttached(), false);
+  assert.equal(isAttached(17), false);
   await assert.rejects(
-    runOp("read", {}, 1_000),
+    runOp("read", { session: "s1", tab: "17" }, 1_000),
     (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
   );
   assert.deepEqual(attachTargets, [17, 17], "a genuine detach must not be suppressed");
 
   chrome.tabs.onUpdated.emit(17, { status: "loading" });
-  const afterNavigation = await runOp("read", {}, 1_000);
+  const afterNavigation = await runOp("read", { session: "s1", tab: "17" }, 1_000);
   assert.equal(afterNavigation.text, "ok");
   assert.deepEqual(
     attachTargets,
@@ -203,53 +205,122 @@ test("release invalidates an in-flight attach and the stale success detaches its
   );
 });
 
-test("switch invalidates an in-flight attach without resurrecting the old tab", async () => {
-  const firstAttach = deferred();
+test("two tabs keep their own attachment and isolated world", async () => {
   const attachTargets = [];
-  const detachTargets = [];
+  const worlds = [];
+  let nextContextId = 9;
   globalThis.chrome = chromeMock({
-    attach: ({ tabId }) => {
+    attach: async ({ tabId }) => {
       attachTargets.push(tabId);
-      return attachTargets.length === 1 ? firstAttach.promise : Promise.resolve();
     },
-    detach: async ({ tabId }) => {
-      detachTargets.push(tabId);
-    },
-    sendCommand: async (_target, method) => {
+    sendCommand: async ({ tabId }, method) => {
       if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
-      if (method === "Page.createIsolatedWorld") return { executionContextId: 9 };
+      if (method === "Page.createIsolatedWorld") {
+        nextContextId += 1;
+        worlds.push({ tabId, contextId: nextContextId });
+        return { executionContextId: nextContextId };
+      }
       if (method === "Runtime.evaluate") {
-        return { result: { value: { url: "https://second.example/", title: "Second", text: "ok" } } };
+        return { result: { value: { url: "https://example/", title: "T", text: `tab ${tabId}` } } };
       }
       return {};
     },
   });
-  const { currentTabId, isAttached, runOp } = await import(
-    `../extension/ops.js?switch-attach=${Date.now()}`
+  const { installOpsListeners, isAttached, runOp } = await import(
+    `../extension/ops.js?two-tabs=${Date.now()}`
   );
-  await runOp("open", { url: "https://first.example/" }, 1_000);
-  await runOp("tabs", { op: "create", url: "https://second.example/" }, 1_000);
-  await runOp("tabs", { op: "switch", id: "17" }, 1_000);
+  installOpsListeners();
+  await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
+  await runOp("tabs", { session: "s1", op: "create", url: "https://second.example/" }, 1_000);
 
-  const read = runOp("read", {}, 1_000);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(attachTargets, [17]);
-  await runOp("tabs", { op: "switch", id: "18" }, 1_000);
-
-  firstAttach.resolve();
-  await assert.rejects(
-    read,
-    (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
-  );
-  assert.deepEqual(detachTargets, [17]);
-  assert.equal(currentTabId(), 18);
-  assert.equal(isAttached(), false);
-
-  const retried = await runOp("read", {}, 1_000);
-  assert.equal(retried.text, "ok");
+  assert.equal((await runOp("read", { session: "s1", tab: "17" }, 1_000)).text, "tab 17");
+  assert.equal((await runOp("read", { session: "s1", tab: "18" }, 1_000)).text, "tab 18");
   assert.deepEqual(attachTargets, [17, 18]);
-  assert.equal(currentTabId(), 18);
-  assert.equal(isAttached(), true);
+  assert.equal(isAttached(17), true);
+  assert.equal(isAttached(18), true);
+  assert.deepEqual(worlds, [{ tabId: 17, contextId: 10 }, { tabId: 18, contextId: 11 }]);
+
+  // A navigation on one tab drops only that tab's world, so the other
+  // conversation's refs survive.
+  chrome.debugger.onEvent.emit({ tabId: 17 }, "Page.frameNavigated", { frame: { id: "main" } });
+  await runOp("read", { session: "s1", tab: "18" }, 1_000);
+  assert.equal(worlds.length, 2, "tab 18 must reuse its own world");
+  await runOp("read", { session: "s1", tab: "17" }, 1_000);
+  assert.deepEqual(worlds.at(-1), { tabId: 17, contextId: 12 });
+
+  // Nor does one tab's detach ban the other.
+  chrome.debugger.onDetach.emit({ tabId: 17 }, "canceled_by_user");
+  assert.equal(isAttached(17), false);
+  assert.equal(isAttached(18), true);
+  assert.equal((await runOp("read", { session: "s1", tab: "18" }, 1_000)).text, "tab 18");
+});
+
+test("status names every claimed tab so the popup can show them", async () => {
+  globalThis.chrome = chromeMock({ attach: async () => {} });
+  const { runOp } = await import(`../extension/ops.js?status-tabs=${Date.now()}`);
+  await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
+  await runOp("tabs", { session: "s1", op: "create", url: "https://second.example/" }, 1_000);
+
+  // The popup asks without a tab of its own: it is the owner's view of the whole
+  // browser, not one conversation's.
+  const all = await runOp("status", {}, 1_000);
+  assert.deepEqual(all.tabs.map((tab) => tab.title), ["Tab 17", "Tab 18"]);
+  assert.deepEqual(all.tabs.map((tab) => tab.active), [false, false]);
+
+  const one = await runOp("status", { session: "s1", tab: "18" }, 1_000);
+  assert.equal(one.attached, false);
+  assert.equal(one.banned, false);
+  assert.deepEqual(one.tabs.map((tab) => tab.active), [false, true]);
+});
+
+test("a session sees, drives, and closes only the tabs it opened", async () => {
+  const removed = [];
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    tabRemove: async (id) => removed.push(id),
+  });
+  const { runOp } = await import(`../extension/ops.js?ownership=${Date.now()}`);
+  await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
+  await runOp("open", { session: "s2", url: "https://second.example/" }, 1_000);
+
+  // One conversation must not learn the other's tab id from the list...
+  const mine = await runOp("tabs", { session: "s1", op: "list", tab: "17" }, 1_000);
+  assert.deepEqual(mine.tabs.map((tab) => tab.id), ["17"]);
+  assert.equal(mine.active, "17");
+
+  // ...nor act on it if it guesses one.
+  for (const op of ["switch", "close"]) {
+    await assert.rejects(
+      runOp("tabs", { session: "s1", op, id: "18", tab: "17" }, 1_000),
+      (error) => error instanceof RelayOpError && error.failure === "invalid_input",
+    );
+  }
+  await assert.rejects(
+    runOp("read", { session: "s1", tab: "18" }, 1_000),
+    (error) => error instanceof RelayOpError && error.failure === "no_page",
+  );
+  assert.deepEqual(removed, []);
+});
+
+test("closing a session sweeps every tab it opened, not just the last one", async () => {
+  const removed = [];
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    tabRemove: async (id) => removed.push(id),
+  });
+  const { runOp } = await import(`../extension/ops.js?sweep=${Date.now()}`);
+  await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
+  // `tabs create` re-points the caller; the tab it moved off must not be orphaned.
+  await runOp("tabs", { session: "s1", op: "create", url: "https://second.example/" }, 1_000);
+  await runOp("open", { session: "s2", url: "https://third.example/" }, 1_000);
+
+  const closed = await runOp("close", { session: "s1", tab: "18" }, 1_000);
+  assert.equal(closed.closed, true);
+  assert.deepEqual(removed, [17, 18], "both of s1's tabs, and only s1's");
+
+  // s2 is untouched and still works.
+  const other = await runOp("tabs", { session: "s2", op: "list", tab: "19" }, 1_000);
+  assert.deepEqual(other.tabs.map((tab) => tab.id), ["19"]);
 });
 
 test("find clamps relay-provided limits before evaluating page code", async () => {
@@ -270,7 +341,7 @@ test("find clamps relay-provided limits before evaluating page code", async () =
     },
   });
   const { runOp } = await import(`../extension/ops.js?find-limit=${Date.now()}`);
-  await runOp("open", { url: "https://example.com/" }, 1_000);
+  await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
 
   for (const query of [
     ":scope",
@@ -281,7 +352,7 @@ test("find clamps relay-provided limits before evaluating page code", async () =
     ":is(&)",
   ]) {
     await assert.rejects(
-      runOp("find", { query, limit: 5 }, 1_000),
+      runOp("find", { session: "s1", tab: "17", query, limit: 5 }, 1_000),
       (error) => error instanceof RelayOpError
         && error.failure === "invalid_input"
         && /bounded selector scan/.test(error.message),
@@ -290,8 +361,8 @@ test("find clamps relay-provided limits before evaluating page code", async () =
   assert.equal(attachCalls, 0, "unsupported selectors must be rejected before attach");
   assert.equal(expressions.length, 0, "unsupported selectors must not reach the page");
 
-  await runOp("find", { query: "needle", limit: 10_000 }, 1_000);
-  await runOp("find", { query: "needle", limit: -20 }, 1_000);
+  await runOp("find", { session: "s1", tab: "17", query: "needle", limit: 10_000 }, 1_000);
+  await runOp("find", { session: "s1", tab: "17", query: "needle", limit: -20 }, 1_000);
 
   assert.equal(attachCalls, 1);
   assert.match(expressions[0], /\)\(\{"query":"needle","limit":100\}\)$/);
@@ -302,13 +373,13 @@ test("owned tab metadata comes from debugger targets without the tabs permission
   globalThis.chrome = chromeMock({ attach: async () => {} });
   const { runOp } = await import(`../extension/ops.js?target-metadata=${Date.now()}`);
 
-  const opened = await runOp("open", { url: "https://example.com/path" }, 1_000);
+  const opened = await runOp("open", { session: "s1", url: "https://example.com/path" }, 1_000);
   assert.deepEqual(opened.page, {
     url: "https://example.com/path",
     title: "Tab 17",
   });
 
-  const listed = await runOp("tabs", { op: "list" }, 1_000);
+  const listed = await runOp("tabs", { session: "s1", op: "list", tab: "17" }, 1_000);
   assert.deepEqual(listed.tabs, [{
     id: "17",
     url: "https://example.com/path",
@@ -321,11 +392,11 @@ test("the relay operation deadline bounds CDP work without claiming to cancel it
   const attaching = deferred();
   globalThis.chrome = chromeMock({ attach: () => attaching.promise });
   const { runOp } = await import(`../extension/ops.js?operation-deadline=${Date.now()}`);
-  await runOp("open", { url: "https://example.com/" }, 1_000);
+  await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
 
   const started = Date.now();
   await assert.rejects(
-    runOp("read", {}, 1_000),
+    runOp("read", { session: "s1", tab: "17" }, 1_000),
     (error) => error instanceof RelayOpError
       && error.failure === "timeout"
       && /running read/.test(error.message),

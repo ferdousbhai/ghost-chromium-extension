@@ -37,12 +37,15 @@ function render(status) {
       ? "Retrying. Is ghostd running?"
       : "Run `ghostd relay-token` in a terminal and paste the token below."));
 
-  if (status.tab) {
+  // One tab per conversation, so there may be several open at once.
+  const tabs = Array.isArray(status.tabs) ? status.tabs : [];
+  if (tabs.length > 0) {
     tabBox.hidden = false;
     tabBox.innerHTML = "";
     const label = document.createElement("strong");
-    label.textContent = "Ghost's tab: ";
-    tabBox.append(label, document.createTextNode(status.tab.title || status.tab.url || ""));
+    label.textContent = tabs.length === 1 ? "Ghost's tab: " : `Ghost's tabs (${tabs.length}): `;
+    const named = tabs.map((tab) => tab.title || tab.url || "").join(", ");
+    tabBox.append(label, document.createTextNode(named));
   } else {
     tabBox.hidden = true;
   }
@@ -71,7 +74,7 @@ async function refresh() {
     paired: (settings.token ?? "") !== "",
     enabled: settings.enabled !== false,
     lastError: "",
-    tab: null,
+    tabs: [],
   });
 }
 

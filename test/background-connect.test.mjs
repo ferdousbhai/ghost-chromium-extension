@@ -245,7 +245,7 @@ test("only this extension's popup can read live relay status", async () => {
     enabled: true,
     port: 7717,
     lastError: "Not paired yet — run `ghostd relay-token` and paste the token below.",
-    tab: null,
+    tabs: [],
   });
 });
 
@@ -333,7 +333,7 @@ test("settings are cached and an open socket stays off until a compatible welcom
   await settle();
   assert.deepEqual(socket.sent.map((frame) => frame.t), ["hello"]);
 
-  socket.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 1, daemon: "ghostd" }) });
+  socket.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 2, daemon: "ghostd" }) });
   await settle();
   assert.equal(badges.at(-1), "on");
 
@@ -372,7 +372,7 @@ test("a late operation result cannot cross into a replacement socket", async () 
       title: "Example",
     }],
     loadSettings: async () => stored,
-    restoreSession: async () => ({ ghostTabs: { tabs: [17], active: 17 } }),
+    restoreSession: async () => ({ ghostTabs: { tabs: [17] } }),
     tabApi: {
       get: async () => {
         tabReads += 1;
@@ -407,11 +407,11 @@ test("a late operation result cannot cross into a replacement socket", async () 
   const first = sockets[0];
   first.readyState = WebSocket.OPEN;
   first.onopen();
-  first.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 1, daemon: "ghostd" }) });
+  first.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 2, daemon: "ghostd" }) });
   await settle();
 
   first.onmessage({
-    data: JSON.stringify({ t: "req", id: 41, op: "status", args: {}, timeoutMs: 1_000 }),
+    data: JSON.stringify({ t: "req", id: 41, op: "status", args: { tab: "17" }, timeoutMs: 1_000 }),
   });
   await settle();
   stored = { ...stored, token: "second-token" };
@@ -420,7 +420,7 @@ test("a late operation result cannot cross into a replacement socket", async () 
   const second = sockets[1];
   second.readyState = WebSocket.OPEN;
   second.onopen();
-  second.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 1, daemon: "ghostd" }) });
+  second.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 2, daemon: "ghostd" }) });
 
   statusRead.resolve(tab);
   await settle();

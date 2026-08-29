@@ -1,12 +1,16 @@
 # Ghost browser relay (Chromium extension)
 
 "My browser" mode: the ghost drives **tabs it created in the browser you are
-already signed into**, instead of a separate profile of its own. It acts through
-one selected ghost-owned tab at a time and can switch among the rest.
+already signed into**, instead of a separate profile of its own. Every operation
+names the tab it acts on, so each conversation drives its own tab: one extension
+serves them all over one socket without their attachments, isolated worlds, or
+element refs colliding.
 
-The other mode — "Ghost's browser", a dedicated Playwright Chromium profile under
-the ghost home — stays the default and is the right choice for anything
-autonomous. This one exists for the jobs where the point *is* your session: read
+This is the default mode. The other — "Ghost's browser", a dedicated Playwright
+Chromium profile under the ghost home — is selected with `browserMode: "profile"`
+and remains the right choice for anything autonomous; until this extension pairs,
+relay sessions fail their browser calls rather than falling back to it. "My
+browser" exists for the jobs where the point *is* your session: read
 the thing behind the login, fill the form on the site that knows who you are,
 check the dashboard you never log out of.
 
@@ -17,7 +21,7 @@ ghost tool call
   → GhostBrowserSession        url policy, ref bookkeeping, read budget, idle timer
     → RelayBrowserBackend      packages/extensions/.../browser-relay-backend.ts
       → RelayHub               packages/daemon/src/relay.ts, ws://127.0.0.1:7717/relay
-        → this extension       background.js dials OUT, ops.js drives the selected tab
+        → this extension       background.js dials OUT, ops.js drives the named tab
           → chrome.debugger    real CDP input into a ghost-owned tab
 ```
 
@@ -80,7 +84,7 @@ there must not also hand out the API. Any page you visit can open
 | Bound to `127.0.0.1` | Anything off this machine. |
 | `Origin` must be `chrome-extension://…` or absent | A web page opening the socket from a tab you are visiting. |
 | 32-byte token, compared in constant time | Everything else, including another extension. |
-| One connection at a time | A second browser interleaving actions across the ghost-owned tabs. |
+| One connection at a time | A second browser driving the same tabs behind this one's back. |
 | Closed, validated op set | Arbitrary CDP frames and script hidden in another verb; `javascript` remains one explicit capability. |
 
 And on the extension side:
@@ -94,7 +98,8 @@ And on the extension side:
   the relay out of the tab until it navigates.
 - **Only tabs created by the ghost.** It never adopts a tab you opened. The
   `tabs` operation can create, select, or close one of those tabs; session `close`
-  closes all of them while the browser stays open.
+  closes the caller's own tab, leaving other conversations' tabs and the browser
+  itself open.
 - **Pause** in the popup refuses every request instantly, without unpairing.
 - The extension re-checks the URL scheme itself: it does not have to trust the
   daemon in order to be safe to install.
@@ -110,7 +115,7 @@ for anything you would not do yourself.
 | `extension/manifest.json` | MV3. Permissions: `debugger`, `storage`, `alarms`. That is all. |
 | `extension/icons/` | Chrome's required icon sizes, derived from the same Lucide ghost mascot and amber token as the shell. |
 | `extension/background.js` | The outbound socket, reconnect loop, MV3 keepalive, frame dispatch. |
-| `extension/ops.js` | The 20 protocol operations against ghost-owned tabs; the `chrome.debugger` attach state machine. |
+| `extension/ops.js` | The 20 protocol operations against ghost-owned tabs; the per-tab `chrome.debugger` attach state machine. |
 | `extension/page-scripts.js` | The snippets that run inside the page (read, find, resolve, focus-and-clear). |
 | `extension/protocol.js` | Frame shapes and the failure vocabulary; mirrors the TypeScript side. |
 | `extension/popup.{html,js}` | Status, pairing, pause. |
@@ -120,7 +125,7 @@ No build step. It is plain ES modules; edit and hit reload in `chrome://extensio
 Each relay request carries a deadline. The extension applies it around the whole
 operation and drops a late result if the socket that requested it has gone away.
 Chromium's `chrome.debugger.sendCommand()` Promise has no cancellation signal,
-and relay protocol v1 has no cancel frame, so a deadline bounds the reply but
+and the relay protocol has no cancel frame, so a deadline bounds the reply but
 does not claim to abort a CDP command already accepted by Chromium.
 
 ## Element refs
