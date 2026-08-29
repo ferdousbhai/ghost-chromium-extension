@@ -1,16 +1,14 @@
 # Ghost browser relay (Chromium extension)
 
-"My browser" mode: the ghost drives **tabs it created in the browser you are
-already signed into**, instead of a separate profile of its own. Every operation
-names the tab it acts on, so each conversation drives its own tab: one extension
-serves them all over one socket without their attachments, isolated worlds, or
-element refs colliding.
+The ghost drives **tabs it created in the browser you are already signed into**.
+Every operation names the tab it acts on, so each conversation drives its own
+tab: one extension serves them all over one socket without their attachments,
+isolated worlds, or element refs colliding.
 
-This is the default mode. The other — "Ghost's browser", a dedicated Playwright
-Chromium profile under the ghost home — is selected with `browserMode: "profile"`
-and remains the right choice for anything autonomous; until this extension pairs,
-relay sessions fail their browser calls rather than falling back to it. "My
-browser" exists for the jobs where the point *is* your session: read
+This is the only browser a ghost has. There is no second profile to fall back to,
+so until this extension pairs, browser calls fail and say so; if Chromium is not
+running, the ghost starts it from the shell like anything else. That is the point:
+the pages the ghost works on are your session — read
 the thing behind the login, fill the form on the site that knows who you are,
 check the dashboard you never log out of.
 
@@ -104,9 +102,25 @@ And on the extension side:
 - The extension re-checks the URL scheme itself: it does not have to trust the
   daemon in order to be safe to install.
 
-What this does *not* protect against: the ghost is genuinely acting as you, in
-your session, with your cookies. That is the feature. Use "Ghost's browser" mode
-for anything you would not do yourself.
+What this does *not* protect against:
+
+- The ghost is genuinely acting as you, in your session, with your cookies. That
+  is the feature. Pause in the popup, or close the tab, for anything you would
+  not do yourself.
+- **DNS rebinding.** Ghost resolves a hostname and checks the answers before it
+  navigates, but the browser resolves it again independently. A short-TTL name
+  that answers publicly to the daemon and `127.0.0.1` to Chromium will load.
+- **Subresources.** Only the URL the ghost asks for is checked. A public page's
+  own `fetch`, XHR, and iframes are never seen by Ghost, so a page can reach
+  private-network addresses from inside your browser.
+- **Redirects that already fired.** A redirect to a private address is caught
+  when Ghost rechecks where it landed, so the ghost cannot read the response —
+  but the request was already made, with your cookies.
+
+The backend that could enforce these per-request — a browser Ghost launched and
+proxied — was removed on purpose. Restoring them belongs here, in the extension,
+which already has `chrome.debugger` and could pause requests with `Fetch.enable`;
+that is a deliberate not-yet, not an oversight.
 
 ## Files
 

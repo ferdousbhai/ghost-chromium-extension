@@ -2,7 +2,7 @@
  * The code that runs *inside* the owner's pages.
  *
  * Strings, evaluated through CDP `Runtime.evaluate`, for the same reason the
- * Playwright backend keeps its snippets as strings: they are the one part of the
+ * relay keeps its snippets as strings: they are the one part of the
  * system with a DOM in scope, and quarantining them in a named file beats smearing
  * `document` through modules that have no business with it.
  *
@@ -168,7 +168,7 @@ const REGISTRY = `
 /**
  * Readable text for the current page, untruncated — the session layer owns the
  * budget, and it must be the same budget for both backends. Byte-for-byte the
- * container preference the Playwright backend uses, so `read` returns the same
+ * container preference `read` has always used, so it returns the same
  * shape of thing whichever browser the ghost is driving.
  */
 export const READ_PAGE_SCRIPT = `() => {
@@ -187,7 +187,7 @@ export const READ_PAGE_SCRIPT = `() => {
 /**
  * Find elements by CSS selector, or — when the query is not a selector that matches
  * anything — by visible text and accessible attributes. Same two-pass strategy and
- * same "deepest text match only" rule as the Playwright backend, so `e1` means the
+ * same "deepest text match only" rule the session layer's refs assume, so `e1` means the
  * same thing to the model in either mode.
  */
 export const FIND_ELEMENTS_SCRIPT = `({ query, limit }) => {

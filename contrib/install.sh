@@ -35,7 +35,7 @@ for arg in "$@"; do
 done
 
 find_chromium() {
-  for candidate in "${GHOST_BROWSER_EXECUTABLE:-}" chromium chromium-browser google-chrome-stable google-chrome; do
+  for candidate in "${GHOST_RELAY_CHROMIUM:-}" chromium chromium-browser google-chrome-stable google-chrome; do
     [ -n "$candidate" ] || continue
     if command -v "$candidate" >/dev/null 2>&1; then command -v "$candidate"; return 0; fi
   done
