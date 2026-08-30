@@ -442,7 +442,7 @@ test("a late operation result cannot cross into a replacement socket", async () 
   assert.equal(second.sent.at(-1).id, 42);
 });
 
-test("close waits for cancelled tab creation and tombstones the retired session", async () => {
+test("close waits for tab creation after its response deadline and tombstones the session", async () => {
   const created = deferred();
   const sockets = [];
   const removed = [];
@@ -515,6 +515,11 @@ test("close waits for cancelled tab creation and tombstones the retired session"
   await settle();
   assert.equal(createCalls, 1);
 
+  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  const timedOut = await responseFor(socket, 51);
+  assert.equal(timedOut.ok, false);
+  assert.equal(timedOut.error.failure, "timeout");
+
   socket.onmessage({
     data: JSON.stringify({
       t: "req",
@@ -529,7 +534,6 @@ test("close waits for cancelled tab creation and tombstones the retired session"
   assert.deepEqual(removed, []);
 
   created.resolve();
-  assert.equal((await responseFor(socket, 51)).ok, true);
   assert.equal((await responseFor(socket, 52)).ok, true);
   assert.deepEqual(removed, [17]);
 

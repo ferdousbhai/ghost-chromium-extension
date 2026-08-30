@@ -1285,7 +1285,7 @@ export async function releaseAllTabs() {
   }
 }
 
-export async function runOp(op, args, timeoutMs) {
+export function startOp(op, args, timeoutMs) {
   const handler = ops[op];
   if (!handler) {
     throw failed(FAILURES.invalidInput, `The relay extension does not implement "${op}".`);
@@ -1296,9 +1296,16 @@ export async function runOp(op, args, timeoutMs) {
   // here so even ops made of several CDP calls answer on time. The late Chrome
   // promise remains observed by Promise.race; it is not falsely presented as a
   // transport cancellation.
-  return withTimeout(
-    handler(args ?? {}, budget),
-    budget,
-    `running ${op}`,
-  );
+  const completion = handler(args ?? {}, budget);
+  return {
+    response: withTimeout(completion, budget, `running ${op}`),
+    // A timed response does not cancel Chromium. The dispatcher uses this
+    // separately to keep terminal close behind the work that can still claim a
+    // tab, while the daemon still receives its deadline response on time.
+    settled: completion.then(() => true, () => false),
+  };
+}
+
+export async function runOp(op, args, timeoutMs) {
+  return startOp(op, args, timeoutMs).response;
 }

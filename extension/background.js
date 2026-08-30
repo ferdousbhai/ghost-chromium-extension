@@ -25,7 +25,7 @@
  * the one field a browser `WebSocket` lets you set: the subprotocol list.
  */
 import { PROTOCOL_VERSION, RELAY_PATH, SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX, toErrorFrame } from "./protocol.js";
-import { installOpsListeners, releaseAllTabs, restoreTabsFromSession, runOp } from "./ops.js";
+import { installOpsListeners, releaseAllTabs, restoreTabsFromSession, startOp } from "./ops.js";
 
 const DEFAULT_PORT = 7717;
 const PING_INTERVAL_MS = 20_000;
@@ -277,14 +277,20 @@ async function answerRequest(socket, frame) {
     return false;
   }
 
+  let operation;
   try {
-    const result = await runOp(frame.op, frame.args ?? {}, frame.timeoutMs ?? 30_000);
-    sendTo(socket, { t: "res", id: frame.id, ok: true, result });
-    return true;
+    operation = startOp(frame.op, frame.args ?? {}, frame.timeoutMs ?? 30_000);
   } catch (error) {
     sendTo(socket, toErrorFrame(frame.id, error));
     return false;
   }
+  try {
+    const result = await operation.response;
+    sendTo(socket, { t: "res", id: frame.id, ok: true, result });
+  } catch (error) {
+    sendTo(socket, toErrorFrame(frame.id, error));
+  }
+  return operation.settled;
 }
 
 function queueRequest(socket, frame) {
@@ -306,8 +312,8 @@ function queueRequest(socket, frame) {
       });
       return;
     }
-    const succeeded = await answerRequest(socket, frame);
-    if (frame.op === "close" && succeeded) retiredSessions.add(session);
+    const completed = await answerRequest(socket, frame);
+    if (frame.op === "close" && completed) retiredSessions.add(session);
   };
   const task = previous.then(run, run);
   sessionTails.set(session, task);
