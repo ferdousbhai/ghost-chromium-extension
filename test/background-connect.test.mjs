@@ -68,7 +68,13 @@ function chromeMock({
       onStartup: eventHook(),
     },
     storage: {
-      local: { get: loadSettings },
+      local: {
+        get: (defaults) => Object.hasOwn(defaults, "ghostOwnershipPoison")
+          ? Promise.resolve({ ghostOwnershipPoison: null })
+          : loadSettings(defaults),
+        remove: async () => {},
+        set: async () => {},
+      },
       onChanged: eventHook(),
       session: {
         get: restoreSession,
@@ -404,11 +410,16 @@ test("settings are cached and an open socket stays off until a compatible welcom
 
 test("an old protocol-2 daemon is refused with update guidance", async () => {
   const sockets = [];
+  const reconnects = [];
   globalThis.chrome = chromeMock({
     loadSettings: async () => ({ port: 7717, token: "paired", enabled: true }),
   });
   globalThis.setInterval = () => 1;
   globalThis.clearInterval = () => {};
+  globalThis.setTimeout = (callback, delay) => {
+    reconnects.push({ callback, delay });
+    return reconnects.length;
+  };
   globalThis.WebSocket = class FakeWebSocket {
     static CONNECTING = 0;
     static OPEN = 1;
@@ -445,9 +456,26 @@ test("an old protocol-2 daemon is refused with update guidance", async () => {
   assert.match(socket.closes[0].reason, /speaks relay protocol 2.*speaks 3/i);
   assert.match(socket.closes[0].reason, /update whichever is older/i);
 
+  socket.onclose({ code: 4000, reason: socket.closes[0].reason });
+  await settle();
+  assert.equal(reconnects.length, 1);
+  assert.equal(reconnects[0].delay, 60_000);
+
   chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
   await settle();
-  assert.equal(sockets.length, 1, "a version mismatch must not reconnect-loop");
+  assert.equal(sockets.length, 1, "alarms must not turn a version mismatch into a reconnect loop");
+
+  reconnects[0].callback();
+  await settle();
+  assert.equal(sockets.length, 2, "the slow probe lets an updated peer recover without settings edits");
+  const recovered = sockets[1];
+  recovered.readyState = WebSocket.OPEN;
+  recovered.onopen();
+  recovered.onmessage({
+    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "updated-ghostd" }),
+  });
+  await settle();
+  assert.equal(recovered.sent.at(-1).protocol, PROTOCOL_VERSION);
 });
 
 test("a late operation result cannot cross into a replacement socket", async () => {
@@ -466,7 +494,12 @@ test("a late operation result cannot cross into a replacement socket", async () 
     }],
     loadSettings: async () => stored,
     restoreSession: async () => ({
-      ghostTabs: { version: 1, tabs: [17], sessions: [["socket-session", [17]]] },
+      ghostTabs: {
+        version: 2,
+        tabs: [17],
+        sessions: [["socket-session", [17]]],
+        retired: [],
+      },
     }),
     tabApi: {
       get: async () => {
@@ -527,12 +560,19 @@ test("a late operation result cannot cross into a replacement socket", async () 
   assert.equal(second.sent.some((frame) => frame.id === 41), false);
 
   // Leave the shared ops module without a remembered tab for later test files.
-  second.onmessage({ data: JSON.stringify({ t: "req", id: 42, op: "close", args: {} }) });
+  second.onmessage({
+    data: JSON.stringify({
+      t: "req",
+      id: 42,
+      op: "close",
+      args: { session: "socket-session" },
+    }),
+  });
   await settle();
   assert.equal(second.sent.at(-1).id, 42);
 });
 
-test("close waits for tab creation after its response deadline and tombstones the session", async () => {
+test("close tombstones on the response deadline and cleans up a late tab creation", async () => {
   const created = deferred();
   const sockets = [];
   const removed = [];
@@ -621,12 +661,11 @@ test("close waits for tab creation after its response deadline and tombstones th
       timeoutMs: 1_000,
     }),
   });
-  await settle();
-  assert.equal(socket.sent.some((frame) => frame.id === 52), false);
+  assert.equal((await responseFor(socket, 52)).ok, true);
   assert.deepEqual(removed, []);
 
   created.resolve();
-  assert.equal((await responseFor(socket, 52)).ok, true);
+  for (let attempt = 0; attempt < 20 && removed.length === 0; attempt += 1) await settle();
   assert.deepEqual(removed, [17]);
 
   socket.onmessage({

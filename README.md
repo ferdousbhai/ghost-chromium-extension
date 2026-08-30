@@ -1,8 +1,8 @@
 # Ghost browser relay (Chromium extension)
 
 The ghost drives **tabs it created in the browser you are already signed into**.
-Every operation names the tab it acts on, so each conversation drives its own
-tab: one extension serves them all over one socket without their attachments,
+Every page operation names the tab it acts on, and each conversation may own
+several: one extension serves them all over one socket without their attachments,
 isolated worlds, or element refs colliding.
 
 This is the only browser a ghost has. There is no second profile to fall back to,
@@ -61,8 +61,9 @@ only after a compatible ghostd has answered the protocol handshake, `||` when
 that authenticated connection is paused, and `off` otherwise.
 
 The current relay protocol is 3. A protocol-2 daemon or extension is refused
-before either side accepts browser work; update the older Ghost package, then
-reload the unpacked extension from `chrome://extensions` if it was the old side.
+before either side accepts browser work; update the older Ghost package. The
+extension probes again after a one-minute cool-down, or reload it from
+`chrome://extensions` to retry immediately after updating either side.
 
 The token lives at `$XDG_STATE_HOME/ghost/relay-token` (default
 `~/.local/state/ghost/relay-token`), mode `0600`.
@@ -100,8 +101,8 @@ And on the extension side:
   the relay out of the tab until it navigates.
 - **Only tabs created by the ghost.** It never adopts a tab you opened. The
   `tabs` operation can create, select, or close one of those tabs; session `close`
-  closes the caller's own tab, leaving other conversations' tabs and the browser
-  itself open.
+  attempts every tab that conversation opened, leaving other conversations' tabs
+  and the browser itself open.
 - **Pause** in the popup refuses every request instantly, without unpairing.
 - The extension re-checks the URL scheme itself: it does not have to trust the
   daemon in order to be safe to install.
@@ -144,7 +145,10 @@ Each relay request carries a deadline. The extension applies it around the whole
 operation and drops a late result if the socket that requested it has gone away.
 Chromium's `chrome.debugger.sendCommand()` Promise has no cancellation signal,
 and the relay protocol has no cancel frame, so a deadline bounds the reply but
-does not claim to abort a CDP command already accepted by Chromium.
+does not claim to abort a CDP command already accepted by Chromium. A terminal
+session close first publishes a durable retirement marker, then makes bounded
+attempts against every known tab. Late tab creation observes that marker and
+removes itself; uncertain removals remain owned for the next close retry.
 
 ## Element refs
 
@@ -187,5 +191,6 @@ rather than the semantic verbs used here.
 | Badge stays `off` | ghostd is not running, or the port is wrong. The popup says which. |
 | "That pairing token is not this daemon's" | Token rotated, or `$XDG_STATE_HOME` differs between the shell and the daemon. Re-run `ghostd relay-token`. |
 | "A browser is already connected" | Another Chromium profile has the extension paired. Only one at a time. |
+| "Browser ownership … is indeterminate" | A storage failure interrupted tab creation. Close the named ghost-created tab; the relay retries automatically. |
 | "Chromium refused to attach its debugger" | DevTools is open on that tab, or another extension is debugging it. |
 | Worked, then stopped after a while | You dismissed the debugger banner. It recovers when the tab navigates. |

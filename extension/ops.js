@@ -8,9 +8,9 @@
  * op names the tab it acts on and gets that tab's own attach state and isolated
  * world. Two conversations driving two tabs cannot reset each other's world or
  * invalidate each other's refs. `state.tabs` maps a claimed tab id to that state;
- * the ghost never touches a tab the owner opened. `close` shuts the caller's tab
- * and detaches from it, never the browser, which has the rest of the owner's day
- * in it.
+ * the ghost never touches a tab the owner opened. `close` shuts every tab the
+ * caller's session opened and detaches from them, never the browser, which has
+ * the rest of the owner's day in it.
  *
  * **`chrome.debugger` is the only way in.** There is no `chrome.scripting`, no
  * content script, and no `host_permissions` in the manifest. The debugger grant
@@ -58,7 +58,7 @@ const RING_LIMIT = 200;
  * what keeps one conversation from listing, driving, or closing another's tab
  * over the socket they share.
  */
-const state = { tabs: new Map(), sessions: new Map() };
+const state = { tabs: new Map(), sessions: new Map(), retired: new Set() };
 
 function freshTabState() {
   return {
@@ -118,8 +118,10 @@ function requireOwningSession(args) {
 const attachBarriers = new Map();
 
 const SESSION_KEY = "ghostTabs";
-const SESSION_STATE_VERSION = 1;
+const POISON_KEY = "ghostOwnershipPoison";
+const SESSION_STATE_VERSION = 2;
 let ownershipTail = Promise.resolve();
+const ownershipPoison = new Map();
 
 function serializeOwnership(work) {
   const task = ownershipTail.then(work, work);
@@ -132,11 +134,54 @@ function ownershipSnapshot() {
     version: SESSION_STATE_VERSION,
     tabs: [...state.tabs.keys()],
     sessions: [...state.sessions].map(([session, owned]) => [session, [...owned]]),
+    retired: [...state.retired],
   };
 }
 
-function persistOwnership() {
-  return chrome.storage.session.set({ [SESSION_KEY]: ownershipSnapshot() });
+async function persistOwnership() {
+  await chrome.storage.session.set({ [SESSION_KEY]: ownershipSnapshot() });
+  if (ownershipPoison.size > 0) {
+    ownershipPoison.clear();
+    await chrome.storage.local.remove(POISON_KEY).catch(() => {});
+  }
+}
+
+async function persistPoison(session, tabId) {
+  ownershipPoison.set(tabId, session);
+  await chrome.storage.local.set({ [POISON_KEY]: poisonSnapshot() });
+}
+
+function poisonSnapshot() {
+  return {
+    version: 1,
+    claims: [...ownershipPoison].map(([tab, session]) => [session, tab]),
+  };
+}
+
+function parsePoison(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "claims,version"
+      || value.version !== 1 || !Array.isArray(value.claims) || value.claims.length === 0) {
+    return null;
+  }
+  const parsed = new Map();
+  for (const row of value.claims) {
+    if (!Array.isArray(row) || row.length !== 2) return null;
+    const [session, tab] = row;
+    if (typeof session !== "string" || session === ""
+        || !Number.isSafeInteger(tab) || tab < 0 || parsed.has(tab)) return null;
+    parsed.set(tab, session);
+  }
+  return parsed;
+}
+
+async function clearPoison(tabId) {
+  ownershipPoison.delete(tabId);
+  if (ownershipPoison.size === 0) {
+    await chrome.storage.local.remove(POISON_KEY).catch(() => {});
+  } else {
+    await chrome.storage.local.set({ [POISON_KEY]: poisonSnapshot() }).catch(() => {});
+  }
 }
 
 function noSuchTab(error, tabId) {
@@ -156,9 +201,9 @@ async function liveTabOrNull(tabId) {
 
 function validStoredOwnership(saved) {
   if (!saved || typeof saved !== "object" || Array.isArray(saved)) return false;
-  if (Object.keys(saved).sort().join(",") !== "sessions,tabs,version") return false;
+  if (Object.keys(saved).sort().join(",") !== "retired,sessions,tabs,version") return false;
   if (saved.version !== SESSION_STATE_VERSION || !Array.isArray(saved.tabs)
-      || !Array.isArray(saved.sessions)) return false;
+      || !Array.isArray(saved.sessions) || !Array.isArray(saved.retired)) return false;
   const tabs = new Set();
   for (const id of saved.tabs) {
     if (!Number.isSafeInteger(id) || id < 0 || tabs.has(id)) return false;
@@ -177,14 +222,23 @@ function validStoredOwnership(saved) {
       assigned.add(id);
     }
   }
+  const retired = new Set();
+  for (const session of saved.retired) {
+    if (typeof session !== "string" || session === "" || retired.has(session)) return false;
+    retired.add(session);
+  }
   return assigned.size === tabs.size;
 }
 
 export function restoreTabsFromSession() {
   return serializeOwnership(async () => {
     let stored;
+    let poison;
     try {
-      stored = await chrome.storage.session.get({ [SESSION_KEY]: null });
+      [stored, poison] = await Promise.all([
+        chrome.storage.session.get({ [SESSION_KEY]: null }),
+        chrome.storage.local.get({ [POISON_KEY]: null }),
+      ]);
     } catch (error) {
       throw failed(
         FAILURES.browserUnavailable,
@@ -192,8 +246,51 @@ export function restoreTabsFromSession() {
       );
     }
     const saved = stored[SESSION_KEY];
+    const savedPoison = poison[POISON_KEY];
+    if (savedPoison !== null && savedPoison !== undefined) {
+      const poisonClaims = parsePoison(savedPoison);
+      if (poisonClaims === null) {
+        throw failed(
+          FAILURES.browserUnavailable,
+          "Stored browser ownership recovery is invalid; reload the Ghost extension.",
+        );
+      }
+      const validSaved = validStoredOwnership(saved);
+      const unresolved = new Map();
+      let verificationError = null;
+      for (const [tab, session] of poisonClaims) {
+        const durable = validSaved
+          && saved.sessions.some(([owner, tabs]) => owner === session && tabs.includes(tab));
+        if (durable) continue;
+        let live;
+        try {
+          live = await liveTabOrNull(tab);
+        } catch (error) {
+          verificationError ??= error;
+          unresolved.set(tab, session);
+          continue;
+        }
+        if (live !== null) unresolved.set(tab, session);
+      }
+      ownershipPoison.clear();
+      for (const [tab, session] of unresolved) ownershipPoison.set(tab, session);
+      if (unresolved.size > 0) {
+        await chrome.storage.local.set({ [POISON_KEY]: poisonSnapshot() }).catch(() => {});
+        const tab = unresolved.keys().next().value;
+        throw failed(
+          FAILURES.browserUnavailable,
+          `Browser ownership of tab ${tab} is indeterminate after a worker restart`
+            + (verificationError === null
+              ? ". Close that ghost-created tab; the relay will retry automatically."
+              : `, and at least one tab status could not be verified: `
+                + `${verificationError?.message ?? verificationError}.`),
+        );
+      } else {
+        await chrome.storage.local.remove(POISON_KEY).catch(() => {});
+      }
+    }
     if (saved === null || saved === undefined) {
-      if (state.tabs.size > 0) {
+      if (state.tabs.size > 0 || state.retired.size > 0) {
         try {
           await persistOwnership();
         } catch (error) {
@@ -230,20 +327,26 @@ export function restoreTabsFromSession() {
       const live = owned.filter((id) => restoredTabs.has(id));
       if (live.length > 0) restoredSessions.set(session, new Set(live));
     }
+    const restoredRetired = new Set(saved.retired);
 
     const previousTabs = new Map(state.tabs);
     const previousSessions = new Map(state.sessions);
+    const previousRetired = new Set(state.retired);
     state.tabs.clear();
     state.sessions.clear();
+    state.retired.clear();
     for (const [id, tab] of restoredTabs) state.tabs.set(id, tab);
     for (const [session, owned] of restoredSessions) state.sessions.set(session, owned);
+    for (const session of restoredRetired) state.retired.add(session);
     try {
       await persistOwnership();
     } catch (error) {
       state.tabs.clear();
       state.sessions.clear();
+      state.retired.clear();
       for (const [id, tab] of previousTabs) state.tabs.set(id, tab);
       for (const [session, owned] of previousSessions) state.sessions.set(session, owned);
+      for (const session of previousRetired) state.retired.add(session);
       throw failed(
         FAILURES.browserUnavailable,
         `Could not confirm restored browser ownership: ${error?.message ?? error}.`,
@@ -276,41 +379,62 @@ function forgetTab(tabId) {
 }
 
 /** Claim a new tab durably before its successful create response leaves this worker. */
-function claimTab(session, tabId) {
-  return serializeOwnership(async () => {
+async function claimTab(session, tabId, timeoutMs) {
+  let storageError = null;
+  let retired = false;
+  await serializeOwnership(async () => {
     rememberTab(session, tabId);
+    retired = state.retired.has(session);
     try {
       await persistOwnership();
-      return;
-    } catch (storageError) {
-      forgetTab(tabId);
-      let rolledBack = true;
-      try {
-        await chrome.tabs.remove(tabId);
-      } catch (removeError) {
-        let live = !noSuchTab(removeError, tabId);
-        if (live) {
-          try {
-            live = (await liveTabOrNull(tabId)) !== null;
-          } catch {
-            // Indeterminate is live: forgetting it could orphan a real tab.
-          }
-        }
-        if (live) {
-          rolledBack = false;
-          rememberTab(session, tabId);
-          await persistOwnership().catch(() => {});
-        }
-      }
-      throw failed(
-        FAILURES.browserUnavailable,
-        `Could not persist ownership of tab ${tabId}: ${storageError?.message ?? storageError}. `
-          + (rolledBack
-            ? "The new tab was rolled back; retry open."
-            : "The tab is still owned in this worker; retry close."),
-      );
+    } catch (error) {
+      storageError = error;
     }
   });
+
+  if (storageError === null) {
+    if (!retired) return;
+    await retireTab(tabId, timeoutMs);
+    throw failed(
+      FAILURES.browserUnavailable,
+      "This browser session is closed. Open through a fresh session.",
+    );
+  }
+
+  let poisonError = null;
+  try {
+    await serializeOwnership(() => persistPoison(session, tabId));
+  } catch (error) {
+    poisonError = error;
+  }
+  const removal = await removeTab(tabId, timeoutMs);
+  if (removal.authoritative) {
+    forgetTab(tabId);
+    await serializeOwnership(() => clearPoison(tabId));
+    throw failed(
+      FAILURES.browserUnavailable,
+      `Could not persist ownership of tab ${tabId}: ${storageError?.message ?? storageError}. `
+        + "The new tab was rolled back; retry open.",
+    );
+  }
+
+  try {
+    await serializeOwnership(() => persistOwnership());
+  } catch {
+    throw failed(
+      FAILURES.browserUnavailable,
+      `Could not persist ownership of tab ${tabId}: ${storageError?.message ?? storageError}. `
+        + "The tab remains fail-closed for close recovery"
+        + (poisonError === null
+          ? ", including across a worker restart."
+          : `, but its recovery marker also failed: ${poisonError?.message ?? poisonError}.`),
+    );
+  }
+  throw failed(
+    FAILURES.browserUnavailable,
+    `Could not persist ownership of tab ${tabId}: ${storageError?.message ?? storageError}. `
+      + "The tab is durably owned; retry close.",
+  );
 }
 
 function dropTab(tabId) {
@@ -321,39 +445,61 @@ function dropTab(tabId) {
   return serializeOwnership(() => persistOwnership()).catch(() => undefined);
 }
 
+function cleanupBudget(timeoutMs) {
+  return Math.max(100, Math.floor(timeoutMs * 0.8));
+}
+
+/** Try to prove one tab absent without trusting an indeterminate Chrome error. */
+async function removeTab(tabId, timeoutMs) {
+  const budget = cleanupBudget(timeoutMs);
+  let removeError;
+  try {
+    await withTimeout(
+      Promise.resolve().then(() => chrome.tabs.remove(tabId)),
+      budget,
+      `closing tab ${tabId}`,
+    );
+    return { authoritative: true, removed: true };
+  } catch (error) {
+    removeError = error;
+    if (noSuchTab(error, tabId)) return { authoritative: true, removed: false };
+  }
+  try {
+    const live = await withTimeout(liveTabOrNull(tabId), budget, `checking tab ${tabId}`);
+    if (live === null) return { authoritative: true, removed: false };
+  } catch (getError) {
+    return { authoritative: false, removeError, getError };
+  }
+  return { authoritative: false, removeError };
+}
+
 /** Close one claimed tab without forgetting a live tab Chromium refused to close. */
-async function retireTab(tabId) {
+async function retireTab(tabId, timeoutMs) {
   if (isAttached(tabId)) {
-    await detachStale(tabId);
+    await withTimeout(
+      detachStale(tabId),
+      cleanupBudget(timeoutMs),
+      `detaching tab ${tabId}`,
+    ).catch(() => {});
     const tab = state.tabs.get(tabId);
     if (tab) resetAttachment(tab);
   }
-  try {
-    await chrome.tabs.remove(tabId);
+  const removal = await removeTab(tabId, timeoutMs);
+  if (removal.authoritative) {
     await dropTab(tabId);
-    return true;
-  } catch (removeError) {
-    if (!state.tabs.has(tabId) || noSuchTab(removeError, tabId)) {
-      await dropTab(tabId);
-      return false;
-    }
-    try {
-      if ((await liveTabOrNull(tabId)) === null) {
-        await dropTab(tabId);
-        return false;
-      }
-    } catch (getError) {
-      throw failed(
-        FAILURES.browserUnavailable,
-        `Chromium did not close tab ${tabId}, and its status could not be verified: `
-          + `${getError?.message ?? getError}. Retry the close.`,
-      );
-    }
+    return removal.removed;
+  }
+  if (removal.getError) {
     throw failed(
       FAILURES.browserUnavailable,
-      "Chromium did not close one of the ghost's tabs. Retry the close.",
+      `Chromium did not close tab ${tabId}, and its status could not be verified: `
+        + `${removal.getError?.message ?? removal.getError}. Retry the close.`,
     );
   }
+  throw failed(
+    FAILURES.browserUnavailable,
+    `Chromium did not close ghost tab ${tabId}. Retry the close.`,
+  );
 }
 
 /** Whether the relay currently holds a debugger session on one claimed tab. */
@@ -1069,7 +1215,7 @@ const ops = {
         );
       }
       tabId = tab.id;
-      await claimTab(session, tabId);
+      await claimTab(session, tabId, timeoutMs);
     }
 
     if (tab.status !== "complete") {
@@ -1407,7 +1553,7 @@ const ops = {
           `Chromium would not open a tab: ${error?.message ?? error}`,
         );
       }
-      await claimTab(session, tab.id);
+      await claimTab(session, tab.id, timeoutMs);
       if (tab.status !== "complete" && url !== "" && url !== "about:blank") {
         const loaded = await waitForLoad(tab.id, timeoutMs);
         if (!loaded) await stopLoading(tab.id);
@@ -1432,7 +1578,7 @@ const ops = {
     }
 
     if (op === "close") {
-      await retireTab(id);
+      await retireTab(id, timeoutMs);
       const active = id === caller ? null : caller;
       return {
         ...(await tabsAnswer(args.session, active)),
@@ -1443,19 +1589,45 @@ const ops = {
     throw failed(FAILURES.invalidInput, `Unknown tabs op "${op}".`);
   },
 
-  async close(args) {
+  async close(args, timeoutMs) {
     // Session teardown closes every tab this session opened, not just the one it
     // was last driving: `tabs create` re-points the caller, and without this the
     // tabs it moved off would be left in the owner's browser with nothing owning
     // them. Other conversations keep their own tabs, and the browser keeps the
     // rest of the owner's day in it.
-    const owned = [...(state.sessions.get(args?.session) ?? [])];
-    let closed = false;
-    for (const tabId of owned) {
-      const removed = await retireTab(tabId);
-      closed = closed || removed;
+    const session = requireOwningSession(args);
+    let retirementError = null;
+    await serializeOwnership(async () => {
+      state.retired.add(session);
+      try {
+        await persistOwnership();
+      } catch (error) {
+        retirementError = error;
+      }
+    });
+
+    const owned = [...(state.sessions.get(session) ?? [])];
+    const outcomes = await Promise.allSettled(
+      owned.map((tabId) => retireTab(tabId, timeoutMs)),
+    );
+    const failures = outcomes.flatMap((outcome, index) =>
+      outcome.status === "rejected"
+        ? [{ tab: owned[index], message: outcome.reason?.message ?? String(outcome.reason) }]
+        : []);
+    if (retirementError !== null || failures.length > 0) {
+      throw failed(
+        FAILURES.browserUnavailable,
+        `Browser session close needs retry: ${failures.length} of ${owned.length} tabs remain `
+          + `uncertain${retirementError === null ? "." : "; its retirement marker was not saved."}`,
+        {
+          tabs: failures,
+          ...(retirementError === null
+            ? {}
+            : { retirement: retirementError?.message ?? String(retirementError) }),
+        },
+      );
     }
-    return { closed };
+    return { closed: outcomes.some((outcome) => outcome.status === "fulfilled" && outcome.value) };
   },
 
 };
@@ -1477,6 +1649,22 @@ export function startOp(op, args, timeoutMs) {
   if (!handler) {
     throw failed(FAILURES.invalidInput, `The relay extension does not implement "${op}".`);
   }
+  const session = typeof args?.session === "string" && args.session !== ""
+    ? args.session
+    : null;
+  if (session !== null && state.retired.has(session) && op !== "close") {
+    throw failed(
+      FAILURES.browserUnavailable,
+      "This browser session is closed. Open through a fresh session.",
+    );
+  }
+  if (ownershipPoison.size > 0 && op !== "close" && op !== "status") {
+    const tab = ownershipPoison.keys().next().value;
+    throw failed(
+      FAILURES.browserUnavailable,
+      `Browser ownership of tab ${tab} is indeterminate. Retry session close.`,
+    );
+  }
   const budget = Math.max(1_000, timeoutMs || 30_000);
   // The relay protocol has a request deadline but no cancellation frame, and
   // chrome.debugger.sendCommand has no AbortSignal. Bound the response lifecycle
@@ -1486,10 +1674,6 @@ export function startOp(op, args, timeoutMs) {
   const completion = handler(args ?? {}, budget);
   return {
     response: withTimeout(completion, budget, `running ${op}`),
-    // A timed response does not cancel Chromium. The dispatcher uses this
-    // separately to keep terminal close behind the work that can still claim a
-    // tab, while the daemon still receives its deadline response on time.
-    settled: completion.then(() => true, () => false),
   };
 }
 

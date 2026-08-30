@@ -31,6 +31,7 @@ const DEFAULT_PORT = 7717;
 const PING_INTERVAL_MS = 20_000;
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 10_000;
+const PROTOCOL_RETRY_MS = 60_000;
 const KEEPALIVE_ALARM = "ghost-relay-keepalive";
 
 let ws = null;
@@ -59,14 +60,12 @@ let lastError = "";
  * Latched when the daemon's `welcome` reports a protocol version this extension
  * cannot speak. A mismatch does not heal by dialing again — the socket opens
  * fine every time and only the `welcome` reveals the problem — so retrying is a
- * permanent 1s reconnect storm. While latched, every reconnect is suppressed;
- * it is cleared only when the settings change or the extension is re-installed
- * (either can mean a fixed daemon or a fixed extension).
+ * permanent 1s reconnect storm. While latched, alarms are suppressed and one
+ * slow retry checks whether the owner has updated the daemon or extension.
  */
 let protocolIncompatible = false;
-/** Per-protocol-session ordering plus successful-close tombstones. */
+/** Per-protocol-session request-start ordering; durable tombstones live in ops. */
 const sessionTails = new Map();
-const retiredSessions = new Set();
 
 function normalizeSettings(stored = {}) {
   return {
@@ -142,16 +141,16 @@ async function refreshBadge() {
 
 
 function scheduleReconnect() {
-  if (protocolIncompatible) {
-    // A version mismatch will not fix itself by dialing again. Sit tight until
-    // the owner updates one side and the settings change (or reinstall) clears
-    // the latch, rather than reconnecting every second forever.
-    void setBadge("off");
-    return;
-  }
-  const delay = reconnectDelay;
-  reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
-  setTimeout(() => void connect(), delay);
+  const incompatible = protocolIncompatible;
+  const delay = incompatible ? PROTOCOL_RETRY_MS : reconnectDelay;
+  if (incompatible) void setBadge("off");
+  else reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+  setTimeout(() => {
+    // Keep alarm-driven attempts latched during the cool-down, then give exactly
+    // this scheduled probe permission to negotiate the newly updated peer.
+    if (incompatible) protocolIncompatible = false;
+    void connect();
+  }, delay);
 }
 
 async function connectOnce(epoch) {
@@ -290,7 +289,6 @@ async function answerRequest(socket, frame) {
   } catch (error) {
     sendTo(socket, toErrorFrame(frame.id, error));
   }
-  return operation.settled;
 }
 
 function queueRequest(socket, frame) {
@@ -299,22 +297,7 @@ function queueRequest(socket, frame) {
     : null;
   if (session === null) return answerRequest(socket, frame);
   const previous = sessionTails.get(session) ?? Promise.resolve();
-  const run = async () => {
-    if (retiredSessions.has(session) && frame.op !== "close") {
-      sendTo(socket, {
-        t: "res",
-        id: frame.id,
-        ok: false,
-        error: {
-          failure: "browser_unavailable",
-          message: "This browser session is closed. Open through a fresh session.",
-        },
-      });
-      return;
-    }
-    const completed = await answerRequest(socket, frame);
-    if (frame.op === "close" && completed) retiredSessions.add(session);
-  };
+  const run = () => answerRequest(socket, frame);
   const task = previous.then(run, run);
   sessionTails.set(session, task);
   const clear = () => {

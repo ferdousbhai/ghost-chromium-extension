@@ -40,11 +40,16 @@ function chromeMock({
   attach,
   detach = async () => {},
   getTargets,
+  persistLocal = async () => {},
   persistSession = async () => {},
+  removeLocal = async () => {},
+  restoreLocal = async () => ({ ghostOwnershipPoison: null }),
   restoreSession = async () => ({ ghostTabs: null }),
   sendCommand = async () => ({}),
+  tabCreate,
   tabGet,
   tabRemove = () => {},
+  tabUpdate,
 }) {
   const tabs = new Map();
   let nextTabId = 17;
@@ -70,6 +75,11 @@ function chromeMock({
       sendCommand,
     },
     storage: {
+      local: {
+        get: restoreLocal,
+        remove: removeLocal,
+        set: persistLocal,
+      },
       session: {
         get: restoreSession,
         set: persistSession,
@@ -77,6 +87,7 @@ function chromeMock({
     },
     tabs: {
       create: async ({ url = "about:blank" }) => {
+        if (tabCreate) return tabCreate({ url }, tabs);
         const tab = {
           id: nextTabId,
           windowId: 4,
@@ -101,6 +112,7 @@ function chromeMock({
         tabs.delete(id);
       },
       update: async (id, update) => {
+        if (tabUpdate) return tabUpdate(id, update, tabs);
         const tab = tabs.get(id);
         if (!tab) throw new Error("missing tab");
         Object.assign(tab, update);
@@ -381,9 +393,10 @@ test("a worker restart restores a durably published session claim", async () => 
   await first.runOp("open", { session: "durable", url: "https://example.com/" }, 1_000);
   assert.deepEqual(stored, {
     ghostTabs: {
-      version: 1,
+      version: 2,
       tabs: [17],
       sessions: [["durable", [17]]],
+      retired: [],
     },
   });
 
@@ -433,6 +446,99 @@ test("a rejected claim publication closes the unowned new tab", async () => {
   assert.deepEqual(removed, [17]);
 });
 
+test("double claim persistence failure stays poisoned across a worker restart", async () => {
+  let failPersistence = true;
+  let failRemoval = true;
+  let storedSession = { ghostTabs: null };
+  let storedLocal = { ghostOwnershipPoison: null };
+  let persistenceAttempts = 0;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistLocal: async (value) => { storedLocal = structuredClone(value); },
+    persistSession: async (value) => {
+      persistenceAttempts += 1;
+      if (failPersistence) throw new Error("session storage unavailable");
+      storedSession = structuredClone(value);
+    },
+    removeLocal: async () => { storedLocal = { ghostOwnershipPoison: null }; },
+    restoreLocal: async () => structuredClone(storedLocal),
+    restoreSession: async () => structuredClone(storedSession),
+    tabRemove: async () => {
+      if (failRemoval) throw new Error("Chromium refused the rollback");
+    },
+  });
+  const first = await import(`../extension/ops.js?poison-writer=${Date.now()}`);
+
+  await assert.rejects(
+    first.runOp("open", { session: "poisoned", url: "https://example.com/" }, 1_000),
+    (error) => error instanceof RelayOpError
+      && error.failure === "browser_unavailable"
+      && /across a worker restart/.test(error.message),
+  );
+  assert.equal(persistenceAttempts, 2, "the uncertain live tab gets a second durable claim attempt");
+  assert.deepEqual(storedLocal, {
+    ghostOwnershipPoison: { version: 1, claims: [["poisoned", 17]] },
+  });
+
+  const restarted = await import(`../extension/ops.js?poison-reader=${Date.now()}`);
+  await assert.rejects(
+    restarted.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError
+      && error.failure === "browser_unavailable"
+      && /indeterminate after a worker restart/.test(error.message),
+  );
+  await assert.rejects(
+    restarted.runOp("open", { session: "fresh", url: "https://other.example/" }, 1_000),
+    (error) => error instanceof RelayOpError && /ownership of tab 17 is indeterminate/i.test(error.message),
+  );
+
+  failPersistence = false;
+  failRemoval = false;
+  const recovered = await first.runOp("close", { session: "poisoned" }, 1_000);
+  assert.equal(recovered.closed, true);
+  assert.deepEqual(storedLocal, { ghostOwnershipPoison: null });
+
+  let cleared = false;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    removeLocal: async () => { cleared = true; },
+    restoreLocal: async () => ({
+      ghostOwnershipPoison: { version: 1, claims: [["already-gone", 99]] },
+    }),
+  });
+  const absent = await import(`../extension/ops.js?poison-absent=${Date.now()}`);
+  await absent.restoreTabsFromSession();
+  assert.equal(cleared, true, "an authoritative no-such-tab result clears the restart poison");
+});
+
+test("concurrent failed claims publish every uncertain tab to the poison ledger", async () => {
+  let nextId = 17;
+  let storedLocal = { ghostOwnershipPoison: null };
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistLocal: async (value) => { storedLocal = structuredClone(value); },
+    persistSession: async () => { throw new Error("session storage unavailable"); },
+    tabCreate: ({ url }, tabs) => {
+      const tab = { id: nextId, windowId: 4, status: "complete", url, title: `Tab ${nextId}` };
+      nextId += 1;
+      tabs.set(tab.id, tab);
+      return tab;
+    },
+    tabRemove: async () => { throw new Error("Chromium refused the rollback"); },
+  });
+  const concurrent = await import(`../extension/ops.js?poison-concurrent=${Date.now()}`);
+
+  const failures = await Promise.allSettled([
+    concurrent.runOp("open", { session: "one", url: "https://one.example/" }, 1_000),
+    concurrent.runOp("open", { session: "two", url: "https://two.example/" }, 1_000),
+  ]);
+
+  assert.deepEqual(failures.map(({ status }) => status), ["rejected", "rejected"]);
+  assert.deepEqual(storedLocal, {
+    ghostOwnershipPoison: { version: 1, claims: [["one", 17], ["two", 18]] },
+  });
+});
+
 test("restore fails closed when storage or tab existence is indeterminate", async () => {
   globalThis.chrome = chromeMock({
     attach: async () => {},
@@ -475,7 +581,7 @@ test("a partial session close keeps the refused live tab for retry", async () =>
   globalThis.chrome = chromeMock({
     attach: async () => {},
     tabRemove: (id) => {
-      if (id === 18 && refuseSecond) {
+      if (id === 17 && refuseSecond) {
         refuseSecond = false;
         throw new Error("Chromium refused the close");
       }
@@ -494,11 +600,67 @@ test("a partial session close keeps the refused live tab for retry", async () =>
     runOp("close", { session: "s1" }, 1_000),
     (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
   );
-  assert.deepEqual(removed, [17]);
+  assert.deepEqual(removed, [18], "a failed first tab must not suppress later cleanup attempts");
 
   const retried = await runOp("close", { session: "s1" }, 1_000);
   assert.equal(retried.closed, true);
-  assert.deepEqual(removed, [17, 18]);
+  assert.deepEqual(removed, [18, 17]);
+});
+
+test("retirement advances past never-settling create, update, and remove calls", async () => {
+  const creating = deferred();
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    tabCreate: () => creating.promise,
+  });
+  const createOps = await import(`../extension/ops.js?never-create=${Date.now()}`);
+  await assert.rejects(
+    createOps.runOp("open", { session: "never-create", url: "https://example.com/" }, 1_000),
+    (error) => error instanceof RelayOpError && error.failure === "timeout",
+  );
+  assert.deepEqual(
+    await createOps.runOp("close", { session: "never-create" }, 1_000),
+    { closed: false },
+  );
+
+  const updating = deferred();
+  const removedAfterUpdate = [];
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    tabRemove: async (id) => { removedAfterUpdate.push(id); },
+    tabUpdate: () => updating.promise,
+  });
+  const updateOps = await import(`../extension/ops.js?never-update=${Date.now()}`);
+  await updateOps.runOp("open", { session: "never-update", url: "https://first.example/" }, 1_000);
+  await assert.rejects(
+    updateOps.runOp("open", {
+      session: "never-update",
+      tab: "17",
+      url: "https://second.example/",
+    }, 1_000),
+    (error) => error instanceof RelayOpError && error.failure === "timeout",
+  );
+  assert.equal((await updateOps.runOp("close", { session: "never-update" }, 1_000)).closed, true);
+  assert.deepEqual(removedAfterUpdate, [17]);
+
+  const removing = deferred();
+  let removeAttempts = 0;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    tabRemove: async () => {
+      removeAttempts += 1;
+      if (removeAttempts === 1) await removing.promise;
+    },
+  });
+  const removeOps = await import(`../extension/ops.js?never-remove=${Date.now()}`);
+  await removeOps.runOp("open", { session: "never-remove", url: "https://example.com/" }, 1_000);
+  await assert.rejects(
+    removeOps.runOp("close", { session: "never-remove" }, 1_000),
+    (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
+  );
+  assert.equal((await removeOps.runOp("close", { session: "never-remove" }, 1_000)).closed, true);
+  assert.equal(removeAttempts, 2);
+  removing.resolve();
 });
 
 test("an indeterminate remove failure retains the tab for close retry", async () => {
@@ -530,7 +692,8 @@ test("an indeterminate remove failure retains the tab for close retry", async ()
     runOp("close", { session: "s1" }, 1_000),
     (error) => error instanceof RelayOpError
       && error.failure === "browser_unavailable"
-      && /could not be verified/.test(error.message),
+      && /needs retry/.test(error.message)
+      && /could not be verified/.test(error.details.tabs[0].message),
   );
   const retried = await runOp("close", { session: "s1" }, 1_000);
   assert.equal(retried.closed, true);
