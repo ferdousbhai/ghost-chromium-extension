@@ -26,6 +26,12 @@ let settingsSnapshot = { ...DEFAULT_SETTINGS };
 let refreshInFlight = null;
 let mutationInFlight = null;
 let savedTimer = null;
+let settingsMutationRevision = 0;
+let settingsRepairInFlight = null;
+const settingsRepairKeys = new Set();
+const latestSettings = new Map(
+  Object.entries(DEFAULT_SETTINGS).map(([key, value]) => [key, { revision: 0, value }]),
+);
 
 function withDeadline(promise, message) {
   const signal = AbortSignal.timeout(POPUP_API_TIMEOUT_MS);
@@ -51,6 +57,60 @@ function normalizeSettings(value = {}) {
     token: typeof value.token === "string" ? value.token : "",
     enabled: value.enabled !== false,
   };
+}
+
+function queueSettingsRepair(keys) {
+  for (const key of keys) settingsRepairKeys.add(key);
+  void startSettingsRepair();
+}
+
+function persistSettingsPatch(patch, revisions) {
+  const raw = chrome.storage.local.set(patch);
+  void raw.then(
+    () => {
+      const stale = Object.keys(patch).filter(
+        (key) => latestSettings.get(key)?.revision !== revisions.get(key),
+      );
+      if (stale.length > 0) queueSettingsRepair(stale);
+    },
+    () => {},
+  );
+  return withDeadline(raw, "Chromium did not save the relay settings in time.");
+}
+
+function startSettingsRepair() {
+  if (settingsRepairInFlight !== null || settingsRepairKeys.size === 0) {
+    return settingsRepairInFlight ?? Promise.resolve();
+  }
+  const keys = [...settingsRepairKeys];
+  settingsRepairKeys.clear();
+  const patch = {};
+  const revisions = new Map();
+  for (const key of keys) {
+    const latest = latestSettings.get(key);
+    if (!latest) continue;
+    patch[key] = latest.value;
+    revisions.set(key, latest.revision);
+  }
+  const attempt = persistSettingsPatch(patch, revisions)
+    .catch(() => {
+      for (const key of keys) settingsRepairKeys.add(key);
+    })
+    .finally(() => {
+      if (settingsRepairInFlight === attempt) settingsRepairInFlight = null;
+    });
+  settingsRepairInFlight = attempt;
+  return attempt;
+}
+
+function saveSettingsPatch(patch) {
+  settingsMutationRevision += 1;
+  const revisions = new Map();
+  for (const [key, value] of Object.entries(patch)) {
+    latestSettings.set(key, { revision: settingsMutationRevision, value });
+    revisions.set(key, settingsMutationRevision);
+  }
+  return persistSettingsPatch(patch, revisions);
 }
 
 function render(status) {
@@ -143,6 +203,7 @@ function refreshSingleFlight() {
 }
 
 function refresh() {
+  if (settingsRepairKeys.size > 0) void startSettingsRepair();
   return mutationInFlight ?? refreshSingleFlight();
 }
 
@@ -181,10 +242,7 @@ saveButton.addEventListener("click", () => void mutateSettings(async () => {
     token: tokenInput.value.trim(),
     port: Number(portInput.value) || DEFAULT_SETTINGS.port,
   };
-  await withDeadline(
-    chrome.storage.local.set(next),
-    "Chromium did not save the relay settings in time.",
-  );
+  await saveSettingsPatch(next);
   settingsSnapshot = { ...settingsSnapshot, ...next };
   showSaved();
 }));
@@ -195,10 +253,7 @@ toggleButton.addEventListener("click", () => void mutateSettings(async () => {
     "Chromium did not return the relay setting in time.",
   );
   const enabled = stored.enabled === false;
-  await withDeadline(
-    chrome.storage.local.set({ enabled }),
-    "Chromium did not save the relay setting in time.",
-  );
+  await saveSettingsPatch({ enabled });
   settingsSnapshot = { ...settingsSnapshot, enabled };
 }));
 

@@ -170,6 +170,50 @@ test("save and toggle are bounded and never overlap", async () => {
   assert.ok(settingReads >= 1);
 });
 
+test("a late timed-out save republishes the newest settings generation", async () => {
+  const firstWrite = deferred();
+  const writes = [];
+  const stored = { port: 7717, token: "paired", enabled: true };
+  const document = popupDocument();
+  globalThis.document = document;
+  globalThis.chrome = {
+    storage: {
+      local: {
+        get: async (defaults) => Object.hasOwn(defaults, "port")
+          ? { ...stored }
+          : { enabled: stored.enabled },
+        set: async (value) => {
+          writes.push(structuredClone(value));
+          if (writes.length === 1) await firstWrite.promise;
+          Object.assign(stored, value);
+        },
+      },
+    },
+    runtime: { sendMessage: async () => ({ connected: false, paired: true, tabs: [] }) },
+  };
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+
+  await import(`../extension/popup.js?late-save=${Date.now()}`);
+  await settle();
+  document.elements.token.value = "first-token";
+  document.elements.port.value = "8111";
+  document.elements.save.emit("click");
+  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  await settle();
+
+  document.elements.token.value = "newest-token";
+  document.elements.port.value = "8222";
+  document.elements.save.emit("click");
+  for (let attempt = 0; attempt < 20 && writes.length < 2; attempt += 1) await settle();
+  assert.deepEqual(stored, { port: 8222, token: "newest-token", enabled: true });
+
+  firstWrite.resolve();
+  for (let attempt = 0; attempt < 20 && writes.length < 3; attempt += 1) await settle();
+  assert.deepEqual(writes[2], { port: 8222, token: "newest-token" });
+  assert.deepEqual(stored, { port: 8222, token: "newest-token", enabled: true });
+});
+
 test("a ghost tab without title or URL falls back to its tab id, including zero", async () => {
   const document = popupDocument();
   globalThis.document = document;

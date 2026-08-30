@@ -42,6 +42,7 @@ function chromeMock({
   attach,
   detach = async () => {},
   getTargets,
+  persistFence = async () => {},
   persistLocal = async () => {},
   persistSession = async () => {},
   removeLocal = async () => {},
@@ -80,7 +81,9 @@ function chromeMock({
       local: {
         get: restoreLocal,
         remove: removeLocal,
-        set: persistLocal,
+        set: (value) => Object.hasOwn(value, "ghostOwnershipFence")
+          ? persistFence(value)
+          : persistLocal(value),
       },
       session: {
         get: restoreSession,
@@ -527,13 +530,11 @@ test("a worker restart restores a durably published session claim", async () => 
   });
   const first = await import(`../extension/ops.js?persist-owner=${Date.now()}`);
   await first.runOp("open", { session: "durable", url: "https://example.com/" }, 1_000);
-  assert.deepEqual(stored, {
-    ghostTabs: {
-      version: 2,
-      tabs: [17],
-      sessions: [["durable", [17]]],
-      retired: [],
-    },
+  assert.deepEqual(stored.ghostTabs, {
+    version: 2,
+    tabs: [17],
+    sessions: [["durable", [17]]],
+    retired: [],
   });
 
   const restarted = await import(`../extension/ops.js?restore-owner=${Date.now()}`);
@@ -591,8 +592,11 @@ test("a new daemon tombstones a pending old-daemon create before admitting work"
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.deepEqual(removed, [17]);
-  assert.deepEqual(storedSession, {
-    ghostTabs: { version: 2, tabs: [], sessions: [], retired: [] },
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: [],
   });
 });
 
@@ -638,7 +642,7 @@ test("incarnation retry republishes an in-memory create tombstone before worker 
     (error) => error instanceof RelayOpError
       && /previous ghostd.*session storage unavailable.*retry automatically/i.test(error.message),
   );
-  assert.deepEqual(storedSession, { ghostTabs: null });
+  assert.equal(storedSession.ghostTabs, null);
 
   await first.reconcileDaemonIncarnation(INCARNATION_B);
   assert.equal(writes, 2, "the retry republishes an already-present in-memory tombstone");
@@ -677,7 +681,7 @@ test("a failed out-of-order incarnation repair stays pending for preparation ret
     persistLocal: async (value) => {
       writes += 1;
       if (writes === 1) await staleWrite.promise;
-      if (writes === 3) throw new Error("incarnation repair unavailable");
+      if (writes === 3 || writes === 4) throw new Error("incarnation repair unavailable");
       Object.assign(storedLocal, structuredClone(value));
     },
     restoreLocal: async (defaults) => Object.hasOwn(defaults, "ghostDaemonIncarnation")
@@ -714,8 +718,13 @@ test("a failed out-of-order incarnation repair stays pending for preparation ret
       && /ownership recovery is not durable yet.*automatic repair/i.test(error.message),
   );
 
+  await assert.rejects(
+    ops.repairBrowserPersistence(),
+    (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
+    "a rejected repair remains a typed relay failure",
+  );
   await ops.repairBrowserPersistence();
-  assert.equal(writes, 4, "connection preparation retries the pending incarnation marker");
+  assert.equal(writes, 5, "connection preparation retries the pending incarnation marker");
   assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
 });
 
@@ -773,8 +782,11 @@ test("a timed-out ownership write cannot block close and repairs a late stale wr
 
   firstWrite.resolve();
   for (let attempt = 0; attempt < 20; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(storedSession, {
-    ghostTabs: { version: 2, tabs: [], sessions: [], retired: [] },
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: [],
   });
   assert.deepEqual(storedLocal, { ghostOwnershipPoison: null });
 
@@ -787,18 +799,25 @@ test("a timed-out ownership write cannot block close and repairs a late stale wr
   await restarted.restoreTabsFromSession();
 });
 
-test("a failed late ownership repair stays fail-closed until preparation retries it", async () => {
+test("a failed late ownership repair stays fenced across a fresh worker module", async () => {
   const staleWrite = deferred();
-  let storedSession = { ghostTabs: null };
+  let storedSession = { ghostTabs: null, ghostTabsRevision: null };
+  const storedLocal = {
+    ghostOwnershipPoison: null,
+    ghostOwnershipFence: null,
+  };
   let writes = 0;
   globalThis.chrome = chromeMock({
     attach: async () => {},
+    persistFence: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
     persistSession: async (value) => {
       writes += 1;
       if (writes === 2) await staleWrite.promise;
       if (writes === 4) throw new Error("repair storage unavailable");
       storedSession = structuredClone(value);
     },
+    restoreLocal: async () => structuredClone(storedLocal),
+    restoreSession: async () => structuredClone(storedSession),
   });
   const ops = await import(`../extension/ops.js?ownership-repair-retry=${Date.now()}`);
   await ops.runOp("open", { session: "stale-owner", url: "https://example.com/" }, 1_000);
@@ -807,8 +826,11 @@ test("a failed late ownership repair stays fail-closed until preparation retries
     ops.runOp("close", { session: "stale-owner" }, 2_000),
     (error) => error instanceof RelayOpError && /workspace release needs retry/i.test(error.message),
   );
-  assert.deepEqual(storedSession, {
-    ghostTabs: { version: 2, tabs: [], sessions: [], retired: ["stale-owner"] },
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: ["stale-owner"],
   });
 
   staleWrite.resolve();
@@ -817,16 +839,24 @@ test("a failed late ownership repair stays fail-closed until preparation retries
   }
   assert.equal(writes, 4, "the immediate newest-snapshot repair was attempted once");
   assert.deepEqual(storedSession.ghostTabs.tabs, [17], "the late stale write won temporarily");
+  assert.ok(
+    storedLocal.ghostOwnershipFence.revision > storedSession.ghostTabsRevision,
+    "the durable fence remains newer than the stale session snapshot",
+  );
   await assert.rejects(
     ops.runOp("open", { session: "other-owner", url: "https://other.example/" }, 1_000),
     (error) => error instanceof RelayOpError
       && /ownership recovery is not durable yet.*automatic repair/i.test(error.message),
   );
 
-  await ops.repairBrowserPersistence();
-  assert.equal(writes, 5, "connection preparation retries the still-pending repair");
-  assert.deepEqual(storedSession, {
-    ghostTabs: { version: 2, tabs: [], sessions: [], retired: ["stale-owner"] },
+  const restarted = await import(`../extension/ops.js?ownership-fence-restart=${Date.now()}`);
+  await restarted.restoreTabsFromSession();
+  assert.equal(writes, 5, "a fresh worker republishes the newer durable fence");
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: ["stale-owner"],
   });
 });
 
@@ -868,9 +898,51 @@ test("a timed-out poison publication releases close and repairs its late result"
   poisonWrite.resolve();
   for (let attempt = 0; attempt < 20; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(storedLocal, { ghostOwnershipPoison: null });
-  assert.deepEqual(storedSession, {
-    ghostTabs: { version: 2, tabs: [], sessions: [], retired: [] },
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: [],
   });
+});
+
+test("poison-only live ownership is reverified and promoted on a repeated restore", async () => {
+  const storedSession = { ghostTabs: null, ghostTabsRevision: null };
+  const storedLocal = {
+    ghostOwnershipPoison: { version: 1, claims: [["poison-owner", 17]] },
+    ghostOwnershipFence: null,
+  };
+  let tabReads = 0;
+  globalThis.chrome = chromeMock({
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
+    persistSession: async (value) => { Object.assign(storedSession, structuredClone(value)); },
+    removeLocal: async () => { storedLocal.ghostOwnershipPoison = null; },
+    restoreLocal: async () => structuredClone(storedLocal),
+    restoreSession: async () => structuredClone(storedSession),
+    tabGet: async () => {
+      tabReads += 1;
+      if (tabReads === 1) throw new Error("tab status temporarily unavailable");
+      return { id: 17, windowId: 4, status: "complete", active: false };
+    },
+  });
+  const ops = await import(`../extension/ops.js?poison-repeat=${Date.now()}`);
+
+  await assert.rejects(
+    ops.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError
+      && /ownership of tab 17 is indeterminate.*temporarily unavailable/i.test(error.message),
+  );
+  assert.deepEqual(storedSession, { ghostTabs: null, ghostTabsRevision: null });
+  assert.notEqual(storedLocal.ghostOwnershipPoison, null);
+
+  await ops.restoreTabsFromSession();
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [17],
+    sessions: [["poison-owner", [17]]],
+    retired: [],
+  });
+  assert.equal(storedLocal.ghostOwnershipPoison, null);
 });
 
 test("a rejected claim publication closes the unowned new tab", async () => {
@@ -930,7 +1002,9 @@ test("double claim persistence failure stays poisoned across a worker restart", 
     restarted.restoreTabsFromSession(),
     (error) => error instanceof RelayOpError
       && error.failure === "browser_unavailable"
-      && /indeterminate after a worker restart/.test(error.message),
+      && /could not confirm restored browser ownership.*session storage unavailable/i.test(
+        error.message,
+      ),
   );
   await assert.rejects(
     restarted.runOp("open", { session: "fresh", url: "https://other.example/" }, 1_000),
@@ -1019,6 +1093,39 @@ test("restore fails closed when storage or tab existence is indeterminate", asyn
     (error) => error instanceof RelayOpError
       && error.failure === "browser_unavailable"
       && /verify restored tab 17/.test(error.message),
+  );
+});
+
+test("restore rejects equal ownership revisions with different snapshots", async () => {
+  const sessionSnapshot = {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: ["session-owner"],
+  };
+  const fenceSnapshot = {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: ["fence-owner"],
+  };
+  globalThis.chrome = chromeMock({
+    restoreLocal: async () => ({
+      ghostOwnershipPoison: null,
+      ghostOwnershipFence: { version: 1, revision: 7, snapshot: fenceSnapshot },
+    }),
+    restoreSession: async () => ({
+      ghostTabs: sessionSnapshot,
+      ghostTabsRevision: 7,
+    }),
+  });
+  const restoring = await import(`../extension/ops.js?restore-fence-conflict=${Date.now()}`);
+
+  await assert.rejects(
+    restoring.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError
+      && error.failure === "browser_unavailable"
+      && /ownership or its durability fence is invalid/i.test(error.message),
   );
 });
 
@@ -1185,8 +1292,11 @@ test("a failed late-create removal is swept after the daemon has rotated session
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.equal(removeAttempts, 2);
-  assert.deepEqual(storedSession, {
-    ghostTabs: { version: 2, tabs: [], sessions: [], retired: [] },
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: [],
   });
 });
 
@@ -1230,8 +1340,11 @@ test("restore merge-gates an older snapshot behind a newer uncertain live claim"
   allowPersistence = true;
   await merging.restoreTabsFromSession();
   assert.equal(restoreReads, 0, "live generation must win before the old snapshot is read");
-  assert.deepEqual(storedSession, {
-    ghostTabs: { version: 2, tabs: [17], sessions: [["newer", [17]]], retired: [] },
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [17],
+    sessions: [["newer", [17]]],
+    retired: [],
   });
   assert.deepEqual(storedLocal, { ghostOwnershipPoison: null });
 
@@ -1252,8 +1365,11 @@ test("retired UUID persistence is garbage-collected after all create leases sett
   const gc = await import(`../extension/ops.js?retired-gc=${Date.now()}`);
   await gc.restoreTabsFromSession();
   await gc.sweepRetiredTabs();
-  assert.deepEqual(storedSession, {
-    ghostTabs: { version: 2, tabs: [], sessions: [], retired: [] },
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: [],
   });
   await assert.rejects(
     gc.runOp("open", { session: "retired-2047", url: "https://late.example/" }, 1_000),

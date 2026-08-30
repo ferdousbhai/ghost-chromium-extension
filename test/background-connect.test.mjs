@@ -5,6 +5,7 @@ import { PROTOCOL_VERSION } from "../extension/protocol.js";
 const originalChrome = globalThis.chrome;
 const originalWebSocket = globalThis.WebSocket;
 const originalSetTimeout = globalThis.setTimeout;
+const originalClearTimeout = globalThis.clearTimeout;
 const originalSetInterval = globalThis.setInterval;
 const originalClearInterval = globalThis.clearInterval;
 const INCARNATION_A = "11111111-1111-4111-8111-111111111111";
@@ -16,6 +17,7 @@ afterEach(() => {
   if (originalWebSocket === undefined) delete globalThis.WebSocket;
   else globalThis.WebSocket = originalWebSocket;
   globalThis.setTimeout = originalSetTimeout;
+  globalThis.clearTimeout = originalClearTimeout;
   globalThis.setInterval = originalSetInterval;
   globalThis.clearInterval = originalClearInterval;
 });
@@ -44,6 +46,7 @@ function chromeMock({
   badges = [],
   debuggerTargets = async () => [],
   loadSettings,
+  persistFence = async () => {},
   persistLocal = async () => {},
   removeLocal = async () => {},
   restoreIncarnation = async () => ({ ghostDaemonIncarnation: null }),
@@ -82,7 +85,9 @@ function chromeMock({
             ? restoreIncarnation(defaults)
             : loadSettings(defaults)),
         remove: removeLocal,
-        set: persistLocal,
+        set: (value) => Object.hasOwn(value, "ghostOwnershipFence")
+          ? persistFence(value)
+          : persistLocal(value),
       },
       onChanged: eventHook(),
       session: {
@@ -310,6 +315,68 @@ test("a failed dial releases the latch and reconnects once", async () => {
   reconnects[0]();
   await settle();
   assert.equal(constructions, 2);
+});
+
+test("reconnect attempts share one cancelable timer and recover through an alarm", async () => {
+  const timers = new Map();
+  const sockets = [];
+  let nextTimer = 1;
+  let failDial = true;
+  globalThis.chrome = chromeMock({
+    loadSettings: async () => ({ port: 7717, token: "paired", enabled: true }),
+  });
+  globalThis.setTimeout = (callback, delay) => {
+    const id = nextTimer;
+    nextTimer += 1;
+    timers.set(id, {
+      delay,
+      run: () => {
+        timers.delete(id);
+        callback();
+      },
+    });
+    return id;
+  };
+  globalThis.clearTimeout = (id) => { timers.delete(id); };
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor() {
+      if (failDial) throw new Error("dial failed");
+      this.readyState = FakeWebSocket.CONNECTING;
+      sockets.push(this);
+    }
+
+    close() {
+      this.readyState = 3;
+      this.onclose?.({ code: 1000, reason: "" });
+    }
+  };
+
+  await import(`../extension/background.js?timer-coalesce=${Date.now()}`);
+  await settle();
+  assert.equal(timers.size, 1);
+  assert.deepEqual([...timers.values()].map(({ delay }) => delay), [1_000]);
+
+  chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
+  chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
+  chrome.runtime.onStartup.emit();
+  await settle();
+  assert.equal(timers.size, 1, "overlapping failures coalesce behind one retry timer");
+
+  failDial = false;
+  chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
+  await settle();
+  assert.equal(sockets.length, 1);
+  assert.equal(timers.size, 0, "an alarm recovery cancels the obsolete retry");
+
+  sockets[0].onclose({ code: 1006, reason: "" });
+  assert.equal(timers.size, 1);
+  chrome.storage.onChanged.emit({ token: { oldValue: "paired", newValue: "new" } }, "local");
+  await settle();
+  assert.equal(sockets.length, 2);
+  assert.equal(timers.size, 0, "a settings redial cancels the disconnected socket's retry");
 });
 
 test("a settings change invalidates an awaiting attempt before it can dial", async () => {
@@ -731,8 +798,11 @@ test("a new daemon incarnation retires crash-orphaned claims before hello", asyn
   for (let attempt = 0; attempt < 30 && replacement.sent.length === 0; attempt += 1) await settle();
   assert.equal(replacement.sent.at(-1).t, "hello");
   assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
-  assert.deepEqual(storedSession, {
-    ghostTabs: { version: 2, tabs: [], sessions: [], retired: [] },
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: [],
   });
   assert.equal(live, false);
 });

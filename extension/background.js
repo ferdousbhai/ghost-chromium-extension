@@ -62,6 +62,8 @@ let settingsGeneration = 0;
 let settingsCache = null;
 let settingsInFlight = null;
 let reconnectDelay = RECONNECT_MIN_MS;
+let reconnectTimer = null;
+let reconnectTimerIncompatible = false;
 let pingTimer = null;
 /** The current socket only becomes connected after its compatible welcome. */
 let welcomedSocket = null;
@@ -178,12 +180,26 @@ async function refreshBadge() {
 }
 
 
+function cancelReconnect() {
+  if (reconnectTimer === null) return;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  reconnectTimerIncompatible = false;
+}
+
 function scheduleReconnect() {
   const incompatible = protocolIncompatible;
+  if (reconnectTimer !== null) {
+    if (!incompatible || reconnectTimerIncompatible) return;
+    cancelReconnect();
+  }
   const delay = incompatible ? PROTOCOL_RETRY_MS : reconnectDelay;
   if (incompatible) void setBadge("off");
   else reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
-  setTimeout(() => {
+  reconnectTimerIncompatible = incompatible;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectTimerIncompatible = false;
     // Keep alarm-driven attempts latched during the cool-down, then give exactly
     // this scheduled probe permission to negotiate the newly updated peer.
     if (incompatible) protocolIncompatible = false;
@@ -271,6 +287,7 @@ async function connectOnce(epoch) {
 function connect() {
   if (protocolIncompatible) return Promise.resolve();
   if (connectInFlight !== null) return connectInFlight;
+  cancelReconnect();
 
   const epoch = connectEpoch;
   const attempt = connectOnce(epoch).catch((error) => {
@@ -379,6 +396,7 @@ async function handleFrame(socket, raw) {
     // so only now is the backoff safe to reset.
     protocolIncompatible = false;
     reconnectDelay = RECONNECT_MIN_MS;
+    cancelReconnect();
     welcomedSocket = socket;
     lastError = "";
     clearInterval(pingTimer ?? undefined);
@@ -414,6 +432,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     // a fresh chance.
     connectEpoch += 1;
     protocolIncompatible = false;
+    cancelReconnect();
     const oldSocket = ws;
     ws = null;
     if (welcomedSocket === oldSocket) welcomedSocket = null;
