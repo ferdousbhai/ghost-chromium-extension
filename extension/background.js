@@ -64,6 +64,9 @@ let lastError = "";
  * (either can mean a fixed daemon or a fixed extension).
  */
 let protocolIncompatible = false;
+/** Per-protocol-session ordering plus successful-close tombstones. */
+const sessionTails = new Map();
+const retiredSessions = new Set();
 
 function normalizeSettings(stored = {}) {
   return {
@@ -257,6 +260,64 @@ function connect() {
   return attempt;
 }
 
+async function answerRequest(socket, frame) {
+  const { enabled } = await loadSettings();
+  if (!enabled && frame.op !== "status") {
+    sendTo(socket, {
+      t: "res",
+      id: frame.id,
+      ok: false,
+      error: {
+        failure: "browser_unavailable",
+        message:
+          "The Ghost relay is paused. The owner can resume it from the "
+          + "extension's popup in Chromium.",
+      },
+    });
+    return false;
+  }
+
+  try {
+    const result = await runOp(frame.op, frame.args ?? {}, frame.timeoutMs ?? 30_000);
+    sendTo(socket, { t: "res", id: frame.id, ok: true, result });
+    return true;
+  } catch (error) {
+    sendTo(socket, toErrorFrame(frame.id, error));
+    return false;
+  }
+}
+
+function queueRequest(socket, frame) {
+  const session = typeof frame.args?.session === "string" && frame.args.session !== ""
+    ? frame.args.session
+    : null;
+  if (session === null) return answerRequest(socket, frame);
+  const previous = sessionTails.get(session) ?? Promise.resolve();
+  const run = async () => {
+    if (retiredSessions.has(session) && frame.op !== "close") {
+      sendTo(socket, {
+        t: "res",
+        id: frame.id,
+        ok: false,
+        error: {
+          failure: "browser_unavailable",
+          message: "This browser session is closed. Open through a fresh session.",
+        },
+      });
+      return;
+    }
+    const succeeded = await answerRequest(socket, frame);
+    if (frame.op === "close" && succeeded) retiredSessions.add(session);
+  };
+  const task = previous.then(run, run);
+  sessionTails.set(session, task);
+  const clear = () => {
+    if (sessionTails.get(session) === task) sessionTails.delete(session);
+  };
+  void task.then(clear, clear);
+  return task;
+}
+
 async function handleFrame(socket, raw) {
   if (ws !== socket) return;
   let frame;
@@ -285,29 +346,7 @@ async function handleFrame(socket, raw) {
   }
   if (frame?.t !== "req" || typeof frame.id !== "number") return;
   if (welcomedSocket !== socket) return;
-
-  const { enabled } = await loadSettings();
-  if (!enabled && frame.op !== "status") {
-    sendTo(socket, {
-      t: "res",
-      id: frame.id,
-      ok: false,
-      error: {
-        failure: "browser_unavailable",
-        message:
-          "The Ghost relay is paused. The owner can resume it from the "
-          + "extension's popup in Chromium.",
-      },
-    });
-    return;
-  }
-
-  try {
-    const result = await runOp(frame.op, frame.args ?? {}, frame.timeoutMs ?? 30_000);
-    sendTo(socket, { t: "res", id: frame.id, ok: true, result });
-  } catch (error) {
-    sendTo(socket, toErrorFrame(frame.id, error));
-  }
+  return queueRequest(socket, frame);
 }
 
 

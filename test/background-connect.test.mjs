@@ -88,6 +88,15 @@ async function settle() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
+async function responseFor(socket, id) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const response = socket.sent.find((frame) => frame.t === "res" && frame.id === id);
+    if (response) return response;
+    await settle();
+  }
+  assert.fail(`relay response ${id} did not arrive`);
+}
+
 test("connect is single-flight while settings and session restoration await", async () => {
   const settings = deferred();
   const session = deferred();
@@ -431,4 +440,132 @@ test("a late operation result cannot cross into a replacement socket", async () 
   second.onmessage({ data: JSON.stringify({ t: "req", id: 42, op: "close", args: {} }) });
   await settle();
   assert.equal(second.sent.at(-1).id, 42);
+});
+
+test("close waits for cancelled tab creation and tombstones the retired session", async () => {
+  const created = deferred();
+  const sockets = [];
+  const removed = [];
+  let createCalls = 0;
+  let live = false;
+  const tab = {
+    id: 17,
+    windowId: 4,
+    status: "complete",
+    url: "https://example.com/",
+    title: "Example",
+  };
+  globalThis.chrome = chromeMock({
+    debuggerTargets: async () => live
+      ? [{ tabId: 17, type: "page", attached: false, url: tab.url, title: tab.title }]
+      : [],
+    loadSettings: async () => ({ port: 7717, token: "paired", enabled: true }),
+    tabApi: {
+      create: async () => {
+        createCalls += 1;
+        await created.promise;
+        live = true;
+        return tab;
+      },
+      get: async () => live ? tab : null,
+      remove: async (tabId) => {
+        removed.push(tabId);
+        live = false;
+      },
+    },
+  });
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.sent = [];
+      sockets.push(this);
+    }
+
+    send(raw) {
+      this.sent.push(JSON.parse(raw));
+    }
+
+    close() {
+      this.readyState = 3;
+    }
+  };
+
+  await import(`../extension/background.js?session-order=${Date.now()}`);
+  await settle();
+  const socket = sockets[0];
+  socket.readyState = WebSocket.OPEN;
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 2, daemon: "ghostd" }) });
+  await settle();
+
+  socket.onmessage({
+    data: JSON.stringify({
+      t: "req",
+      id: 51,
+      op: "open",
+      args: { session: "retiring", url: tab.url },
+      timeoutMs: 1_000,
+    }),
+  });
+  await settle();
+  assert.equal(createCalls, 1);
+
+  socket.onmessage({
+    data: JSON.stringify({
+      t: "req",
+      id: 52,
+      op: "close",
+      args: { session: "retiring" },
+      timeoutMs: 1_000,
+    }),
+  });
+  await settle();
+  assert.equal(socket.sent.some((frame) => frame.id === 52), false);
+  assert.deepEqual(removed, []);
+
+  created.resolve();
+  assert.equal((await responseFor(socket, 51)).ok, true);
+  assert.equal((await responseFor(socket, 52)).ok, true);
+  assert.deepEqual(removed, [17]);
+
+  socket.onmessage({
+    data: JSON.stringify({
+      t: "req",
+      id: 53,
+      op: "open",
+      args: { session: "retiring", url: tab.url },
+      timeoutMs: 1_000,
+    }),
+  });
+  const stale = await responseFor(socket, 53);
+  assert.equal(stale.ok, false);
+  assert.equal(stale.error.failure, "browser_unavailable");
+  assert.equal(createCalls, 1);
+
+  socket.onmessage({
+    data: JSON.stringify({
+      t: "req",
+      id: 54,
+      op: "open",
+      args: { session: "fresh", url: tab.url },
+      timeoutMs: 1_000,
+    }),
+  });
+  assert.equal((await responseFor(socket, 54)).ok, true);
+  assert.equal(createCalls, 2);
+  socket.onmessage({
+    data: JSON.stringify({
+      t: "req",
+      id: 55,
+      op: "close",
+      args: { session: "fresh" },
+      timeoutMs: 1_000,
+    }),
+  });
+  assert.equal((await responseFor(socket, 55)).ok, true);
 });
