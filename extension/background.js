@@ -27,6 +27,7 @@
 import { PROTOCOL_VERSION, RELAY_PATH, SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX, toErrorFrame } from "./protocol.js";
 import {
   installOpsListeners,
+  repairBrowserPersistence,
   reconcileDaemonIncarnation,
   releaseAllTabs,
   restoreTabsFromSession,
@@ -204,8 +205,10 @@ async function connectOnce(epoch) {
     return;
   }
 
+  await repairBrowserPersistence();
   await restoreTabsFromSession();
   await sweepRetiredTabs().catch(() => undefined);
+  await repairBrowserPersistence();
   if (epoch !== connectEpoch) return;
 
   // A browser WebSocket cannot set headers, so the token rides in the one field
@@ -356,7 +359,9 @@ async function handleFrame(socket, raw) {
       return;
     }
     try {
+      await repairBrowserPersistence();
       await reconcileDaemonIncarnation(frame.incarnation);
+      await repairBrowserPersistence();
     } catch (error) {
       if (ws !== socket) return;
       lastError = error?.message ?? String(error);
@@ -394,6 +399,7 @@ installOpsListeners(notice);
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === KEEPALIVE_ALARM) {
+    void repairBrowserPersistence().catch(() => {});
     void sweepRetiredTabs().catch(() => {});
     void connect();
   }

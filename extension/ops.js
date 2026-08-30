@@ -72,7 +72,14 @@ let ownershipGeneration = 0;
 let sweepInFlight = null;
 let incarnationTail = Promise.resolve();
 let incarnationPublication = null;
-let incarnationRepairScheduled = false;
+
+function freshRepairLane() {
+  return { requested: 0, completed: 0, inFlight: null };
+}
+
+const ownershipRepair = freshRepairLane();
+const poisonRepair = freshRepairLane();
+const incarnationRepair = freshRepairLane();
 
 function freshTabState() {
   return {
@@ -178,16 +185,47 @@ function serializeIncarnation(work) {
   return task;
 }
 
-function scheduleIncarnationRepair() {
-  if (incarnationRepairScheduled) return;
-  incarnationRepairScheduled = true;
-  const task = serializeIncarnation(async () => {
-    incarnationRepairScheduled = false;
+function repairPending(lane) {
+  return lane.completed !== lane.requested;
+}
+
+function browserPersistenceRepairPending() {
+  return repairPending(ownershipRepair)
+    || repairPending(poisonRepair)
+    || repairPending(incarnationRepair);
+}
+
+function startRepair(lane, serialize, work) {
+  if (!repairPending(lane)) return Promise.resolve();
+  if (lane.inFlight !== null) return lane.inFlight;
+  const revision = lane.requested;
+  const attempt = serialize(async () => {
+    await work();
+    if (lane.requested === revision) lane.completed = revision;
+  });
+  lane.inFlight = attempt;
+  const clear = () => {
+    if (lane.inFlight === attempt) lane.inFlight = null;
+  };
+  void attempt.then(clear, clear);
+  return attempt;
+}
+
+function requestRepair(lane, attempt) {
+  lane.requested += 1;
+  void attempt().catch(() => {});
+}
+
+function attemptIncarnationRepair() {
+  return startRepair(incarnationRepair, serializeIncarnation, async () => {
     const publication = incarnationPublication;
     if (publication === null) return;
-    await persistIncarnation(publication).catch(() => {});
+    await persistIncarnation(publication);
   });
-  void task.catch(() => {});
+}
+
+function scheduleIncarnationRepair() {
+  requestRepair(incarnationRepair, attemptIncarnationRepair);
 }
 
 function ownershipSnapshot() {
@@ -199,12 +237,20 @@ function ownershipSnapshot() {
   };
 }
 
+function attemptOwnershipRepair() {
+  return startRepair(ownershipRepair, serializeOwnership, persistOwnership);
+}
+
 function scheduleOwnershipRepair() {
-  void serializeOwnership(() => persistOwnership()).catch(() => {});
+  requestRepair(ownershipRepair, attemptOwnershipRepair);
+}
+
+function attemptPoisonRepair() {
+  return startRepair(poisonRepair, serializeOwnership, persistCurrentPoison);
 }
 
 function schedulePoisonRepair() {
-  void serializeOwnership(() => persistCurrentPoison()).catch(() => {});
+  requestRepair(poisonRepair, attemptPoisonRepair);
 }
 
 function sameSnapshot(left, right) {
@@ -257,19 +303,32 @@ function persistCurrentPoison() {
   );
 }
 
+async function persistCurrentPoisonOrSchedule() {
+  try {
+    await persistCurrentPoison();
+  } catch {
+    schedulePoisonRepair();
+  }
+}
+
 async function persistOwnership() {
   await setOwnershipSnapshot(ownershipSnapshot());
   if (ownershipPoison.size > 0) {
     ownershipPoison.clear();
     ownershipGeneration += 1;
-    await persistCurrentPoison().catch(() => {});
+    await persistCurrentPoisonOrSchedule();
   }
 }
 
 async function persistPoison(session, tabId) {
   if (ownershipPoison.get(tabId) !== session) ownershipGeneration += 1;
   ownershipPoison.set(tabId, session);
-  await persistCurrentPoison();
+  try {
+    await persistCurrentPoison();
+  } catch (error) {
+    schedulePoisonRepair();
+    throw error;
+  }
 }
 
 function poisonSnapshot() {
@@ -298,7 +357,7 @@ function parsePoison(value) {
 
 async function clearPoison(tabId) {
   if (ownershipPoison.delete(tabId)) ownershipGeneration += 1;
-  await persistCurrentPoison().catch(() => {});
+  await persistCurrentPoisonOrSchedule();
 }
 
 function noSuchTab(error, tabId) {
@@ -411,7 +470,7 @@ export function restoreTabsFromSession() {
       ownershipPoison.clear();
       for (const [tab, session] of unresolved) ownershipPoison.set(tab, session);
       if (unresolved.size > 0) {
-        await persistCurrentPoison().catch(() => {});
+        await persistCurrentPoisonOrSchedule();
         const tab = unresolved.keys().next().value;
         throw failed(
           FAILURES.browserUnavailable,
@@ -422,7 +481,7 @@ export function restoreTabsFromSession() {
                 + `${verificationError?.message ?? verificationError}.`),
         );
       } else {
-        await persistCurrentPoison().catch(() => {});
+        await persistCurrentPoisonOrSchedule();
       }
     }
     const applyGeneration = ownershipGeneration;
@@ -2007,6 +2066,28 @@ export async function releaseAllTabs() {
   }));
 }
 
+/** Retry every durability repair that a timed-out Chrome storage write left pending. */
+export async function repairBrowserPersistence() {
+  let failed = false;
+  for (const attempt of [
+    attemptOwnershipRepair,
+    attemptPoisonRepair,
+    attemptIncarnationRepair,
+  ]) {
+    try {
+      await attempt();
+    } catch {
+      failed = true;
+    }
+  }
+  if (failed || browserPersistenceRepairPending()) {
+    throw failed(
+      FAILURES.browserUnavailable,
+      "Browser ownership recovery is not durable yet. Browser work remains paused while the relay retries automatically.",
+    );
+  }
+}
+
 export function startOp(op, args, timeoutMs) {
   const handler = ops[op];
   if (!handler) {
@@ -2019,6 +2100,12 @@ export function startOp(op, args, timeoutMs) {
     throw failed(
       FAILURES.browserUnavailable,
       RELEASED_WORKSPACE_MESSAGE,
+    );
+  }
+  if (browserPersistenceRepairPending() && op !== "close" && op !== "status") {
+    throw failed(
+      FAILURES.browserUnavailable,
+      "Browser ownership recovery is not durable yet. Retry after the relay finishes its automatic repair.",
     );
   }
   if (ownershipPoison.size > 0 && op !== "close" && op !== "status") {

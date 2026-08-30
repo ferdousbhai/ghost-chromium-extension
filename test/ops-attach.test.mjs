@@ -665,7 +665,7 @@ test("incarnation retry republishes an in-memory create tombstone before worker 
   assert.deepEqual(removed, [17]);
 });
 
-test("overlapping incarnation changes repair an out-of-order timed-out marker write", async () => {
+test("a failed out-of-order incarnation repair stays pending for preparation retry", async () => {
   const staleWrite = deferred();
   const storedLocal = {
     ghostOwnershipPoison: null,
@@ -677,6 +677,7 @@ test("overlapping incarnation changes repair an out-of-order timed-out marker wr
     persistLocal: async (value) => {
       writes += 1;
       if (writes === 1) await staleWrite.promise;
+      if (writes === 3) throw new Error("incarnation repair unavailable");
       Object.assign(storedLocal, structuredClone(value));
     },
     restoreLocal: async (defaults) => Object.hasOwn(defaults, "ghostDaemonIncarnation")
@@ -700,11 +701,21 @@ test("overlapping incarnation changes repair an out-of-order timed-out marker wr
 
   staleWrite.resolve();
   for (let attempt = 0;
-    attempt < 30 && (writes < 3 || storedLocal.ghostDaemonIncarnation !== INCARNATION_B);
+    attempt < 30 && writes < 3;
     attempt += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.equal(writes, 3, "the late stale marker queues exactly one newest-marker repair");
+  assert.equal(writes, 3, "the late stale marker queues one immediate repair attempt");
+  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_A);
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(
+    ops.runOp("open", { session: "blocked", url: "https://blocked.example/" }, 1_000),
+    (error) => error instanceof RelayOpError
+      && /ownership recovery is not durable yet.*automatic repair/i.test(error.message),
+  );
+
+  await ops.repairBrowserPersistence();
+  assert.equal(writes, 4, "connection preparation retries the pending incarnation marker");
   assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
 });
 
@@ -774,6 +785,49 @@ test("a timed-out ownership write cannot block close and repairs a late stale wr
   );
   const restarted = await import(`../extension/ops.js?write-timeout-restart=${Date.now()}`);
   await restarted.restoreTabsFromSession();
+});
+
+test("a failed late ownership repair stays fail-closed until preparation retries it", async () => {
+  const staleWrite = deferred();
+  let storedSession = { ghostTabs: null };
+  let writes = 0;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistSession: async (value) => {
+      writes += 1;
+      if (writes === 2) await staleWrite.promise;
+      if (writes === 4) throw new Error("repair storage unavailable");
+      storedSession = structuredClone(value);
+    },
+  });
+  const ops = await import(`../extension/ops.js?ownership-repair-retry=${Date.now()}`);
+  await ops.runOp("open", { session: "stale-owner", url: "https://example.com/" }, 1_000);
+
+  await assert.rejects(
+    ops.runOp("close", { session: "stale-owner" }, 2_000),
+    (error) => error instanceof RelayOpError && /workspace release needs retry/i.test(error.message),
+  );
+  assert.deepEqual(storedSession, {
+    ghostTabs: { version: 2, tabs: [], sessions: [], retired: ["stale-owner"] },
+  });
+
+  staleWrite.resolve();
+  for (let attempt = 0; attempt < 30 && writes < 4; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(writes, 4, "the immediate newest-snapshot repair was attempted once");
+  assert.deepEqual(storedSession.ghostTabs.tabs, [17], "the late stale write won temporarily");
+  await assert.rejects(
+    ops.runOp("open", { session: "other-owner", url: "https://other.example/" }, 1_000),
+    (error) => error instanceof RelayOpError
+      && /ownership recovery is not durable yet.*automatic repair/i.test(error.message),
+  );
+
+  await ops.repairBrowserPersistence();
+  assert.equal(writes, 5, "connection preparation retries the still-pending repair");
+  assert.deepEqual(storedSession, {
+    ghostTabs: { version: 2, tabs: [], sessions: [], retired: ["stale-owner"] },
+  });
 });
 
 test("a timed-out poison publication releases close and repairs its late result", async () => {
