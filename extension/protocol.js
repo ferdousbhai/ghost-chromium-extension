@@ -11,7 +11,7 @@
  */
 
 /** Bumped when a frame shape changes incompatibly. */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 // The handshake name, deliberately frozen while PROTOCOL_VERSION moves: it
 // identifies the socket, and the `hello`/`welcome` exchange negotiates the

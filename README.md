@@ -60,6 +60,10 @@ Click the extension, paste the token, **Save & connect**. It is kept in
 only after a compatible ghostd has answered the protocol handshake, `||` when
 that authenticated connection is paused, and `off` otherwise.
 
+The current relay protocol is 3. A protocol-2 daemon or extension is refused
+before either side accepts browser work; update the older Ghost package, then
+reload the unpacked extension from `chrome://extensions` if it was the old side.
+
 The token lives at `$XDG_STATE_HOME/ghost/relay-token` (default
 `~/.local/state/ghost/relay-token`), mode `0600`.
 The pasted copy lives in Chromium's profile under `chrome.storage.local`;

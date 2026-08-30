@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
+import { PROTOCOL_VERSION } from "../extension/protocol.js";
 
 const originalChrome = globalThis.chrome;
 const originalWebSocket = globalThis.WebSocket;
@@ -342,7 +343,9 @@ test("settings are cached and an open socket stays off until a compatible welcom
   await settle();
   assert.deepEqual(socket.sent.map((frame) => frame.t), ["hello"]);
 
-  socket.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 2, daemon: "ghostd" }) });
+  socket.onmessage({
+    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "ghostd" }),
+  });
   await settle();
   assert.equal(badges.at(-1), "on");
 
@@ -364,6 +367,54 @@ test("settings are cached and an open socket stays off until a compatible welcom
   assert.equal(socket.sent.at(-1).ok, false);
   assert.equal(socket.sent.at(-1).error.failure, "browser_unavailable");
   assert.equal(settingsReads, 2);
+});
+
+test("an old protocol-2 daemon is refused with update guidance", async () => {
+  const sockets = [];
+  globalThis.chrome = chromeMock({
+    loadSettings: async () => ({ port: 7717, token: "paired", enabled: true }),
+  });
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.sent = [];
+      this.closes = [];
+      sockets.push(this);
+    }
+
+    send(raw) {
+      this.sent.push(JSON.parse(raw));
+    }
+
+    close(code, reason) {
+      this.readyState = 3;
+      this.closes.push({ code, reason });
+    }
+  };
+
+  await import(`../extension/background.js?old-protocol=${Date.now()}`);
+  await settle();
+  const socket = sockets[0];
+  socket.readyState = WebSocket.OPEN;
+  socket.onopen();
+  assert.equal(socket.sent.at(-1).protocol, 3);
+
+  socket.onmessage({
+    data: JSON.stringify({ t: "welcome", protocol: 2, daemon: "old-ghostd" }),
+  });
+  await settle();
+  assert.equal(socket.closes[0].code, 4000);
+  assert.match(socket.closes[0].reason, /speaks relay protocol 2.*speaks 3/i);
+  assert.match(socket.closes[0].reason, /update whichever is older/i);
+
+  chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
+  await settle();
+  assert.equal(sockets.length, 1, "a version mismatch must not reconnect-loop");
 });
 
 test("a late operation result cannot cross into a replacement socket", async () => {
@@ -416,7 +467,9 @@ test("a late operation result cannot cross into a replacement socket", async () 
   const first = sockets[0];
   first.readyState = WebSocket.OPEN;
   first.onopen();
-  first.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 2, daemon: "ghostd" }) });
+  first.onmessage({
+    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "ghostd" }),
+  });
   await settle();
 
   first.onmessage({
@@ -429,7 +482,9 @@ test("a late operation result cannot cross into a replacement socket", async () 
   const second = sockets[1];
   second.readyState = WebSocket.OPEN;
   second.onopen();
-  second.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 2, daemon: "ghostd" }) });
+  second.onmessage({
+    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "ghostd" }),
+  });
 
   statusRead.resolve(tab);
   await settle();
@@ -500,7 +555,9 @@ test("close waits for tab creation after its response deadline and tombstones th
   const socket = sockets[0];
   socket.readyState = WebSocket.OPEN;
   socket.onopen();
-  socket.onmessage({ data: JSON.stringify({ t: "welcome", protocol: 2, daemon: "ghostd" }) });
+  socket.onmessage({
+    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "ghostd" }),
+  });
   await settle();
 
   socket.onmessage({
