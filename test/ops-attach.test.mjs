@@ -8,6 +8,14 @@ const INCARNATION_A = "11111111-1111-4111-8111-111111111111";
 const INCARNATION_B = "22222222-2222-4222-8222-222222222222";
 const BROWSER_SESSION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
+function poisonPublication(claims, revision = 2, browserSession = BROWSER_SESSION) {
+  return { version: 2, browserSession, revision, claims };
+}
+
+function incarnationPublication(incarnation, revision = 2) {
+  return { version: 1, revision, incarnation };
+}
+
 afterEach(() => {
   if (originalChrome === undefined) delete globalThis.chrome;
   else globalThis.chrome = originalChrome;
@@ -80,14 +88,14 @@ function chromeMock({
     },
     storage: {
       local: {
-        get: restoreLocal,
+        get: async (defaults) => ({ ...defaults, ...await restoreLocal(defaults) }),
         remove: removeLocal,
         set: (value) => Object.hasOwn(value, "ghostOwnershipFence")
           ? persistFence(value)
           : persistLocal(value),
       },
       session: {
-        get: restoreSession,
+        get: async (defaults) => ({ ...defaults, ...await restoreSession(defaults) }),
         set: persistSession,
       },
     },
@@ -553,7 +561,7 @@ test("a Chromium restart never adopts a reused tab id from the prior browser ses
     retired: [],
   };
   const storedLocal = {
-    ghostOwnershipPoison: { version: 1, claims: [["old-browser", 17]] },
+    ghostOwnershipPoison: poisonPublication([["old-browser", 17]], 8),
     ghostOwnershipFence: {
       version: 2,
       browserSession: BROWSER_SESSION,
@@ -569,8 +577,8 @@ test("a Chromium restart never adopts a reused tab id from the prior browser ses
   let tabReads = 0;
   globalThis.chrome = chromeMock({
     persistFence: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
     persistSession: async (value) => { Object.assign(storedSession, structuredClone(value)); },
-    removeLocal: async () => { storedLocal.ghostOwnershipPoison = null; },
     restoreLocal: async () => structuredClone(storedLocal),
     restoreSession: async () => structuredClone(storedSession),
     tabGet: async () => {
@@ -590,7 +598,73 @@ test("a Chromium restart never adopts a reused tab id from the prior browser ses
     retired: [],
   });
   assert.deepEqual((await restarted.runOp("status", {}, 1_000)).tabs, []);
-  assert.equal(storedLocal.ghostOwnershipPoison, null);
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, []);
+  assert.deepEqual(storedLocal.ghostOwnershipPoisonBackup.claims, []);
+});
+
+test("a partial fresh-browser poison reset is completed before ownership is published", async () => {
+  const partialBrowser = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const storedLocal = {
+    ghostOwnershipPoison: poisonPublication([], 10, partialBrowser),
+    ghostOwnershipPoisonBackup: poisonPublication([["old-browser", 17]], 8),
+  };
+  const storedSession = {
+    ghostTabs: null,
+    ghostTabsRevision: null,
+    ghostBrowserSession: null,
+  };
+  let tabReads = 0;
+  globalThis.chrome = chromeMock({
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
+    persistSession: async (value) => { Object.assign(storedSession, structuredClone(value)); },
+    restoreLocal: async () => structuredClone(storedLocal),
+    restoreSession: async () => structuredClone(storedSession),
+    tabGet: async () => {
+      tabReads += 1;
+      return { id: 17, windowId: 8, status: "complete", active: true };
+    },
+  });
+  const restarted = await import(`../extension/ops.js?partial-browser-reset=${Date.now()}`);
+
+  await restarted.restoreTabsFromSession();
+  assert.equal(tabReads, 0);
+  assert.notEqual(storedSession.ghostBrowserSession, partialBrowser);
+  assert.equal(
+    storedLocal.ghostOwnershipPoison.browserSession,
+    storedSession.ghostBrowserSession,
+  );
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, []);
+  assert.deepEqual(storedLocal.ghostOwnershipPoisonBackup, storedLocal.ghostOwnershipPoison);
+});
+
+test("fresh Chromium withholds its browser identity until both poison slots clear", async () => {
+  const storedLocal = {
+    ghostOwnershipPoison: poisonPublication([["old-browser", 17]], 8),
+  };
+  let sessionWrites = 0;
+  globalThis.chrome = chromeMock({
+    persistLocal: async (value) => {
+      if (Object.hasOwn(value, "ghostOwnershipPoisonBackup")) {
+        throw new Error("backup poison slot unavailable");
+      }
+      Object.assign(storedLocal, structuredClone(value));
+    },
+    persistSession: async () => { sessionWrites += 1; },
+    restoreLocal: async () => structuredClone(storedLocal),
+    restoreSession: async () => ({
+      ghostTabs: null,
+      ghostTabsRevision: null,
+      ghostBrowserSession: null,
+    }),
+  });
+  const resetting = await import(`../extension/ops.js?browser-reset-barrier=${Date.now()}`);
+
+  await assert.rejects(
+    resetting.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError && /backup poison slot unavailable/i.test(error.message),
+  );
+  assert.equal(sessionWrites, 0);
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, []);
 });
 
 test("a new daemon tombstones a pending old-daemon create before admitting work", async () => {
@@ -599,7 +673,7 @@ test("a new daemon tombstones a pending old-daemon create before admitting work"
   let storedSession = { ghostTabs: null };
   const storedLocal = {
     ghostOwnershipPoison: null,
-    ghostDaemonIncarnation: INCARNATION_A,
+    ghostDaemonIncarnation: incarnationPublication(INCARNATION_A),
   };
   globalThis.chrome = chromeMock({
     attach: async () => {},
@@ -626,7 +700,8 @@ test("a new daemon tombstones a pending old-daemon create before admitting work"
   await new Promise((resolve) => setImmediate(resolve));
 
   await ops.reconcileDaemonIncarnation(INCARNATION_B);
-  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
+  assert.equal(storedLocal.ghostDaemonIncarnation.incarnation, INCARNATION_B);
+  assert.equal(storedLocal.ghostDaemonIncarnationBackup.incarnation, INCARNATION_B);
   assert.deepEqual(storedSession.ghostTabs.retired, ["crashed-owner"]);
 
   created.resolve();
@@ -656,7 +731,7 @@ test("incarnation retry republishes an in-memory create tombstone before worker 
   let storedSession = { ghostTabs: null };
   const storedLocal = {
     ghostOwnershipPoison: null,
-    ghostDaemonIncarnation: INCARNATION_A,
+    ghostDaemonIncarnation: incarnationPublication(INCARNATION_A),
   };
   globalThis.chrome = chromeMock({
     attach: async () => {},
@@ -667,7 +742,10 @@ test("incarnation retry republishes an in-memory create tombstone before worker 
       storedSession = structuredClone(value);
     },
     restoreLocal: async (defaults) => Object.hasOwn(defaults, "ghostDaemonIncarnation")
-      ? { ghostDaemonIncarnation: storedLocal.ghostDaemonIncarnation }
+      ? {
+        ghostDaemonIncarnation: storedLocal.ghostDaemonIncarnation,
+        ghostDaemonIncarnationBackup: storedLocal.ghostDaemonIncarnationBackup,
+      }
       : { ghostOwnershipPoison: storedLocal.ghostOwnershipPoison },
     restoreSession: async () => structuredClone(storedSession),
     tabCreate: async ({ url }, tabs) => {
@@ -696,7 +774,7 @@ test("incarnation retry republishes an in-memory create tombstone before worker 
   await first.reconcileDaemonIncarnation(INCARNATION_B);
   assert.equal(writes, 2, "the retry republishes an already-present in-memory tombstone");
   assert.deepEqual(storedSession.ghostTabs.retired, ["crashed-owner"]);
-  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
+  assert.equal(storedLocal.ghostDaemonIncarnation.incarnation, INCARNATION_B);
 
   const restarted = await import(`../extension/ops.js?incarnation-republish-restart=${Date.now()}`);
   await restarted.restoreTabsFromSession();
@@ -718,63 +796,32 @@ test("incarnation retry republishes an in-memory create tombstone before worker 
   assert.deepEqual(removed, [17]);
 });
 
-test("a failed out-of-order incarnation repair stays pending for preparation retry", async () => {
-  const staleWrite = deferred();
+test("a fresh worker ignores an older incarnation slot that settled late", async () => {
   const storedLocal = {
     ghostOwnershipPoison: null,
-    ghostDaemonIncarnation: "33333333-3333-4333-8333-333333333333",
+    ghostDaemonIncarnation: incarnationPublication(INCARNATION_A, 4),
+    ghostDaemonIncarnationBackup: incarnationPublication(INCARNATION_B, 4),
   };
   let writes = 0;
   globalThis.chrome = chromeMock({
     attach: async () => {},
     persistLocal: async (value) => {
       writes += 1;
-      if (writes === 1) await staleWrite.promise;
-      if (writes === 3 || writes === 4) throw new Error("incarnation repair unavailable");
       Object.assign(storedLocal, structuredClone(value));
     },
     restoreLocal: async (defaults) => Object.hasOwn(defaults, "ghostDaemonIncarnation")
-      ? { ghostDaemonIncarnation: storedLocal.ghostDaemonIncarnation }
+      ? {
+        ghostDaemonIncarnation: storedLocal.ghostDaemonIncarnation,
+        ghostDaemonIncarnationBackup: storedLocal.ghostDaemonIncarnationBackup,
+      }
       : { ghostOwnershipPoison: storedLocal.ghostOwnershipPoison },
   });
   const ops = await import(`../extension/ops.js?incarnation-write-order=${Date.now()}`);
 
-  const first = ops.reconcileDaemonIncarnation(INCARNATION_A);
-  for (let attempt = 0; attempt < 20 && writes === 0; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  const second = ops.reconcileDaemonIncarnation(INCARNATION_B);
-
-  await assert.rejects(
-    first,
-    (error) => error instanceof RelayOpError && /save the daemon incarnation/i.test(error.message),
-  );
-  await second;
-  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
-
-  staleWrite.resolve();
-  for (let attempt = 0;
-    attempt < 30 && writes < 3;
-    attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  assert.equal(writes, 3, "the late stale marker queues one immediate repair attempt");
-  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_A);
-  await new Promise((resolve) => setImmediate(resolve));
-  await assert.rejects(
-    ops.runOp("open", { session: "blocked", url: "https://blocked.example/" }, 1_000),
-    (error) => error instanceof RelayOpError
-      && /ownership recovery is not durable yet.*automatic repair/i.test(error.message),
-  );
-
-  await assert.rejects(
-    ops.repairBrowserPersistence(),
-    (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
-    "a rejected repair remains a typed relay failure",
-  );
-  await ops.repairBrowserPersistence();
-  assert.equal(writes, 5, "connection preparation retries the pending incarnation marker");
-  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
+  await ops.reconcileDaemonIncarnation(INCARNATION_B);
+  assert.equal(writes, 0, "the higher acknowledged slot remains authoritative after restart");
+  assert.equal(storedLocal.ghostDaemonIncarnation.incarnation, INCARNATION_A);
+  assert.equal(storedLocal.ghostDaemonIncarnationBackup.incarnation, INCARNATION_B);
 });
 
 test("a claim is not acknowledged until storage accepts it", async () => {
@@ -806,7 +853,7 @@ test("a timed-out ownership write cannot block close and repairs a late stale wr
   let removals = 0;
   globalThis.chrome = chromeMock({
     attach: async () => {},
-    persistLocal: async (value) => { storedLocal = structuredClone(value); },
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
     persistSession: async (value) => {
       writes += 1;
       if (writes === 1) await firstWrite.promise;
@@ -837,7 +884,8 @@ test("a timed-out ownership write cannot block close and repairs a late stale wr
     sessions: [],
     retired: [],
   });
-  assert.deepEqual(storedLocal, { ghostOwnershipPoison: null });
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, []);
+  assert.deepEqual(storedLocal.ghostOwnershipPoisonBackup.claims, []);
 
   await assert.rejects(
     writer.runOp("open", { session: "timed-write", url: "https://late.example/" }, 1_000),
@@ -911,50 +959,36 @@ test("a failed late ownership repair stays fenced across a fresh worker module",
   });
 });
 
-test("a timed-out poison publication releases close and repairs its late result", async () => {
-  const poisonWrite = deferred();
-  let storedSession = { ghostTabs: null };
-  let storedLocal = { ghostOwnershipPoison: null };
-  let sessionWrites = 0;
-  let localWrites = 0;
-  let removals = 0;
+test("a fresh worker keeps newer poison when an older empty slot settled late", async () => {
+  const storedSession = {
+    ghostTabs: null,
+    ghostTabsRevision: null,
+    ghostBrowserSession: BROWSER_SESSION,
+  };
+  const storedLocal = {
+    ghostOwnershipPoison: poisonPublication([], 4),
+    ghostOwnershipPoisonBackup: poisonPublication([["uncertain", 17]], 4),
+  };
   globalThis.chrome = chromeMock({
     attach: async () => {},
-    persistLocal: async (value) => {
-      localWrites += 1;
-      if (localWrites === 1) await poisonWrite.promise;
-      storedLocal = structuredClone(value);
-    },
-    persistSession: async (value) => {
-      sessionWrites += 1;
-      if (sessionWrites === 1) throw new Error("session storage unavailable");
-      storedSession = structuredClone(value);
-    },
-    removeLocal: async () => { storedLocal = { ghostOwnershipPoison: null }; },
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
     restoreLocal: async () => structuredClone(storedLocal),
     restoreSession: async () => structuredClone(storedSession),
-    tabRemove: async () => {
-      removals += 1;
-      if (removals === 1) throw new Error("Chromium refused the rollback");
-    },
+    tabGet: async () => { throw new Error("tab status indeterminate"); },
   });
-  const writer = await import(`../extension/ops.js?poison-timeout=${Date.now()}`);
+  const restarted = await import(`../extension/ops.js?poison-late-empty=${Date.now()}`);
 
   await assert.rejects(
-    writer.runOp("open", { session: "timed-poison", url: "https://example.com/" }, 2_000),
-    (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
+    restarted.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError
+      && /ownership of tab 17 is indeterminate.*tab status indeterminate/i.test(error.message),
   );
-  assert.equal((await writer.runOp("close", { session: "timed-poison" }, 2_000)).closed, true);
-
-  poisonWrite.resolve();
-  for (let attempt = 0; attempt < 20; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(storedLocal, { ghostOwnershipPoison: null });
-  assert.deepEqual(storedSession.ghostTabs, {
-    version: 2,
-    tabs: [],
-    sessions: [],
-    retired: [],
-  });
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, [["uncertain", 17]]);
+  assert.deepEqual(storedLocal.ghostOwnershipPoisonBackup.claims, [["uncertain", 17]]);
+  await assert.rejects(
+    restarted.runOp("open", { session: "fresh", url: "https://example.com/" }, 1_000),
+    (error) => error instanceof RelayOpError && /ownership of tab 17 is indeterminate/i.test(error.message),
+  );
 });
 
 test("poison-only live ownership is reverified and promoted on a repeated restore", async () => {
@@ -964,7 +998,7 @@ test("poison-only live ownership is reverified and promoted on a repeated restor
     ghostBrowserSession: BROWSER_SESSION,
   };
   const storedLocal = {
-    ghostOwnershipPoison: { version: 1, claims: [["poison-owner", 17]] },
+    ghostOwnershipPoison: poisonPublication([["poison-owner", 17]]),
     ghostOwnershipFence: null,
   };
   let tabReads = 0;
@@ -998,7 +1032,7 @@ test("poison-only live ownership is reverified and promoted on a repeated restor
     sessions: [["poison-owner", [17]]],
     retired: [],
   });
-  assert.equal(storedLocal.ghostOwnershipPoison, null);
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, []);
 });
 
 test("a rejected claim publication closes the unowned new tab", async () => {
@@ -1027,7 +1061,7 @@ test("double claim persistence failure stays poisoned across a worker restart", 
   let persistenceAttempts = 0;
   globalThis.chrome = chromeMock({
     attach: async () => {},
-    persistLocal: async (value) => { storedLocal = structuredClone(value); },
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
     persistSession: async (value) => {
       persistenceAttempts += 1;
       if (failPersistence) throw new Error("session storage unavailable");
@@ -1041,6 +1075,7 @@ test("double claim persistence failure stays poisoned across a worker restart", 
     },
   });
   const first = await import(`../extension/ops.js?poison-writer=${Date.now()}`);
+  await first.restoreTabsFromSession();
 
   await assert.rejects(
     first.runOp("open", { session: "poisoned", url: "https://example.com/" }, 1_000),
@@ -1049,9 +1084,8 @@ test("double claim persistence failure stays poisoned across a worker restart", 
       && /across a worker restart/.test(error.message),
   );
   assert.equal(persistenceAttempts, 2, "the uncertain live tab gets a second durable claim attempt");
-  assert.deepEqual(storedLocal, {
-    ghostOwnershipPoison: { version: 1, claims: [["poisoned", 17]] },
-  });
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, [["poisoned", 17]]);
+  assert.deepEqual(storedLocal.ghostOwnershipPoisonBackup.claims, [["poisoned", 17]]);
 
   const restarted = await import(`../extension/ops.js?poison-reader=${Date.now()}`);
   await assert.rejects(
@@ -1073,15 +1107,19 @@ test("double claim persistence failure stays poisoned across a worker restart", 
   failRemoval = false;
   const recovered = await first.runOp("close", { session: "poisoned" }, 1_000);
   assert.equal(recovered.closed, true);
-  assert.deepEqual(storedLocal, { ghostOwnershipPoison: null });
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, []);
+  assert.deepEqual(storedLocal.ghostOwnershipPoisonBackup.claims, []);
 
   let cleared = false;
   globalThis.chrome = chromeMock({
     attach: async () => {},
-    removeLocal: async () => { cleared = true; },
+    persistLocal: async (value) => {
+      if (Object.values(value).some((entry) => entry?.claims?.length === 0)) cleared = true;
+    },
     restoreLocal: async () => ({
-      ghostOwnershipPoison: { version: 1, claims: [["already-gone", 99]] },
+      ghostOwnershipPoison: poisonPublication([["already-gone", 99]]),
     }),
+    restoreSession: async () => ({ ghostBrowserSession: BROWSER_SESSION }),
   });
   const absent = await import(`../extension/ops.js?poison-absent=${Date.now()}`);
   await absent.restoreTabsFromSession();
@@ -1090,10 +1128,10 @@ test("double claim persistence failure stays poisoned across a worker restart", 
 
 test("concurrent failed claims publish every uncertain tab to the poison ledger", async () => {
   let nextId = 17;
-  let storedLocal = { ghostOwnershipPoison: null };
+  const storedLocal = { ghostOwnershipPoison: null };
   globalThis.chrome = chromeMock({
     attach: async () => {},
-    persistLocal: async (value) => { storedLocal = structuredClone(value); },
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
     persistSession: async () => { throw new Error("session storage unavailable"); },
     tabCreate: ({ url }, tabs) => {
       const tab = { id: nextId, windowId: 4, status: "complete", url, title: `Tab ${nextId}` };
@@ -1111,9 +1149,11 @@ test("concurrent failed claims publish every uncertain tab to the poison ledger"
   ]);
 
   assert.deepEqual(failures.map(({ status }) => status), ["rejected", "rejected"]);
-  assert.deepEqual(storedLocal, {
-    ghostOwnershipPoison: { version: 1, claims: [["one", 17], ["two", 18]] },
-  });
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, [["one", 17], ["two", 18]]);
+  assert.deepEqual(
+    storedLocal.ghostOwnershipPoisonBackup.claims,
+    [["one", 17], ["two", 18]],
+  );
 });
 
 test("restore fails closed when storage or tab existence is indeterminate", async () => {
@@ -1148,7 +1188,7 @@ test("restore fails closed when storage or tab existence is indeterminate", asyn
     tabFailure.restoreTabsFromSession(),
     (error) => error instanceof RelayOpError
       && error.failure === "browser_unavailable"
-      && /verify restored tab 17/.test(error.message),
+      && /verify restored browser tabs.*tabs service unavailable/i.test(error.message),
   );
 });
 
@@ -1191,6 +1231,131 @@ test("restore rejects equal ownership revisions with different snapshots", async
   );
 });
 
+test("ownership recovery accepts the exact tab cap with bounded lookup concurrency", async () => {
+  const tabs = Array.from({ length: 1_024 }, (_, index) => index);
+  const owner = "x".repeat(128);
+  let active = 0;
+  let maximumActive = 0;
+  let reads = 0;
+  globalThis.chrome = chromeMock({
+    restoreLocal: async () => ({
+      ghostOwnershipPoison: poisonPublication(tabs.map((tab) => [owner, tab])),
+    }),
+    restoreSession: async () => ({
+      ghostBrowserSession: BROWSER_SESSION,
+      ghostTabs: {
+        version: 2,
+        tabs,
+        sessions: [[owner, tabs]],
+        retired: [],
+      },
+    }),
+    tabGet: async (id) => {
+      reads += 1;
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise((resolve) => setImmediate(resolve));
+      active -= 1;
+      throw new Error(`No tab with id: ${id}.`);
+    },
+  });
+  const restoring = await import(`../extension/ops.js?restore-exact-cap=${Date.now()}`);
+
+  await restoring.restoreTabsFromSession();
+  assert.equal(reads, 1_024);
+  assert.ok(maximumActive <= 16, `expected no more than 16 lookups, observed ${maximumActive}`);
+});
+
+test("a quota-sized hung restore stops after one bounded lookup batch", async () => {
+  const tabs = Array.from({ length: 1_024 }, (_, index) => index);
+  const never = deferred();
+  let reads = 0;
+  globalThis.chrome = chromeMock({
+    restoreSession: async () => ({
+      ghostBrowserSession: BROWSER_SESSION,
+      ghostTabs: {
+        version: 2,
+        tabs,
+        sessions: [["bounded-owner", tabs]],
+        retired: [],
+      },
+    }),
+    tabGet: async () => {
+      reads += 1;
+      return never.promise;
+    },
+  });
+  const restoring = await import(`../extension/ops.js?restore-hung-cap=${Date.now()}`);
+  const started = Date.now();
+
+  await assert.rejects(
+    restoring.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError && /did not finish restoring/i.test(error.message),
+  );
+  assert.ok(Date.now() - started < 2_500, "the quota-sized restore has one aggregate deadline");
+  assert.equal(reads, 16, "hung lookups never fan out beyond the bounded worker batch");
+  never.resolve(null);
+});
+
+test("ownership and poison recovery reject over-cap rows and owner strings before tab I/O", async () => {
+  const overCapTabs = Array.from({ length: 1_025 }, (_, index) => index);
+  let tabReads = 0;
+  globalThis.chrome = chromeMock({
+    restoreSession: async () => ({
+      ghostBrowserSession: BROWSER_SESSION,
+      ghostTabs: {
+        version: 2,
+        tabs: overCapTabs,
+        sessions: [["owner", overCapTabs]],
+        retired: [],
+      },
+    }),
+    tabGet: async () => { tabReads += 1; },
+  });
+  const overRows = await import(`../extension/ops.js?restore-over-cap=${Date.now()}`);
+  await assert.rejects(
+    overRows.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError && /ownership.*invalid/i.test(error.message),
+  );
+  assert.equal(tabReads, 0);
+
+  globalThis.chrome = chromeMock({
+    restoreLocal: async () => ({
+      ghostOwnershipPoison: poisonPublication(
+        Array.from({ length: 1_025 }, (_, index) => ["owner", index]),
+      ),
+    }),
+    restoreSession: async () => ({ ghostBrowserSession: BROWSER_SESSION }),
+    tabGet: async () => { tabReads += 1; },
+  });
+  const overPoison = await import(`../extension/ops.js?poison-over-cap=${Date.now()}`);
+  await assert.rejects(
+    overPoison.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError && /ownership recovery is invalid/i.test(error.message),
+  );
+  assert.equal(tabReads, 0);
+
+  const longOwner = "x".repeat(129);
+  globalThis.chrome = chromeMock({
+    restoreSession: async () => ({
+      ghostBrowserSession: BROWSER_SESSION,
+      ghostTabs: {
+        version: 2,
+        tabs: [17],
+        sessions: [[longOwner, [17]]],
+        retired: [],
+      },
+    }),
+    tabGet: async () => { tabReads += 1; },
+  });
+  const overString = await import(`../extension/ops.js?owner-over-cap=${Date.now()}`);
+  await assert.rejects(
+    overString.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError && /ownership.*invalid/i.test(error.message),
+  );
+  assert.equal(tabReads, 0);
+});
+
 test("a timed-out restored tab lookup releases ownership for a later retry", async () => {
   const firstLookup = deferred();
   let lookups = 0;
@@ -1217,7 +1382,7 @@ test("a timed-out restored tab lookup releases ownership for a later retry", asy
     restoring.restoreTabsFromSession(),
     (error) => error instanceof RelayOpError
       && error.failure === "browser_unavailable"
-      && /did not finish restoring tab 17/.test(error.message),
+      && /did not finish restoring browser ownership tab 17/i.test(error.message),
   );
   await restoring.restoreTabsFromSession();
   assert.equal(lookups, 2);
@@ -1378,7 +1543,7 @@ test("restore merge-gates an older snapshot behind a newer uncertain live claim"
   let restoreReads = 0;
   globalThis.chrome = chromeMock({
     attach: async () => {},
-    persistLocal: async (value) => { storedLocal = structuredClone(value); },
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
     persistSession: async (value) => {
       if (!allowPersistence) throw new Error("session storage unavailable");
       storedSession = structuredClone(value);
@@ -1409,7 +1574,8 @@ test("restore merge-gates an older snapshot behind a newer uncertain live claim"
     sessions: [["newer", [17]]],
     retired: [],
   });
-  assert.deepEqual(storedLocal, { ghostOwnershipPoison: null });
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, []);
+  assert.deepEqual(storedLocal.ghostOwnershipPoisonBackup.claims, []);
 
   allowRemoval = true;
   assert.equal((await merging.runOp("close", { session: "newer" }, 1_000)).closed, true);

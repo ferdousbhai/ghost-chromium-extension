@@ -149,7 +149,8 @@ test("the worker repairs a timed-out popup write after that popup context is gon
     { port: stored.port, token: stored.token, enabled: stored.enabled },
     { port: 8222, token: "newest", enabled: true },
   );
-  assert.equal(stored.ghostRelaySettingsFence.revision, 2);
+  assert.equal(stored.ghostRelaySettingsFence.revision, 4);
+  assert.equal(stored.ghostRelaySettingsFenceBackup.revision, 4);
 });
 
 test("a late settings-fence write cannot regress a newer worker choice", async () => {
@@ -201,18 +202,23 @@ test("a late settings-fence write cannot regress a newer worker choice", async (
     (value) => { secondResponse = value; },
   );
   for (let attempt = 0; attempt < 20 && secondResponse === undefined; attempt += 1) await settle();
-  assert.equal(secondResponse.ok, true);
-  assert.equal(stored.ghostRelaySettingsFence.revision, 2);
+  assert.equal(
+    secondResponse,
+    undefined,
+    "a newer choice is not acknowledged while an older fence write is still indeterminate",
+  );
 
   firstFenceWrite.resolve();
-  for (let attempt = 0; attempt < 20 && fenceWrites < 4; attempt += 1) await settle();
+  for (let attempt = 0; attempt < 40 && secondResponse === undefined; attempt += 1) await settle();
+  assert.equal(secondResponse.ok, true);
   await settle();
-  assert.equal(fenceWrites, 4);
+  assert.ok(fenceWrites >= 3);
   assert.deepEqual(stored.ghostRelaySettingsFence, {
     version: 1,
-    revision: 2,
+    revision: 4,
     settings: { port: 8222, token: "newest", enabled: true },
   });
+  assert.deepEqual(stored.ghostRelaySettingsFenceBackup, stored.ghostRelaySettingsFence);
   assert.deepEqual(
     { port: stored.port, token: stored.token, enabled: stored.enabled },
     { port: 8222, token: "newest", enabled: true },
@@ -226,7 +232,12 @@ test("a fresh worker repairs raw settings from the durable fence", async () => {
     enabled: true,
     ghostRelaySettingsFence: {
       version: 1,
-      revision: 2,
+      revision: 4,
+      settings: { port: 8111, token: "stale", enabled: true },
+    },
+    ghostRelaySettingsFenceBackup: {
+      version: 1,
+      revision: 4,
       settings: { port: 8222, token: "", enabled: false },
     },
   };
@@ -241,5 +252,6 @@ test("a fresh worker repairs raw settings from the durable fence", async () => {
     { port: stored.port, token: stored.token, enabled: stored.enabled },
     { port: 8222, token: "", enabled: false },
   );
-  assert.equal(stored.ghostRelaySettingsFence.revision, 2);
+  assert.equal(stored.ghostRelaySettingsFence.revision, 4);
+  assert.equal(stored.ghostRelaySettingsFenceBackup.revision, 4);
 });

@@ -12,6 +12,10 @@ const INCARNATION_A = "11111111-1111-4111-8111-111111111111";
 const INCARNATION_B = "22222222-2222-4222-8222-222222222222";
 const BROWSER_SESSION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
+function incarnationPublication(incarnation, revision = 2) {
+  return { version: 1, revision, incarnation };
+}
+
 afterEach(() => {
   if (originalChrome === undefined) delete globalThis.chrome;
   else globalThis.chrome = originalChrome;
@@ -82,11 +86,17 @@ function chromeMock({
     },
     storage: {
       local: {
-        get: (defaults) => Object.hasOwn(defaults, "ghostOwnershipPoison")
-          ? restorePoison(defaults)
-          : (Object.hasOwn(defaults, "ghostDaemonIncarnation")
-            ? restoreIncarnation(defaults)
-            : loadSettings(defaults)),
+        get: async (defaults) => {
+          let restored;
+          if (Object.hasOwn(defaults, "ghostOwnershipPoison")) {
+            restored = await restorePoison(defaults);
+          } else if (Object.hasOwn(defaults, "ghostDaemonIncarnation")) {
+            restored = await restoreIncarnation(defaults);
+          } else {
+            restored = await loadSettings(defaults);
+          }
+          return { ...defaults, ...restored };
+        },
         remove: removeLocal,
         set: (value) => Object.hasOwn(value, "ghostOwnershipFence")
           ? persistFence(value)
@@ -637,11 +647,13 @@ test("settings are cached and an open socket stays off until a compatible welcom
   const badges = [];
   const sockets = [];
   let settingsReads = 0;
+  let settingsError = null;
   let stored = { port: 7717, token: "paired", enabled: true };
   globalThis.chrome = chromeMock({
     badges,
     loadSettings: async () => {
       settingsReads += 1;
+      if (settingsError !== null) throw settingsError;
       return stored;
     },
   });
@@ -711,6 +723,21 @@ test("settings are cached and an open socket stays off until a compatible welcom
   assert.equal(socket.sent.at(-1).ok, false);
   assert.equal(socket.sent.at(-1).error.failure, "browser_unavailable");
   assert.equal(settingsReads, 2);
+
+  settingsError = new Error("settings storage is restarting");
+  chrome.storage.onChanged.emit({ enabled: { oldValue: false, newValue: true } }, "local");
+  await settle();
+  socket.onmessage({ data: JSON.stringify({ t: "req", id: 4, op: "read", args: {} }) });
+  await settle();
+  assert.equal(socket.sent.at(-1).id, 4);
+  assert.equal(socket.sent.at(-1).ok, false);
+  assert.equal(socket.sent.at(-1).error.failure, "browser_unavailable");
+  assert.match(socket.sent.at(-1).error.message, /could not verify.*settings storage is restarting/i);
+
+  socket.onmessage({ data: JSON.stringify({ t: "req", id: 5, op: "status", args: {} }) });
+  await settle();
+  assert.equal(socket.sent.at(-1).id, 5);
+  assert.equal(socket.sent.at(-1).ok, true, "status remains available for recovery visibility");
 });
 
 test("a new daemon incarnation retires crash-orphaned claims before hello", async () => {
@@ -805,7 +832,7 @@ test("a new daemon incarnation retires crash-orphaned claims before hello", asyn
     }),
   });
   assert.equal((await responseFor(first, 61)).ok, true);
-  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_A);
+  assert.equal(storedLocal.ghostDaemonIncarnation.incarnation, INCARNATION_A);
   assert.deepEqual(storedSession.ghostTabs.sessions, [["lost-daemon", [91]]]);
 
   first.readyState = 3;
@@ -834,7 +861,7 @@ test("a new daemon incarnation retires crash-orphaned claims before hello", asyn
   removal.resolve();
   for (let attempt = 0; attempt < 30 && replacement.sent.length === 0; attempt += 1) await settle();
   assert.equal(replacement.sent.at(-1).t, "hello");
-  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
+  assert.equal(storedLocal.ghostDaemonIncarnation.incarnation, INCARNATION_B);
   assert.deepEqual(storedSession.ghostTabs, {
     version: 2,
     tabs: [],
@@ -938,7 +965,9 @@ test("a late operation result cannot cross into a replacement socket", async () 
       title: "Example",
     }],
     loadSettings: async () => stored,
-    restoreIncarnation: async () => ({ ghostDaemonIncarnation: INCARNATION_A }),
+    restoreIncarnation: async () => ({
+      ghostDaemonIncarnation: incarnationPublication(INCARNATION_A),
+    }),
     restoreSession: async () => ({
       ghostBrowserSession: BROWSER_SESSION,
       ghostTabs: {

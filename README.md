@@ -160,10 +160,19 @@ discarded only once no late create handler can still produce a tab. Chrome
 settings and ownership storage calls are bounded as well, so one silent API call
 cannot pin the reconnect loop or extension popup indefinitely.
 
+Settings, uncertain-tab recovery, and daemon identity are revisioned in two
+independent local slots. A late write from a reaped MV3 worker can regress at
+most one slot, so the next worker keeps the newer acknowledged state; the
+second-written slot is the commit record for an equal-revision race. If settings
+cannot be verified, only status works. Page actions stay locked out until
+recovery succeeds.
+
 Ownership recovery is scoped to Chromium's current browser session. An MV3
 worker restart recovers the same ghost-owned tabs, while a full Chromium restart
 mints a fresh identity and never adopts a reused numeric tab id from the prior
-browser process.
+browser process. Both uncertain-tab slots are cleared for that new identity
+before it is published. Recovery accepts at most 1,024 owned tabs and checks no
+more than 16 at once under a shared five-second deadline.
 
 Each ghostd process also announces a fresh incarnation in the protocol-4
 welcome. The extension retires claims left by an earlier crashed process before

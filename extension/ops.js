@@ -50,9 +50,16 @@ const INELIGIBLE_URL = /^(chrome|devtools|edge|view-source|chrome-extension|chro
 const SETTLE_WATCH_MS = 900;
 const STORAGE_TIMEOUT_MS = 750;
 const RESTORE_TIMEOUT_MS = 1_000;
+const RESTORE_TOTAL_TIMEOUT_MS = 5_000;
+const RESTORE_CONCURRENCY = 16;
 const DETACH_TIMEOUT_MS = 750;
 const RETIRED_SWEEP_TIMEOUT_MS = 1_000;
 const RECENT_RETIRED_LIMIT = 1_024;
+const MAX_STORED_TABS = 1_024;
+const MAX_STORED_OWNERS = 1_024;
+const MAX_STORED_RETIRED = 2_048;
+const MAX_OWNER_ID_LENGTH = 128;
+const MAX_TAB_ID = 2_147_483_647;
 const RELEASED_WORKSPACE_MESSAGE =
   "This ghost browser workspace has been released. Retry the browser action so Ghost can open a fresh workspace.";
 /** Chrome's own texture limits; a taller capture comes back blank or fails. */
@@ -67,6 +74,7 @@ const RING_LIMIT = 200;
  */
 const state = { tabs: new Map(), sessions: new Map(), retired: new Set() };
 const creatingSessions = new Map();
+let creatingTotal = 0;
 const recentRetired = new Set();
 let ownershipGeneration = 0;
 let sweepInFlight = null;
@@ -137,6 +145,13 @@ function requireOwningSession(args) {
       "The relay request is missing its ghost browser workspace owner. Update Ghost and reload the extension.",
     );
   }
+  if (session.length > MAX_OWNER_ID_LENGTH) {
+    throw failed(
+      FAILURES.invalidInput,
+      `The ghost browser workspace owner may be at most ${MAX_OWNER_ID_LENGTH} characters. `
+        + "Update Ghost and reload the extension.",
+    );
+  }
   return session;
 }
 
@@ -153,10 +168,12 @@ function rememberRecentRetirement(session) {
 }
 
 function beginCreating(session) {
+  creatingTotal += 1;
   creatingSessions.set(session, (creatingSessions.get(session) ?? 0) + 1);
 }
 
 function endCreating(session) {
+  creatingTotal = Math.max(0, creatingTotal - 1);
   const remaining = (creatingSessions.get(session) ?? 1) - 1;
   if (remaining > 0) creatingSessions.set(session, remaining);
   else creatingSessions.delete(session);
@@ -169,15 +186,23 @@ const SESSION_KEY = "ghostTabs";
 const SESSION_REVISION_KEY = "ghostTabsRevision";
 const BROWSER_SESSION_KEY = "ghostBrowserSession";
 const POISON_KEY = "ghostOwnershipPoison";
+const POISON_BACKUP_KEY = "ghostOwnershipPoisonBackup";
 const OWNERSHIP_FENCE_KEY = "ghostOwnershipFence";
 const INCARNATION_KEY = "ghostDaemonIncarnation";
+const INCARNATION_BACKUP_KEY = "ghostDaemonIncarnationBackup";
 const SESSION_STATE_VERSION = 2;
 const OWNERSHIP_FENCE_VERSION = 2;
+const POISON_VERSION = 2;
+const INCARNATION_VERSION = 1;
 const INCARNATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 let ownershipTail = Promise.resolve();
 let ownershipPublicationRevision = 0;
 let browserSessionId = null;
 const ownershipPoison = new Map();
+let poisonPublicationRevision = 0;
+let poisonStorageTail = Promise.resolve();
+let incarnationPublicationRevision = 0;
+let incarnationStorageTail = Promise.resolve();
 
 function serializeOwnership(work) {
   const task = ownershipTail.then(work, work);
@@ -263,6 +288,33 @@ function sameSnapshot(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function selectNewestPublication(primary, backup, parse) {
+  const left = parse(primary);
+  const right = parse(backup);
+  if (left === undefined || right === undefined) return undefined;
+  if (left === null) return right;
+  if (right === null) return left;
+  if (left.revision === right.revision) {
+    // The second slot is the commit record. Equal-but-different values arise
+    // when an unacknowledged first-slot write from a reaped worker lands after
+    // a newer worker has committed both slots at the same next revision.
+    return right;
+  }
+  return left.revision > right.revision ? left : right;
+}
+
+function queueLocalPublication(tail, primaryKey, backupKey, publication) {
+  const write = async () => {
+    await chrome.storage.local.set({ [primaryKey]: publication });
+    await chrome.storage.local.set({ [backupKey]: publication });
+  };
+  const task = tail.then(write, write);
+  return {
+    task,
+    tail: task.then(() => undefined, () => undefined),
+  };
+}
+
 async function boundedStorageMutation(promise, what, repair) {
   let expired = false;
   void promise.then(
@@ -310,23 +362,23 @@ async function setOwnershipSnapshot(snapshot) {
   );
 }
 
-function persistCurrentPoison() {
-  if (ownershipPoison.size === 0) {
-    return boundedStorageMutation(
-      chrome.storage.local.remove(POISON_KEY),
-      "clearing browser ownership recovery",
-      () => {
-        if (ownershipPoison.size > 0) schedulePoisonRepair();
-      },
-    );
-  }
-  const snapshot = poisonSnapshot();
-  return boundedStorageMutation(
-    chrome.storage.local.set({ [POISON_KEY]: snapshot }),
-    "saving browser ownership recovery",
-    () => {
-      if (!sameSnapshot(snapshot, poisonSnapshot())) schedulePoisonRepair();
-    },
+async function persistCurrentPoison() {
+  browserSessionId ??= crypto.randomUUID();
+  const publication = poisonSnapshot(poisonPublicationRevision + 2);
+  poisonPublicationRevision = publication.revision;
+  const queued = queueLocalPublication(
+    poisonStorageTail,
+    POISON_KEY,
+    POISON_BACKUP_KEY,
+    publication,
+  );
+  poisonStorageTail = queued.tail;
+  await withApiTimeout(
+    queued.task,
+    STORAGE_TIMEOUT_MS,
+    ownershipPoison.size === 0
+      ? "clearing browser ownership recovery"
+      : "saving browser ownership recovery",
   );
 }
 
@@ -358,28 +410,37 @@ async function persistPoison(session, tabId) {
   }
 }
 
-function poisonSnapshot() {
+function poisonSnapshot(revision) {
   return {
-    version: 1,
+    version: POISON_VERSION,
+    browserSession: browserSessionId,
+    revision,
     claims: [...ownershipPoison].map(([tab, session]) => [session, tab]),
   };
 }
 
-function parsePoison(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)
-      || Object.keys(value).sort().join(",") !== "claims,version"
-      || value.version !== 1 || !Array.isArray(value.claims) || value.claims.length === 0) {
-    return null;
+function parsePoisonPublication(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "browserSession,claims,revision,version"
+      || value.version !== POISON_VERSION
+      || typeof value.browserSession !== "string"
+      || !INCARNATION_PATTERN.test(value.browserSession)
+      || !Number.isSafeInteger(value.revision) || value.revision < 1
+      || !Array.isArray(value.claims) || value.claims.length > MAX_STORED_TABS) {
+    return undefined;
   }
   const parsed = new Map();
   for (const row of value.claims) {
-    if (!Array.isArray(row) || row.length !== 2) return null;
+    if (!Array.isArray(row) || row.length !== 2) return undefined;
     const [session, tab] = row;
-    if (typeof session !== "string" || session === ""
-        || !Number.isSafeInteger(tab) || tab < 0 || parsed.has(tab)) return null;
+    if (typeof session !== "string" || session === "" || session.length > MAX_OWNER_ID_LENGTH
+        || !Number.isSafeInteger(tab) || tab < 0 || tab > MAX_TAB_ID || parsed.has(tab)) {
+      return undefined;
+    }
     parsed.set(tab, session);
   }
-  return parsed;
+  return value;
 }
 
 async function clearPoison(tabId) {
@@ -402,14 +463,45 @@ async function liveTabOrNull(tabId) {
   }
 }
 
+async function verifyLiveTabs(tabIds, deadline, description) {
+  const ids = [...tabIds];
+  const results = new Map();
+  let next = 0;
+  async function worker() {
+    while (next < ids.length) {
+      const id = ids[next];
+      next += 1;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw failed(
+          FAILURES.timeout,
+          `The browser did not finish ${description} within the total recovery deadline.`,
+        );
+      }
+      results.set(id, await withApiTimeout(
+        liveTabOrNull(id),
+        Math.min(RESTORE_TIMEOUT_MS, remaining),
+        `${description} tab ${id}`,
+      ));
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(RESTORE_CONCURRENCY, ids.length) }, () => worker()),
+  );
+  return results;
+}
+
 function validStoredOwnership(saved) {
   if (!saved || typeof saved !== "object" || Array.isArray(saved)) return false;
   if (Object.keys(saved).sort().join(",") !== "retired,sessions,tabs,version") return false;
   if (saved.version !== SESSION_STATE_VERSION || !Array.isArray(saved.tabs)
       || !Array.isArray(saved.sessions) || !Array.isArray(saved.retired)) return false;
+  if (saved.tabs.length > MAX_STORED_TABS
+      || saved.sessions.length > MAX_STORED_OWNERS
+      || saved.retired.length > MAX_STORED_RETIRED) return false;
   const tabs = new Set();
   for (const id of saved.tabs) {
-    if (!Number.isSafeInteger(id) || id < 0 || tabs.has(id)) return false;
+    if (!Number.isSafeInteger(id) || id < 0 || id > MAX_TAB_ID || tabs.has(id)) return false;
     tabs.add(id);
   }
   const sessions = new Set();
@@ -417,8 +509,10 @@ function validStoredOwnership(saved) {
   for (const row of saved.sessions) {
     if (!Array.isArray(row) || row.length !== 2) return false;
     const [session, owned] = row;
-    if (typeof session !== "string" || session === "" || sessions.has(session)
-        || !Array.isArray(owned) || owned.length === 0) return false;
+    if (typeof session !== "string" || session === ""
+        || session.length > MAX_OWNER_ID_LENGTH || sessions.has(session)
+        || !Array.isArray(owned) || owned.length === 0
+        || owned.length > MAX_STORED_TABS) return false;
     sessions.add(session);
     for (const id of owned) {
       if (!tabs.has(id) || assigned.has(id)) return false;
@@ -427,7 +521,8 @@ function validStoredOwnership(saved) {
   }
   const retired = new Set();
   for (const session of saved.retired) {
-    if (typeof session !== "string" || session === "" || retired.has(session)) return false;
+    if (typeof session !== "string" || session === ""
+        || session.length > MAX_OWNER_ID_LENGTH || retired.has(session)) return false;
     retired.add(session);
   }
   return assigned.size === tabs.size;
@@ -479,6 +574,7 @@ function selectStoredOwnership(stored, fenced, currentBrowserSession) {
 export function restoreTabsFromSession() {
   const admittedGeneration = ownershipGeneration;
   return serializeOwnership(async () => {
+    const restoreDeadline = Date.now() + RESTORE_TOTAL_TIMEOUT_MS;
     if (ownershipGeneration !== admittedGeneration
         || state.tabs.size > 0 || state.sessions.size > 0 || state.retired.size > 0) {
       await persistOwnership();
@@ -500,6 +596,7 @@ export function restoreTabsFromSession() {
         withApiTimeout(
           chrome.storage.local.get({
             [POISON_KEY]: null,
+            [POISON_BACKUP_KEY]: null,
             [OWNERSHIP_FENCE_KEY]: null,
           }),
           RESTORE_TIMEOUT_MS,
@@ -543,58 +640,79 @@ export function restoreTabsFromSession() {
       publication?.revision ?? 0,
     );
     const saved = publication?.snapshot ?? null;
-    const savedPoison = local[POISON_KEY];
+    const savedPoison = selectNewestPublication(
+      local[POISON_KEY],
+      local[POISON_BACKUP_KEY],
+      parsePoisonPublication,
+    );
+    if (savedPoison === undefined) {
+      throw failed(
+        FAILURES.browserUnavailable,
+        "Stored browser ownership recovery is invalid; reload the Ghost extension.",
+      );
+    }
+    poisonPublicationRevision = Math.max(
+      poisonPublicationRevision,
+      savedPoison?.revision ?? 0,
+    );
     const additionalClaims = new Map();
-    if (savedPoison !== null && savedPoison !== undefined) {
-      const poisonClaims = parsePoison(savedPoison);
-      if (poisonClaims === null) {
-        throw failed(
-          FAILURES.browserUnavailable,
-          "Stored browser ownership recovery is invalid; reload the Ghost extension.",
-        );
-      }
-      if (freshBrowserSession) {
+    if (savedPoison !== null) {
+      const poisonClaims = new Map(
+        savedPoison.claims.map(([session, tab]) => [tab, session]),
+      );
+      if (savedPoison.browserSession !== browserSessionId) {
         ownershipPoison.clear();
-        for (const [tab, session] of poisonClaims) ownershipPoison.set(tab, session);
-        await persistOwnership();
-        return;
-      }
-      let verificationError = null;
-      for (const [tab, session] of poisonClaims) {
-        const durable = saved?.sessions.some(
-          ([owner, tabs]) => owner === session && tabs.includes(tab),
-        ) === true;
-        if (durable) continue;
-        if (saved?.tabs.includes(tab)) {
+        // The empty poison tombstone must reach both durable slots before the
+        // new browser-session id can make reusable numeric tab ids admissible.
+        try {
+          await persistCurrentPoison();
+        } catch (error) {
+          schedulePoisonRepair();
           throw failed(
             FAILURES.browserUnavailable,
-            `Stored browser ownership recovery conflicts over tab ${tab}; reload the Ghost extension.`,
+            `Could not clear ownership from the prior browser session: `
+              + `${error?.message ?? error}. The relay will retry automatically.`,
           );
         }
-        let live;
+      } else {
+        const uncertain = new Map();
+        for (const [tab, session] of poisonClaims) {
+          const durable = saved?.sessions.some(
+            ([owner, tabs]) => owner === session && tabs.includes(tab),
+          ) === true;
+          if (durable) continue;
+          if (saved?.tabs.includes(tab)) {
+            throw failed(
+              FAILURES.browserUnavailable,
+              `Stored browser ownership recovery conflicts over tab ${tab}; reload the Ghost extension.`,
+            );
+          }
+          uncertain.set(tab, session);
+        }
+        let verified;
         try {
-          live = await withApiTimeout(
-            liveTabOrNull(tab),
-            RESTORE_TIMEOUT_MS,
-            `restoring uncertain tab ${tab}`,
+          verified = await verifyLiveTabs(
+            uncertain.keys(),
+            restoreDeadline,
+            "restoring uncertain browser ownership",
           );
         } catch (error) {
-          verificationError ??= error;
-          continue;
+          ownershipPoison.clear();
+          for (const [tab, session] of poisonClaims) ownershipPoison.set(tab, session);
+          await persistCurrentPoisonOrSchedule();
+          const tab = poisonClaims.keys().next().value;
+          throw failed(
+            FAILURES.browserUnavailable,
+            `Browser ownership of tab ${tab} is indeterminate after a worker restart, `
+              + `and at least one tab status could not be verified: `
+              + `${error?.message ?? error}.`,
+          );
         }
-        if (live !== null) additionalClaims.set(tab, session);
-      }
-      ownershipPoison.clear();
-      for (const [tab, session] of poisonClaims) ownershipPoison.set(tab, session);
-      if (verificationError !== null) {
-        await persistCurrentPoisonOrSchedule();
-        const tab = poisonClaims.keys().next().value;
-        throw failed(
-          FAILURES.browserUnavailable,
-          `Browser ownership of tab ${tab} is indeterminate after a worker restart, `
-            + `and at least one tab status could not be verified: `
-            + `${verificationError?.message ?? verificationError}.`,
-        );
+        for (const [tab, session] of uncertain) {
+          if (verified.get(tab) !== null) additionalClaims.set(tab, session);
+        }
+        ownershipPoison.clear();
+        for (const [tab, session] of poisonClaims) ownershipPoison.set(tab, session);
       }
     }
     if (freshBrowserSession) {
@@ -609,21 +727,21 @@ export function restoreTabsFromSession() {
       }
     }
     const restoredTabs = new Map();
-    for (const id of saved?.tabs ?? []) {
-      let tab;
-      try {
-        tab = await withApiTimeout(
-          liveTabOrNull(id),
-          RESTORE_TIMEOUT_MS,
-          `restoring tab ${id}`,
-        );
-      } catch (error) {
-        throw failed(
-          FAILURES.browserUnavailable,
-          `Could not verify restored tab ${id}: ${error?.message ?? error}.`,
-        );
-      }
-      if (tab) restoredTabs.set(id, freshTabState());
+    let verifiedTabs;
+    try {
+      verifiedTabs = await verifyLiveTabs(
+        saved?.tabs ?? [],
+        restoreDeadline,
+        "restoring browser ownership",
+      );
+    } catch (error) {
+      throw failed(
+        FAILURES.browserUnavailable,
+        `Could not verify restored browser tabs: ${error?.message ?? error}.`,
+      );
+    }
+    for (const [id, tab] of verifiedTabs) {
+      if (tab !== null) restoredTabs.set(id, freshTabState());
     }
     for (const id of additionalClaims.keys()) restoredTabs.set(id, freshTabState());
     const restoredSessions = new Map();
@@ -673,20 +791,38 @@ export function restoreTabsFromSession() {
   });
 }
 
+function parseIncarnationPublication(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "incarnation,revision,version"
+      || value.version !== INCARNATION_VERSION
+      || !Number.isSafeInteger(value.revision) || value.revision < 1
+      || typeof value.incarnation !== "string"
+      || !INCARNATION_PATTERN.test(value.incarnation)) return undefined;
+  return value;
+}
+
 async function persistIncarnation(publication) {
+  const durable = {
+    version: INCARNATION_VERSION,
+    revision: publication.revision,
+    incarnation: publication.incarnation,
+  };
+  const queued = queueLocalPublication(
+    incarnationStorageTail,
+    INCARNATION_KEY,
+    INCARNATION_BACKUP_KEY,
+    durable,
+  );
+  incarnationStorageTail = queued.tail;
   try {
-    await boundedStorageMutation(
-      Promise.resolve().then(() => chrome.storage.local.set({
-        [INCARNATION_KEY]: publication.incarnation,
-      })),
+    await withApiTimeout(
+      queued.task,
+      STORAGE_TIMEOUT_MS,
       "saving the daemon incarnation",
-      () => {
-        if (incarnationPublication?.generation !== publication.generation) {
-          scheduleIncarnationRepair();
-        }
-      },
     );
   } catch (error) {
+    scheduleIncarnationRepair();
     throw failed(
       FAILURES.browserUnavailable,
       `Could not save the daemon incarnation: ${error?.message ?? error}.`,
@@ -699,7 +835,10 @@ async function reconcileIncarnation(incarnation) {
     let stored;
     try {
       stored = await withApiTimeout(
-        chrome.storage.local.get({ [INCARNATION_KEY]: null }),
+        chrome.storage.local.get({
+          [INCARNATION_KEY]: null,
+          [INCARNATION_BACKUP_KEY]: null,
+        }),
         RESTORE_TIMEOUT_MS,
         "restoring the daemon incarnation",
       );
@@ -709,14 +848,22 @@ async function reconcileIncarnation(incarnation) {
         `Could not restore the daemon incarnation: ${error?.message ?? error}.`,
       );
     }
-    const previous = stored[INCARNATION_KEY];
-    if (previous !== null && previous !== undefined
-        && (typeof previous !== "string" || !INCARNATION_PATTERN.test(previous))) {
+    const restored = selectNewestPublication(
+      stored[INCARNATION_KEY],
+      stored[INCARNATION_BACKUP_KEY],
+      parseIncarnationPublication,
+    );
+    if (restored === undefined) {
       throw failed(
         FAILURES.browserUnavailable,
         "Stored daemon incarnation is invalid; reload the Ghost extension.",
       );
     }
+    incarnationPublicationRevision = Math.max(
+      incarnationPublicationRevision,
+      restored?.revision ?? 0,
+    );
+    const previous = restored?.incarnation ?? null;
     if (previous === incarnation) return false;
 
     const priorOwners = new Set([...state.sessions.keys(), ...creatingSessions.keys()]);
@@ -754,7 +901,9 @@ async function reconcileIncarnation(incarnation) {
   const publication = {
     incarnation,
     generation: (incarnationPublication?.generation ?? 0) + 1,
+    revision: incarnationPublicationRevision + 2,
   };
+  incarnationPublicationRevision = publication.revision;
   incarnationPublication = publication;
   await persistIncarnation(publication);
 }
@@ -862,6 +1011,23 @@ async function claimTab(session, tabId, timeoutMs) {
 }
 
 async function createClaimedTab(session, options, timeoutMs) {
+  if (state.tabs.size + creatingTotal >= MAX_STORED_TABS) {
+    throw failed(
+      FAILURES.browserUnavailable,
+      `This browser relay already owns ${MAX_STORED_TABS} tabs. Close a ghost browser `
+        + "workspace before opening another tab.",
+    );
+  }
+  const creatingOwners = [...creatingSessions.keys()]
+    .filter((owner) => !state.sessions.has(owner)).length;
+  if (!state.sessions.has(session) && !creatingSessions.has(session)
+      && state.sessions.size + creatingOwners >= MAX_STORED_OWNERS) {
+    throw failed(
+      FAILURES.browserUnavailable,
+      `This browser relay already owns ${MAX_STORED_OWNERS} ghost workspaces. Close one `
+        + "before opening another.",
+    );
+  }
   beginCreating(session);
   try {
     let tab;

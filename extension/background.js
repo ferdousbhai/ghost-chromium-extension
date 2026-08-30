@@ -44,6 +44,7 @@ const RECONNECT_MAX_MS = 10_000;
 const PROTOCOL_RETRY_MS = 60_000;
 const SETTINGS_TIMEOUT_MS = 1_000;
 const SETTINGS_FENCE_KEY = "ghostRelaySettingsFence";
+const SETTINGS_FENCE_BACKUP_KEY = "ghostRelaySettingsFenceBackup";
 const SETTINGS_FENCE_VERSION = 1;
 const KEEPALIVE_ALARM = "ghost-relay-keepalive";
 const settingsStorage = chrome.storage.local;
@@ -71,6 +72,7 @@ let settingsDesired = null;
 let settingsRepairPending = false;
 let settingsRepairInFlight = null;
 let settingsMutationTail = Promise.resolve();
+let settingsStorageTail = Promise.resolve();
 let reconnectDelay = RECONNECT_MIN_MS;
 let reconnectTimer = null;
 let reconnectTimerIncompatible = false;
@@ -120,6 +122,30 @@ function parseSettingsFence(value) {
   return value;
 }
 
+function selectSettingsFence(primary, backup) {
+  const left = parseSettingsFence(primary);
+  const right = parseSettingsFence(backup);
+  if (left === undefined || right === undefined) return undefined;
+  if (left === null) return right;
+  if (right === null) return left;
+  if (left.revision === right.revision) {
+    // The backup slot is written second and is therefore the commit record if
+    // a dead worker's unacknowledged first-slot write arrives late.
+    return right;
+  }
+  return left.revision > right.revision ? left : right;
+}
+
+function queueSettingsFence(publication) {
+  const write = async () => {
+    await settingsStorage.set({ [SETTINGS_FENCE_KEY]: publication });
+    await settingsStorage.set({ [SETTINGS_FENCE_BACKUP_KEY]: publication });
+  };
+  const task = settingsStorageTail.then(write, write);
+  settingsStorageTail = task.then(() => undefined, () => undefined);
+  return task;
+}
+
 function scheduleSettingsRepair() {
   settingsRepairPending = true;
   if (settingsRepairInFlight !== null || settingsDesired === null) return;
@@ -132,8 +158,7 @@ function scheduleSettingsRepair() {
   };
   settingsRepairPending = false;
   const attempt = (async () => {
-    const fenceWrite = settingsStorage.set({ [SETTINGS_FENCE_KEY]: publication });
-    observeSettingsWrite(fenceWrite, revision);
+    const fenceWrite = queueSettingsFence(publication);
     await withPreparationTimeout(
       fenceWrite,
       SETTINGS_TIMEOUT_MS,
@@ -198,13 +223,16 @@ function loadSettings() {
       token: "",
       enabled: true,
       [SETTINGS_FENCE_KEY]: null,
+      [SETTINGS_FENCE_BACKUP_KEY]: null,
     }),
     SETTINGS_TIMEOUT_MS,
     "Chromium did not return the relay settings in time.",
   )
-    .then(
-      (stored) => {
-        const fence = parseSettingsFence(stored[SETTINGS_FENCE_KEY]);
+    .then((stored) => {
+        const fence = selectSettingsFence(
+          stored[SETTINGS_FENCE_KEY],
+          stored[SETTINGS_FENCE_BACKUP_KEY],
+        );
         if (fence === undefined) {
           throw new Error("Stored relay settings recovery is invalid; reload the extension.");
         }
@@ -218,15 +246,14 @@ function loadSettings() {
           settingsDesired ??= settings;
         }
         return { settings: { ...settings, unavailable: null }, cacheable: true };
-      },
-      (error) => ({
+      })
+    .catch((error) => ({
         settings: {
           ...normalizeSettings(),
           unavailable: error?.message ?? String(error),
         },
         cacheable: false,
-      }),
-    )
+      }))
     .then(({ settings, cacheable }) => {
       if (generation !== settingsGeneration) return loadSettings();
       // A transient Chrome storage failure must not pin unpaired defaults for
@@ -277,14 +304,13 @@ function updateRelaySettings(patch) {
     };
     const publication = {
       version: SETTINGS_FENCE_VERSION,
-      revision: settingsRevision + 1,
+      revision: settingsRevision + 2,
       settings: next,
     };
     settingsRevision = publication.revision;
     settingsDesired = next;
     settingsCache = { ...next, unavailable: null };
-    const fenceWrite = settingsStorage.set({ [SETTINGS_FENCE_KEY]: publication });
-    observeSettingsWrite(fenceWrite, publication.revision);
+    const fenceWrite = queueSettingsFence(publication);
     try {
       await withPreparationTimeout(
         fenceWrite,
@@ -346,8 +372,9 @@ function notice(event, data) {
 }
 
 async function refreshBadge() {
-  const { enabled } = await loadSettings();
-  const connected = ws !== null && welcomedSocket === ws && ws.readyState === WebSocket.OPEN;
+  const { enabled, unavailable } = await loadSettings();
+  const connected = unavailable === null
+    && ws !== null && welcomedSocket === ws && ws.readyState === WebSocket.OPEN;
   await setBadge(connected ? (enabled ? "on" : "paused") : "off");
 }
 
@@ -483,7 +510,22 @@ function connect() {
 }
 
 async function answerRequest(socket, frame) {
-  const { enabled } = await loadSettings();
+  const settings = await loadSettings();
+  if (settings.unavailable !== null && frame.op !== "status") {
+    sendTo(socket, {
+      t: "res",
+      id: frame.id,
+      ok: false,
+      error: {
+        failure: "browser_unavailable",
+        message:
+          `Chromium could not verify the relay settings: ${settings.unavailable} `
+          + "Retry after the extension finishes restoring them.",
+      },
+    });
+    return false;
+  }
+  const { enabled } = settings;
   if (!enabled && frame.op !== "status") {
     sendTo(socket, {
       t: "res",
