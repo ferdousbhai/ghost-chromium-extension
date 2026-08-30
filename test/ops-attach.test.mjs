@@ -528,6 +528,44 @@ test("workspace release sweeps older tabs after the current tab is gone", async 
   assert.deepEqual(removed, [18, 17]);
 });
 
+test("a burst of owner-closed tabs coalesces slow ownership publication", async () => {
+  const firstBurstWrite = deferred();
+  let burstWrites = null;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistSession: async () => {
+      if (burstWrites === null) return;
+      burstWrites += 1;
+      if (burstWrites === 1) await firstBurstWrite.promise;
+    },
+  });
+  const ops = await import(`../extension/ops.js?tab-close-coalescing=${Date.now()}`);
+  ops.installOpsListeners();
+  await ops.runOp("open", { session: "burst", url: "https://first.example/" }, 1_000);
+  await ops.runOp("tabs", {
+    session: "burst",
+    op: "create",
+    url: "https://second.example/",
+  }, 1_000);
+  await ops.runOp("tabs", {
+    session: "burst",
+    op: "create",
+    url: "https://third.example/",
+  }, 1_000);
+  burstWrites = 0;
+
+  globalThis.chrome.tabs.onRemoved.emit(17);
+  await new Promise((resolve) => setImmediate(resolve));
+  globalThis.chrome.tabs.onRemoved.emit(18);
+  globalThis.chrome.tabs.onRemoved.emit(19);
+  firstBurstWrite.resolve();
+  for (let attempt = 0; attempt < 20 && burstWrites < 2; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(burstWrites, 2, "one follow-up snapshot covers every close during the slow write");
+});
+
 test("a worker restart restores a durably published session claim", async () => {
   let stored = { ghostTabs: null };
   const removed = [];
@@ -1266,6 +1304,87 @@ test("ownership recovery accepts the exact tab cap with bounded lookup concurren
   assert.ok(maximumActive <= 16, `expected no more than 16 lookups, observed ${maximumActive}`);
 });
 
+test("ownership and poison ledgers share their tab and owner caps", async () => {
+  const savedTabs = Array.from({ length: 512 }, (_, index) => index);
+  const poisonTabs = Array.from({ length: 512 }, (_, index) => index + 512);
+  let tabReads = 0;
+  globalThis.chrome = chromeMock({
+    restoreLocal: async () => ({
+      ghostOwnershipPoison: poisonPublication(
+        poisonTabs.map((tab) => [`poison-${tab}`, tab]),
+      ),
+    }),
+    restoreSession: async () => ({
+      ghostBrowserSession: BROWSER_SESSION,
+      ghostTabs: {
+        version: 2,
+        tabs: savedTabs,
+        sessions: savedTabs.map((tab) => [`saved-${tab}`, [tab]]),
+        retired: [],
+      },
+    }),
+    tabGet: async (id) => {
+      tabReads += 1;
+      throw new Error(`No tab with id: ${id}.`);
+    },
+  });
+  const exact = await import(`../extension/ops.js?restore-combined-exact-cap=${Date.now()}`);
+  await exact.restoreTabsFromSession();
+  assert.equal(tabReads, 1_024, "the exact combined cap remains admissible");
+
+  tabReads = 0;
+  const overPoisonTabs = Array.from({ length: 513 }, (_, index) => index + 512);
+  globalThis.chrome = chromeMock({
+    restoreLocal: async () => ({
+      ghostOwnershipPoison: poisonPublication(
+        overPoisonTabs.map((tab) => [`poison-${tab}`, tab]),
+      ),
+    }),
+    restoreSession: async () => ({
+      ghostBrowserSession: BROWSER_SESSION,
+      ghostTabs: {
+        version: 2,
+        tabs: savedTabs,
+        sessions: savedTabs.map((tab) => [`saved-${tab}`, [tab]]),
+        retired: [],
+      },
+    }),
+    tabGet: async () => { tabReads += 1; },
+  });
+  const overTabs = await import(`../extension/ops.js?restore-combined-tab-over-cap=${Date.now()}`);
+  await assert.rejects(
+    overTabs.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError && /combined limits/i.test(error.message),
+  );
+  assert.equal(tabReads, 0, "a combined tab overflow is rejected before Chromium I/O");
+
+  tabReads = 0;
+  const exactTabs = Array.from({ length: 1_024 }, (_, index) => index);
+  globalThis.chrome = chromeMock({
+    restoreLocal: async () => ({
+      ghostOwnershipPoison: poisonPublication([["extra-owner", 0]]),
+    }),
+    restoreSession: async () => ({
+      ghostBrowserSession: BROWSER_SESSION,
+      ghostTabs: {
+        version: 2,
+        tabs: exactTabs,
+        sessions: exactTabs.map((tab) => [`saved-${tab}`, [tab]]),
+        retired: [],
+      },
+    }),
+    tabGet: async () => { tabReads += 1; },
+  });
+  const overOwners = await import(
+    `../extension/ops.js?restore-combined-owner-over-cap=${Date.now()}`
+  );
+  await assert.rejects(
+    overOwners.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError && /combined limits/i.test(error.message),
+  );
+  assert.equal(tabReads, 0, "a combined owner overflow is rejected before Chromium I/O");
+});
+
 test("a quota-sized hung restore stops after one bounded lookup batch", async () => {
   const tabs = Array.from({ length: 1_024 }, (_, index) => index);
   const never = deferred();
@@ -1421,6 +1540,82 @@ test("a partial workspace release keeps the refused live tab for retry", async (
   const retried = await runOp("close", { session: "s1" }, 1_000);
   assert.equal(retried.closed, true);
   assert.deepEqual(removed, [18, 17]);
+});
+
+test("quota-sized incarnation retirement coalesces ownership publication", async () => {
+  const tabs = Array.from({ length: 1_024 }, (_, index) => index);
+  const owner = "quota-owner";
+  const storedSession = {
+    ghostTabs: {
+      version: 2,
+      tabs,
+      sessions: [[owner, tabs]],
+      retired: [],
+    },
+    ghostTabsRevision: 2,
+    ghostBrowserSession: BROWSER_SESSION,
+  };
+  const storedLocal = {
+    ghostOwnershipPoison: null,
+    ghostDaemonIncarnation: incarnationPublication(INCARNATION_A),
+    ghostDaemonIncarnationBackup: incarnationPublication(INCARNATION_A),
+  };
+  let sessionWrites = 0;
+  let fenceWrites = 0;
+  let activeRemovals = 0;
+  let maximumRemovals = 0;
+  let removals = 0;
+  const slowWrite = () => new Promise((resolve) => setTimeout(resolve, 10));
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistFence: async (value) => {
+      fenceWrites += 1;
+      await slowWrite();
+      Object.assign(storedLocal, structuredClone(value));
+    },
+    persistLocal: async (value) => {
+      await slowWrite();
+      Object.assign(storedLocal, structuredClone(value));
+    },
+    persistSession: async (value) => {
+      sessionWrites += 1;
+      await slowWrite();
+      Object.assign(storedSession, structuredClone(value));
+    },
+    restoreLocal: async () => structuredClone(storedLocal),
+    restoreSession: async () => structuredClone(storedSession),
+    tabGet: async (id) => ({ id, windowId: 4, status: "complete" }),
+    tabRemove: async (id) => {
+      activeRemovals += 1;
+      maximumRemovals = Math.max(maximumRemovals, activeRemovals);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      activeRemovals -= 1;
+      removals += 1;
+      globalThis.chrome.tabs.onRemoved.emit(id);
+    },
+  });
+  const ops = await import(`../extension/ops.js?incarnation-quota-retirement=${Date.now()}`);
+  ops.installOpsListeners();
+  await ops.restoreTabsFromSession();
+  sessionWrites = 0;
+  fenceWrites = 0;
+  const started = Date.now();
+
+  await ops.reconcileDaemonIncarnation(INCARNATION_B);
+
+  assert.equal(removals, 1_024);
+  assert.ok(maximumRemovals <= 16, `expected at most 16 removals, observed ${maximumRemovals}`);
+  assert.equal(sessionWrites, 2, "retirement writes one tombstone and one aggregate result");
+  assert.equal(fenceWrites, 2, "each ownership publication writes one matching fence");
+  assert.ok(Date.now() - started < 2_500, "slow storage is constant, not multiplied per tab");
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: [],
+  });
+  assert.equal(storedLocal.ghostDaemonIncarnation.incarnation, INCARNATION_B);
+  assert.equal(storedLocal.ghostDaemonIncarnationBackup.incarnation, INCARNATION_B);
 });
 
 test("retirement advances past never-settling create, update, and remove calls", async () => {

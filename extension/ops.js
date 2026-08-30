@@ -54,6 +54,8 @@ const RESTORE_TOTAL_TIMEOUT_MS = 5_000;
 const RESTORE_CONCURRENCY = 16;
 const DETACH_TIMEOUT_MS = 750;
 const RETIRED_SWEEP_TIMEOUT_MS = 1_000;
+const RETIRE_TOTAL_TIMEOUT_MS = 1_000;
+const RETIRE_CONCURRENCY = 16;
 const RECENT_RETIRED_LIMIT = 1_024;
 const MAX_STORED_TABS = 1_024;
 const MAX_STORED_OWNERS = 1_024;
@@ -78,6 +80,9 @@ let creatingTotal = 0;
 const recentRetired = new Set();
 let ownershipGeneration = 0;
 let sweepInFlight = null;
+let aggregateRetirementDepth = 0;
+let dropPublicationDirty = false;
+let dropPublicationInFlight = null;
 let incarnationTail = Promise.resolve();
 let incarnationPublication = null;
 
@@ -675,6 +680,21 @@ export function restoreTabsFromSession() {
           );
         }
       } else {
+        const recoveryTabs = new Set(saved?.tabs ?? []);
+        const recoveryOwners = new Set(
+          (saved?.sessions ?? []).map(([session]) => session),
+        );
+        for (const [tab, session] of poisonClaims) {
+          recoveryTabs.add(tab);
+          recoveryOwners.add(session);
+        }
+        if (recoveryTabs.size > MAX_STORED_TABS
+            || recoveryOwners.size > MAX_STORED_OWNERS) {
+          throw failed(
+            FAILURES.browserUnavailable,
+            "Stored browser ownership and recovery exceed their combined limits; reload the Ghost extension.",
+          );
+        }
         const uncertain = new Map();
         for (const [tab, session] of poisonClaims) {
           const durable = saved?.sessions.some(
@@ -1046,22 +1066,56 @@ async function createClaimedTab(session, options, timeoutMs) {
   }
 }
 
+function flushDroppedTabs() {
+  if (dropPublicationInFlight !== null) return dropPublicationInFlight;
+  const attempt = (async () => {
+    while (dropPublicationDirty && aggregateRetirementDepth === 0) {
+      dropPublicationDirty = false;
+      await serializeOwnership(() => persistOwnership()).catch(() => undefined);
+    }
+  })();
+  dropPublicationInFlight = attempt;
+  const clear = () => {
+    if (dropPublicationInFlight !== attempt) return;
+    dropPublicationInFlight = null;
+    if (dropPublicationDirty && aggregateRetirementDepth === 0) void flushDroppedTabs();
+  };
+  void attempt.then(clear, clear);
+  return attempt;
+}
+
 function dropTab(tabId) {
   if (!forgetTab(tabId)) return Promise.resolve();
+  if (aggregateRetirementDepth > 0) return Promise.resolve();
   // A stale durable row is safe: restore rechecks the tab's existence. The live
   // in-memory owner is removed synchronously, while storage cleanup is ordered
-  // behind any claim publication already in progress.
-  return serializeOwnership(() => persistOwnership()).catch(() => undefined);
+  // behind any claim publication already in progress. If several Chrome events
+  // arrive while that write is slow, one follow-up snapshot covers all of them.
+  dropPublicationDirty = true;
+  return flushDroppedTabs();
 }
 
 function cleanupBudget(timeoutMs) {
   return Math.max(100, Math.floor(timeoutMs * 0.8));
 }
 
-async function tryDetach(tabId, timeoutMs = DETACH_TIMEOUT_MS) {
+function remainingCleanupBudget(timeoutMs, deadline) {
+  return Math.max(0, Math.min(cleanupBudget(timeoutMs), deadline - Date.now()));
+}
+
+async function tryDetach(
+  tabId,
+  timeoutMs = DETACH_TIMEOUT_MS,
+  deadline = Date.now() + cleanupBudget(timeoutMs),
+) {
   const tab = state.tabs.get(tabId);
   if (!tab) return true;
   if (tab.pendingDetach) return false;
+  const budget = Math.min(
+    DETACH_TIMEOUT_MS,
+    remainingCleanupBudget(timeoutMs, deadline),
+  );
+  if (budget <= 0) return false;
   let expired = false;
   let outcome = null;
   const raw = Promise.resolve().then(() => chrome.debugger.detach({ tabId }));
@@ -1080,7 +1134,7 @@ async function tryDetach(tabId, timeoutMs = DETACH_TIMEOUT_MS) {
   try {
     await withApiTimeout(
       raw,
-      Math.min(DETACH_TIMEOUT_MS, cleanupBudget(timeoutMs)),
+      budget,
       `detaching tab ${tabId}`,
     );
     return true;
@@ -1092,8 +1146,21 @@ async function tryDetach(tabId, timeoutMs = DETACH_TIMEOUT_MS) {
 }
 
 /** Try to prove one tab absent without trusting an indeterminate Chrome error. */
-async function removeTab(tabId, timeoutMs) {
-  const budget = cleanupBudget(timeoutMs);
+async function removeTab(
+  tabId,
+  timeoutMs,
+  deadline = Date.now() + cleanupBudget(timeoutMs),
+) {
+  let budget = remainingCleanupBudget(timeoutMs, deadline);
+  if (budget <= 0) {
+    return {
+      authoritative: false,
+      getError: failed(
+        FAILURES.timeout,
+        `The browser retirement deadline expired before tab ${tabId} could be checked.`,
+      ),
+    };
+  }
   let removeError;
   try {
     await withTimeout(
@@ -1106,6 +1173,17 @@ async function removeTab(tabId, timeoutMs) {
     removeError = error;
     if (noSuchTab(error, tabId)) return { authoritative: true, removed: false };
   }
+  budget = remainingCleanupBudget(timeoutMs, deadline);
+  if (budget <= 0) {
+    return {
+      authoritative: false,
+      removeError,
+      getError: failed(
+        FAILURES.timeout,
+        `The browser retirement deadline expired before tab ${tabId} could be checked.`,
+      ),
+    };
+  }
   try {
     const live = await withTimeout(liveTabOrNull(tabId), budget, `checking tab ${tabId}`);
     if (live === null) return { authoritative: true, removed: false };
@@ -1116,13 +1194,17 @@ async function removeTab(tabId, timeoutMs) {
 }
 
 /** Close one claimed tab without forgetting a live tab Chromium refused to close. */
-async function retireTab(tabId, timeoutMs) {
+async function retireTab(
+  tabId,
+  timeoutMs,
+  deadline = Date.now() + cleanupBudget(timeoutMs),
+) {
   if (isAttached(tabId)) {
-    const detached = await tryDetach(tabId, timeoutMs);
+    const detached = await tryDetach(tabId, timeoutMs, deadline);
     const tab = state.tabs.get(tabId);
     if (detached && tab) resetAttachment(tab);
   }
-  const removal = await removeTab(tabId, timeoutMs);
+  const removal = await removeTab(tabId, timeoutMs, deadline);
   if (removal.authoritative) {
     await dropTab(tabId);
     return removal.removed;
@@ -1140,16 +1222,57 @@ async function retireTab(tabId, timeoutMs) {
   );
 }
 
+async function retireTabs(tabIds, timeoutMs) {
+  const ids = [...tabIds];
+  const outcomes = new Array(ids.length);
+  if (ids.length === 0) return outcomes;
+  const deadline = Date.now() + Math.min(timeoutMs, RETIRE_TOTAL_TIMEOUT_MS);
+  let next = 0;
+  aggregateRetirementDepth += 1;
+  try {
+    async function worker() {
+      while (next < ids.length) {
+        const index = next;
+        next += 1;
+        const tabId = ids[index];
+        if (Date.now() >= deadline) {
+          outcomes[index] = {
+            status: "rejected",
+            reason: failed(
+              FAILURES.timeout,
+              `The shared browser retirement deadline expired before tab ${tabId} could be closed.`,
+            ),
+          };
+          continue;
+        }
+        try {
+          outcomes[index] = {
+            status: "fulfilled",
+            value: await retireTab(tabId, timeoutMs, deadline),
+          };
+        } catch (reason) {
+          outcomes[index] = { status: "rejected", reason };
+        }
+      }
+    }
+    await Promise.all(
+      Array.from({ length: Math.min(RETIRE_CONCURRENCY, ids.length) }, () => worker()),
+    );
+  } finally {
+    aggregateRetirementDepth -= 1;
+  }
+  return outcomes;
+}
+
 export function sweepRetiredTabs() {
   if (sweepInFlight !== null) return sweepInFlight;
   const attempt = (async () => {
     const retired = [...state.retired];
+    const owned = [];
     for (const session of retired) {
-      const owned = [...(state.sessions.get(session) ?? [])];
-      await Promise.allSettled(
-        owned.map((tabId) => retireTab(tabId, RETIRED_SWEEP_TIMEOUT_MS)),
-      );
+      owned.push(...(state.sessions.get(session) ?? []));
     }
+    await retireTabs(owned, RETIRED_SWEEP_TIMEOUT_MS);
     await serializeOwnership(async () => {
       let changed = false;
       for (const session of [...state.retired]) {
@@ -1160,7 +1283,7 @@ export function sweepRetiredTabs() {
         ownershipGeneration += 1;
         changed = true;
       }
-      if (changed) await persistOwnership();
+      if (changed || owned.length > 0) await persistOwnership();
     });
   })().finally(() => {
     if (sweepInFlight === attempt) sweepInFlight = null;
@@ -2290,14 +2413,17 @@ const ops = {
     });
 
     const owned = [...(state.sessions.get(session) ?? [])];
-    const outcomes = await Promise.allSettled(
-      owned.map((tabId) => retireTab(tabId, timeoutMs)),
-    );
+    const outcomes = await retireTabs(owned, timeoutMs);
     const failures = outcomes.flatMap((outcome, index) =>
       outcome.status === "rejected"
         ? [{ tab: owned[index], message: outcome.reason?.message ?? String(outcome.reason) }]
         : []);
     if (retirementError !== null || failures.length > 0) {
+      try {
+        await serializeOwnership(() => persistOwnership());
+      } catch (error) {
+        retirementError ??= error;
+      }
       throw failed(
         FAILURES.browserUnavailable,
         `Ghost browser workspace release needs retry: ${failures.length} of ${owned.length} tabs `
