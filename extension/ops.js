@@ -172,6 +172,30 @@ function dropTab(tabId) {
   persist();
 }
 
+/** Close one claimed tab without forgetting a live tab Chromium refused to close. */
+async function retireTab(tabId) {
+  if (isAttached(tabId)) {
+    await detachStale(tabId);
+    const tab = state.tabs.get(tabId);
+    if (tab) resetAttachment(tab);
+  }
+  try {
+    await chrome.tabs.remove(tabId);
+    dropTab(tabId);
+    return true;
+  } catch {
+    const stillOpen = await chrome.tabs.get(tabId).catch(() => null);
+    if (!stillOpen) {
+      dropTab(tabId);
+      return false;
+    }
+    throw failed(
+      FAILURES.browserUnavailable,
+      "Chromium did not close one of the ghost's tabs. Retry the close.",
+    );
+  }
+}
+
 /** Whether the relay currently holds a debugger session on one claimed tab. */
 export function isAttached(tabId) {
   return state.tabs.get(tabId)?.attached === true;
@@ -1221,9 +1245,7 @@ const ops = {
     }
 
     if (op === "close") {
-      if (isAttached(id)) await detachStale(id);
-      await chrome.tabs.remove(id).catch(() => {});
-      dropTab(id);
+      await retireTab(id);
       const active = id === caller ? null : caller;
       return {
         ...(await tabsAnswer(args.session, active)),
@@ -1243,10 +1265,8 @@ const ops = {
     const owned = [...(state.sessions.get(args?.session) ?? [])];
     let closed = false;
     for (const tabId of owned) {
-      if (isAttached(tabId)) await detachStale(tabId);
-      const removed = await chrome.tabs.remove(tabId).then(() => true).catch(() => false);
+      const removed = await retireTab(tabId);
       closed = closed || removed;
-      dropTab(tabId);
     }
     return { closed };
   },

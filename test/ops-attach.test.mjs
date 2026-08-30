@@ -323,6 +323,59 @@ test("closing a session sweeps every tab it opened, not just the last one", asyn
   assert.deepEqual(other.tabs.map((tab) => tab.id), ["19"]);
 });
 
+test("session close sweeps older tabs after the current tab is gone", async () => {
+  const removed = [];
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    tabRemove: async (id) => removed.push(id),
+  });
+  const { runOp } = await import(`../extension/ops.js?current-gone=${Date.now()}`);
+  await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
+  await runOp("tabs", {
+    session: "s1",
+    op: "create",
+    url: "https://second.example/",
+  }, 1_000);
+
+  await runOp("tabs", { session: "s1", op: "close", tab: "18" }, 1_000);
+  const closed = await runOp("close", { session: "s1" }, 1_000);
+
+  assert.equal(closed.closed, true);
+  assert.deepEqual(removed, [18, 17]);
+});
+
+test("a partial session close keeps the refused live tab for retry", async () => {
+  const removed = [];
+  let refuseSecond = true;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    tabRemove: (id) => {
+      if (id === 18 && refuseSecond) {
+        refuseSecond = false;
+        throw new Error("Chromium refused the close");
+      }
+      removed.push(id);
+    },
+  });
+  const { runOp } = await import(`../extension/ops.js?close-retry=${Date.now()}`);
+  await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
+  await runOp("tabs", {
+    session: "s1",
+    op: "create",
+    url: "https://second.example/",
+  }, 1_000);
+
+  await assert.rejects(
+    runOp("close", { session: "s1" }, 1_000),
+    (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
+  );
+  assert.deepEqual(removed, [17]);
+
+  const retried = await runOp("close", { session: "s1" }, 1_000);
+  assert.equal(retried.closed, true);
+  assert.deepEqual(removed, [17, 18]);
+});
+
 test("find clamps relay-provided limits before evaluating page code", async () => {
   const expressions = [];
   let attachCalls = 0;
