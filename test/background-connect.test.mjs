@@ -219,6 +219,56 @@ test("a timed-out ownership read releases connect for the alarm retry", async ()
   firstRead.resolve({ ghostTabs: null });
 });
 
+test("a timed-out settings read releases connect and the popup for an alarm retry", async () => {
+  const firstRead = deferred();
+  const reconnects = [];
+  const sockets = [];
+  let reads = 0;
+  globalThis.chrome = chromeMock({
+    loadSettings: () => {
+      reads += 1;
+      return reads === 1
+        ? firstRead.promise
+        : Promise.resolve({ port: 8828, token: "recovered", enabled: true });
+    },
+  });
+  globalThis.setTimeout = (callback, delay) => {
+    reconnects.push({ callback, delay });
+    return reconnects.length;
+  };
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor(url) {
+      this.readyState = FakeWebSocket.CONNECTING;
+      sockets.push(url);
+    }
+  };
+
+  await import(`../extension/background.js?settings-timeout=${Date.now()}`);
+  let status;
+  chrome.runtime.onMessage.emit(
+    { type: "ghost-relay-status" },
+    { id: chrome.runtime.id, url: chrome.runtime.getURL("popup.html") },
+    (value) => { status = value; },
+  );
+  await new Promise((resolve) => originalSetTimeout(resolve, 1_100));
+  await settle();
+
+  assert.equal(reads, 1);
+  assert.deepEqual(sockets, []);
+  const reconnect = reconnects.find(({ delay }) => delay === 1_000);
+  assert.ok(reconnect, "the failed preparation schedules the normal reconnect");
+  assert.equal(status.paired, false, "the popup gets bounded fallback state instead of hanging");
+
+  chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
+  await settle();
+  assert.equal(reads, 2);
+  assert.deepEqual(sockets, ["ws://127.0.0.1:8828/relay"]);
+  firstRead.resolve({ port: 7717, token: "stale", enabled: true });
+});
+
 test("a failed dial releases the latch and reconnects once", async () => {
   let constructions = 0;
   const reconnects = [];
@@ -336,6 +386,96 @@ test("only this extension's popup can read live relay status", async () => {
     lastError: "Not paired yet — run `ghostd relay-token` and paste the token below.",
     tabs: [],
   });
+});
+
+test("the popup reports a nonempty list of tabs owned by the relay", async () => {
+  const sockets = [];
+  let live = false;
+  const tab = {
+    id: 73,
+    windowId: 4,
+    status: "complete",
+    url: "https://popup.example/",
+    title: "Popup tab",
+  };
+  globalThis.chrome = chromeMock({
+    debuggerTargets: async () => live
+      ? [{ tabId: tab.id, type: "page", attached: false, url: tab.url, title: tab.title }]
+      : [],
+    loadSettings: async () => ({ port: 7717, token: "paired", enabled: true }),
+    tabApi: {
+      create: async () => {
+        live = true;
+        return tab;
+      },
+      get: async () => live ? tab : null,
+      remove: async () => { live = false; },
+    },
+  });
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.sent = [];
+      sockets.push(this);
+    }
+
+    send(raw) {
+      this.sent.push(JSON.parse(raw));
+    }
+
+    close() {
+      this.readyState = 3;
+    }
+  };
+
+  await import(`../extension/background.js?popup-tabs=${Date.now()}`);
+  await settle();
+  const socket = sockets[0];
+  socket.readyState = WebSocket.OPEN;
+  socket.onopen();
+  socket.onmessage({
+    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "ghostd" }),
+  });
+  socket.onmessage({
+    data: JSON.stringify({
+      t: "req",
+      id: 31,
+      op: "open",
+      args: { session: "popup-list", url: tab.url },
+      timeoutMs: 1_000,
+    }),
+  });
+  assert.equal((await responseFor(socket, 31)).ok, true);
+
+  let status;
+  chrome.runtime.onMessage.emit(
+    { type: "ghost-relay-status" },
+    { id: chrome.runtime.id, url: chrome.runtime.getURL("popup.html") },
+    (value) => { status = value; },
+  );
+  for (let attempt = 0; attempt < 20 && status === undefined; attempt += 1) await settle();
+  assert.deepEqual(status.tabs, [{
+    id: "73",
+    active: false,
+    url: tab.url,
+    title: tab.title,
+  }]);
+
+  socket.onmessage({
+    data: JSON.stringify({
+      t: "req",
+      id: 32,
+      op: "close",
+      args: { session: "popup-list" },
+      timeoutMs: 1_000,
+    }),
+  });
+  assert.equal((await responseFor(socket, 32)).ok, true);
 });
 
 test("a transient storage read failure is not cached as an unpaired configuration", async () => {

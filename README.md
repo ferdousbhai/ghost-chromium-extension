@@ -148,7 +148,11 @@ and the relay protocol has no cancel frame, so a deadline bounds the reply but
 does not claim to abort a CDP command already accepted by Chromium. A terminal
 session close first publishes a durable retirement marker, then makes bounded
 attempts against every known tab. Late tab creation observes that marker and
-removes itself; uncertain removals remain owned for the next close retry.
+removes itself; uncertain removals remain owned and are retried by the keepalive
+alarm even after ghostd has rotated to a fresh browser session. Tombstones are
+discarded only once no late create handler can still produce a tab. Chrome
+settings and ownership storage calls are bounded as well, so one silent API call
+cannot pin the reconnect loop or extension popup indefinitely.
 
 ## Element refs
 

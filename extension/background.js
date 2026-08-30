@@ -25,13 +25,21 @@
  * the one field a browser `WebSocket` lets you set: the subprotocol list.
  */
 import { PROTOCOL_VERSION, RELAY_PATH, SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX, toErrorFrame } from "./protocol.js";
-import { installOpsListeners, releaseAllTabs, restoreTabsFromSession, startOp } from "./ops.js";
+import {
+  installOpsListeners,
+  releaseAllTabs,
+  restoreTabsFromSession,
+  runOp,
+  startOp,
+  sweepRetiredTabs,
+} from "./ops.js";
 
 const DEFAULT_PORT = 7717;
 const PING_INTERVAL_MS = 20_000;
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 10_000;
 const PROTOCOL_RETRY_MS = 60_000;
+const SETTINGS_TIMEOUT_MS = 1_000;
 const KEEPALIVE_ALARM = "ghost-relay-keepalive";
 
 let ws = null;
@@ -72,7 +80,26 @@ function normalizeSettings(stored = {}) {
     port: Number(stored.port) || DEFAULT_PORT,
     token: typeof stored.token === "string" ? stored.token.trim() : "",
     enabled: stored.enabled !== false,
+    unavailable: null,
   };
+}
+
+function withPreparationTimeout(promise, timeoutMs, message) {
+  const signal = AbortSignal.timeout(timeoutMs);
+  return new Promise((resolve, reject) => {
+    const onTimeout = () => reject(new Error(message));
+    signal.addEventListener("abort", onTimeout, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onTimeout);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onTimeout);
+        reject(error);
+      },
+    );
+  });
 }
 
 function loadSettings() {
@@ -80,11 +107,20 @@ function loadSettings() {
   if (settingsInFlight !== null) return settingsInFlight;
 
   const generation = settingsGeneration;
-  const attempt = chrome.storage.local
-    .get({ port: DEFAULT_PORT, token: "", enabled: true })
+  const attempt = withPreparationTimeout(
+    chrome.storage.local.get({ port: DEFAULT_PORT, token: "", enabled: true }),
+    SETTINGS_TIMEOUT_MS,
+    "Chromium did not return the relay settings in time.",
+  )
     .then(
       (stored) => ({ settings: normalizeSettings(stored), cacheable: true }),
-      () => ({ settings: normalizeSettings(), cacheable: false }),
+      (error) => ({
+        settings: {
+          ...normalizeSettings(),
+          unavailable: error?.message ?? String(error),
+        },
+        cacheable: false,
+      }),
     )
     .then(({ settings, cacheable }) => {
       if (generation !== settingsGeneration) return loadSettings();
@@ -158,6 +194,9 @@ async function connectOnce(epoch) {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   const settings = await loadSettings();
   if (epoch !== connectEpoch) return;
+  if (settings.unavailable !== null) {
+    throw new Error(`Could not read relay settings: ${settings.unavailable}`);
+  }
   if (!settings.token) {
     lastError = "Not paired yet — run `ghostd relay-token` and paste the token below.";
     await setBadge("off");
@@ -165,6 +204,7 @@ async function connectOnce(epoch) {
   }
 
   await restoreTabsFromSession();
+  await sweepRetiredTabs().catch(() => undefined);
   if (epoch !== connectEpoch) return;
 
   // A browser WebSocket cannot set headers, so the token rides in the one field
@@ -343,7 +383,10 @@ installOpsListeners(notice);
 
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === KEEPALIVE_ALARM) void connect();
+  if (alarm.name === KEEPALIVE_ALARM) {
+    void sweepRetiredTabs().catch(() => {});
+    void connect();
+  }
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {

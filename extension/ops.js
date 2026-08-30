@@ -51,6 +51,8 @@ const SETTLE_WATCH_MS = 900;
 const STORAGE_TIMEOUT_MS = 750;
 const RESTORE_TIMEOUT_MS = 1_000;
 const DETACH_TIMEOUT_MS = 750;
+const RETIRED_SWEEP_TIMEOUT_MS = 1_000;
+const RECENT_RETIRED_LIMIT = 1_024;
 /** Chrome's own texture limits; a taller capture comes back blank or fails. */
 const MAX_CAPTURE_PX = 16_384;
 const RING_LIMIT = 200;
@@ -62,6 +64,10 @@ const RING_LIMIT = 200;
  * over the socket they share.
  */
 const state = { tabs: new Map(), sessions: new Map(), retired: new Set() };
+const creatingSessions = new Map();
+const recentRetired = new Set();
+let ownershipGeneration = 0;
+let sweepInFlight = null;
 
 function freshTabState() {
   return {
@@ -77,6 +83,7 @@ function freshTabState() {
      */
     worldContextId: null,
     domainsEnabled: false,
+    pendingDetach: false,
     attachGeneration: 0,
     /**
      * What this tab has said since its last `console`/`network` op. Per tab, not
@@ -116,6 +123,29 @@ function requireOwningSession(args) {
     throw failed(FAILURES.invalidInput, "A tab-creating operation needs a session id.");
   }
   return session;
+}
+
+function isRetired(session) {
+  return state.retired.has(session) || recentRetired.has(session);
+}
+
+function rememberRecentRetirement(session) {
+  recentRetired.delete(session);
+  recentRetired.add(session);
+  while (recentRetired.size > RECENT_RETIRED_LIMIT) {
+    recentRetired.delete(recentRetired.values().next().value);
+  }
+}
+
+function beginCreating(session) {
+  creatingSessions.set(session, (creatingSessions.get(session) ?? 0) + 1);
+}
+
+function endCreating(session) {
+  const remaining = (creatingSessions.get(session) ?? 1) - 1;
+  if (remaining > 0) creatingSessions.set(session, remaining);
+  else creatingSessions.delete(session);
+  if (state.retired.has(session)) void sweepRetiredTabs().catch(() => {});
 }
 
 const attachBarriers = new Map();
@@ -203,11 +233,13 @@ async function persistOwnership() {
   await setOwnershipSnapshot(ownershipSnapshot());
   if (ownershipPoison.size > 0) {
     ownershipPoison.clear();
+    ownershipGeneration += 1;
     await persistCurrentPoison().catch(() => {});
   }
 }
 
 async function persistPoison(session, tabId) {
+  if (ownershipPoison.get(tabId) !== session) ownershipGeneration += 1;
   ownershipPoison.set(tabId, session);
   await persistCurrentPoison();
 }
@@ -237,7 +269,7 @@ function parsePoison(value) {
 }
 
 async function clearPoison(tabId) {
-  ownershipPoison.delete(tabId);
+  if (ownershipPoison.delete(tabId)) ownershipGeneration += 1;
   await persistCurrentPoison().catch(() => {});
 }
 
@@ -288,7 +320,14 @@ function validStoredOwnership(saved) {
 }
 
 export function restoreTabsFromSession() {
+  const admittedGeneration = ownershipGeneration;
   return serializeOwnership(async () => {
+    if (ownershipGeneration !== admittedGeneration
+        || state.tabs.size > 0 || state.sessions.size > 0 || state.retired.size > 0
+        || ownershipPoison.size > 0) {
+      await persistOwnership();
+      return;
+    }
     let stored;
     let poison;
     try {
@@ -358,6 +397,7 @@ export function restoreTabsFromSession() {
         await persistCurrentPoison().catch(() => {});
       }
     }
+    const applyGeneration = ownershipGeneration;
     if (saved === null || saved === undefined) {
       if (state.tabs.size > 0 || state.retired.size > 0) {
         try {
@@ -402,6 +442,11 @@ export function restoreTabsFromSession() {
     }
     const restoredRetired = new Set(saved.retired);
 
+    if (ownershipGeneration !== applyGeneration) {
+      await persistOwnership();
+      return;
+    }
+
     const previousTabs = new Map(state.tabs);
     const previousSessions = new Map(state.sessions);
     const previousRetired = new Set(state.retired);
@@ -413,6 +458,7 @@ export function restoreTabsFromSession() {
     for (const session of restoredRetired) state.retired.add(session);
     try {
       await persistOwnership();
+      ownershipGeneration += 1;
     } catch (error) {
       state.tabs.clear();
       state.sessions.clear();
@@ -440,6 +486,7 @@ function resetAttachment(tab) {
 function rememberTab(session, tabId) {
   state.tabs.set(tabId, freshTabState());
   if (typeof session === "string" && session !== "") sessionTabs(session).add(tabId);
+  ownershipGeneration += 1;
 }
 
 function forgetTab(tabId) {
@@ -448,6 +495,7 @@ function forgetTab(tabId) {
   for (const [session, owned] of state.sessions) {
     if (owned.delete(tabId) && owned.size === 0) state.sessions.delete(session);
   }
+  if (changed) ownershipGeneration += 1;
   return changed;
 }
 
@@ -457,7 +505,7 @@ async function claimTab(session, tabId, timeoutMs) {
   let retired = false;
   await serializeOwnership(async () => {
     rememberTab(session, tabId);
-    retired = state.retired.has(session);
+    retired = isRetired(session);
     try {
       await persistOwnership();
     } catch (error) {
@@ -467,7 +515,12 @@ async function claimTab(session, tabId, timeoutMs) {
 
   if (storageError === null) {
     if (!retired) return;
-    await retireTab(tabId, timeoutMs);
+    try {
+      await retireTab(tabId, timeoutMs);
+    } catch (error) {
+      void sweepRetiredTabs().catch(() => {});
+      throw error;
+    }
     throw failed(
       FAILURES.browserUnavailable,
       "This browser session is closed. Open through a fresh session.",
@@ -511,6 +564,25 @@ async function claimTab(session, tabId, timeoutMs) {
   );
 }
 
+async function createClaimedTab(session, options, timeoutMs) {
+  beginCreating(session);
+  try {
+    let tab;
+    try {
+      tab = await chrome.tabs.create(options);
+    } catch (error) {
+      throw failed(
+        FAILURES.navigationFailed,
+        `Chromium would not open a tab: ${error?.message ?? error}`,
+      );
+    }
+    await claimTab(session, tab.id, timeoutMs);
+    return tab;
+  } finally {
+    endCreating(session);
+  }
+}
+
 function dropTab(tabId) {
   if (!forgetTab(tabId)) return Promise.resolve();
   // A stale durable row is safe: restore rechecks the tab's existence. The live
@@ -524,14 +596,34 @@ function cleanupBudget(timeoutMs) {
 }
 
 async function tryDetach(tabId, timeoutMs = DETACH_TIMEOUT_MS) {
+  const tab = state.tabs.get(tabId);
+  if (!tab) return true;
+  if (tab.pendingDetach) return false;
+  let expired = false;
+  let outcome = null;
+  const raw = Promise.resolve().then(() => chrome.debugger.detach({ tabId }));
+  tab.pendingDetach = true;
+  void raw.then(
+    () => {
+      outcome = "detached";
+      tab.pendingDetach = false;
+      if (expired && state.tabs.get(tabId) === tab) resetAttachment(tab);
+    },
+    () => {
+      outcome = "failed";
+      tab.pendingDetach = false;
+    },
+  );
   try {
     await withApiTimeout(
-      Promise.resolve().then(() => chrome.debugger.detach({ tabId })),
+      raw,
       Math.min(DETACH_TIMEOUT_MS, cleanupBudget(timeoutMs)),
       `detaching tab ${tabId}`,
     );
     return true;
   } catch {
+    expired = true;
+    if (outcome === "detached" && state.tabs.get(tabId) === tab) resetAttachment(tab);
     return false;
   }
 }
@@ -583,6 +675,35 @@ async function retireTab(tabId, timeoutMs) {
     FAILURES.browserUnavailable,
     `Chromium did not close ghost tab ${tabId}. Retry the close.`,
   );
+}
+
+export function sweepRetiredTabs() {
+  if (sweepInFlight !== null) return sweepInFlight;
+  const attempt = (async () => {
+    const retired = [...state.retired];
+    for (const session of retired) {
+      const owned = [...(state.sessions.get(session) ?? [])];
+      await Promise.allSettled(
+        owned.map((tabId) => retireTab(tabId, RETIRED_SWEEP_TIMEOUT_MS)),
+      );
+    }
+    await serializeOwnership(async () => {
+      let changed = false;
+      for (const session of [...state.retired]) {
+        if ((creatingSessions.get(session) ?? 0) > 0) continue;
+        if ((state.sessions.get(session)?.size ?? 0) > 0) continue;
+        state.retired.delete(session);
+        rememberRecentRetirement(session);
+        ownershipGeneration += 1;
+        changed = true;
+      }
+      if (changed) await persistOwnership();
+    });
+  })().finally(() => {
+    if (sweepInFlight === attempt) sweepInFlight = null;
+  });
+  sweepInFlight = attempt;
+  return attempt;
 }
 
 /** Whether the relay currently holds a debugger session on one claimed tab. */
@@ -941,12 +1062,18 @@ function isCurrentAttach(attempt) {
 }
 
 async function detachStale(tabId) {
-  await chrome.debugger.detach({ tabId }).catch(() => {});
+  await tryDetach(tabId);
 }
 
 async function ensureAttached(args) {
   const tabId = requireTab(args);
   const tab = state.tabs.get(tabId);
+  if (tab.pendingDetach) {
+    throw failed(
+      FAILURES.browserUnavailable,
+      `Tab ${tabId} is still cleaning up an older debugger attachment. Try again shortly.`,
+    );
+  }
   if (tab.attached) {
     await enableDomains(tabId);
     return tabId;
@@ -1309,16 +1436,8 @@ const ops = {
       if (tab) clearWorld(tabId);
     }
     if (!tab) {
-      try {
-        tab = await chrome.tabs.create({ url, active: true });
-      } catch (error) {
-        throw failed(
-          FAILURES.navigationFailed,
-          `Chromium would not open a tab: ${error?.message ?? error}`,
-        );
-      }
+      tab = await createClaimedTab(session, { url, active: true }, timeoutMs);
       tabId = tab.id;
-      await claimTab(session, tabId, timeoutMs);
     }
 
     if (tab.status !== "complete") {
@@ -1644,19 +1763,11 @@ const ops = {
       if (url !== "" && url !== "about:blank" && !/^https?:\/\//i.test(url)) {
         throw failed(FAILURES.blockedUrl, "The relay only opens http and https URLs.");
       }
-      let tab;
-      try {
-        tab = await chrome.tabs.create({
-          ...(url === "" ? {} : { url }),
-          active: true,
-        });
-      } catch (error) {
-        throw failed(
-          FAILURES.navigationFailed,
-          `Chromium would not open a tab: ${error?.message ?? error}`,
-        );
-      }
-      await claimTab(session, tab.id, timeoutMs);
+      const tab = await createClaimedTab(
+        session,
+        { ...(url === "" ? {} : { url }), active: true },
+        timeoutMs,
+      );
       if (tab.status !== "complete" && url !== "" && url !== "about:blank") {
         const loaded = await waitForLoad(tab.id, timeoutMs);
         if (!loaded) await stopLoading(tab.id);
@@ -1701,7 +1812,10 @@ const ops = {
     const session = requireOwningSession(args);
     let retirementError = null;
     await serializeOwnership(async () => {
-      state.retired.add(session);
+      if (!state.retired.has(session)) {
+        state.retired.add(session);
+        ownershipGeneration += 1;
+      }
       try {
         await persistOwnership();
       } catch (error) {
@@ -1728,6 +1842,15 @@ const ops = {
             ? {}
             : { retirement: retirementError?.message ?? String(retirementError) }),
         },
+      );
+    }
+    try {
+      await sweepRetiredTabs();
+    } catch (error) {
+      throw failed(
+        FAILURES.browserUnavailable,
+        `Browser session close needs retry: its completed retirement could not be saved: `
+          + `${error?.message ?? error}.`,
       );
     }
     return { closed: outcomes.some((outcome) => outcome.status === "fulfilled" && outcome.value) };
@@ -1761,7 +1884,7 @@ export function startOp(op, args, timeoutMs) {
   const session = typeof args?.session === "string" && args.session !== ""
     ? args.session
     : null;
-  if (session !== null && state.retired.has(session) && op !== "close") {
+  if (session !== null && isRetired(session) && op !== "close") {
     throw failed(
       FAILURES.browserUnavailable,
       "This browser session is closed. Open through a fresh session.",
