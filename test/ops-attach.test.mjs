@@ -1164,6 +1164,63 @@ test("double claim persistence failure stays poisoned across a worker restart", 
   assert.equal(cleared, true, "an authoritative no-such-tab result clears the restart poison");
 });
 
+test("an onRemoved storage rejection stays pending for automatic recovery", async () => {
+  let failPersistence = true;
+  const storedSession = { ghostTabs: null, ghostBrowserSession: BROWSER_SESSION };
+  const storedLocal = { ghostOwnershipPoison: null };
+  let persistenceAttempts = 0;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistFence: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
+    persistSession: async (value) => {
+      persistenceAttempts += 1;
+      if (failPersistence) throw new Error("session storage unavailable");
+      Object.assign(storedSession, structuredClone(value));
+    },
+    restoreLocal: async () => structuredClone(storedLocal),
+    restoreSession: async () => structuredClone(storedSession),
+    tabRemove: async () => { throw new Error("Chromium refused the rollback"); },
+  });
+  const ops = await import(`../extension/ops.js?removed-repair=${Date.now()}`);
+  ops.installOpsListeners();
+
+  await assert.rejects(
+    ops.runOp("open", { session: "uncertain", url: "https://example.com/" }, 1_000),
+    (error) => error instanceof RelayOpError
+      && error.failure === "browser_unavailable"
+      && /across a worker restart/i.test(error.message),
+  );
+  assert.equal(persistenceAttempts, 2);
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, [["uncertain", 17]]);
+
+  globalThis.chrome.tabs.onRemoved.emit(17);
+  for (let attempt = 0; attempt < 20 && persistenceAttempts < 4; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(
+    persistenceAttempts,
+    4,
+    "the rejected drop publication immediately attempts and retains one repair",
+  );
+  await assert.rejects(
+    ops.runOp("open", { session: "other", url: "https://other.example/" }, 1_000),
+    (error) => error instanceof RelayOpError
+      && /ownership recovery is not durable yet.*automatic repair/i.test(error.message),
+  );
+
+  failPersistence = false;
+  await ops.repairBrowserPersistence();
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: [],
+  });
+  assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, []);
+  assert.deepEqual(storedLocal.ghostOwnershipPoisonBackup.claims, []);
+});
+
 test("concurrent failed claims publish every uncertain tab to the poison ledger", async () => {
   let nextId = 17;
   const storedLocal = { ghostOwnershipPoison: null };

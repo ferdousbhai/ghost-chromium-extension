@@ -1071,7 +1071,15 @@ function flushDroppedTabs() {
   const attempt = (async () => {
     while (dropPublicationDirty && aggregateRetirementDepth === 0) {
       dropPublicationDirty = false;
-      await serializeOwnership(() => persistOwnership()).catch(() => undefined);
+      try {
+        await serializeOwnership(() => persistOwnership());
+      } catch {
+        // The repair snapshot includes every drop that arrived during this
+        // attempt. Keep it pending for preparation/alarm retry without making
+        // this best-effort event handler hot-loop storage.
+        scheduleOwnershipRepair();
+        break;
+      }
     }
   })();
   dropPublicationInFlight = attempt;
