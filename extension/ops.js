@@ -2400,8 +2400,24 @@ const ops = {
     // keeps the rest of the owner's day in it.
     const session = requireOwningSession(args);
     let retirementError = null;
+    let needsRetirement = false;
     await serializeOwnership(async () => {
+      needsRetirement = state.retired.has(session)
+        || (state.sessions.get(session)?.size ?? 0) > 0
+        || (creatingSessions.get(session) ?? 0) > 0;
+      if (!needsRetirement) {
+        rememberRecentRetirement(session);
+        return;
+      }
       if (!state.retired.has(session)) {
+        if (state.retired.size >= MAX_STORED_RETIRED) {
+          void sweepRetiredTabs().catch(() => {});
+          throw failed(
+            FAILURES.browserUnavailable,
+            `The relay is still retiring ${MAX_STORED_RETIRED} older ghost browser workspaces. `
+              + "Retry close after its automatic cleanup.",
+          );
+        }
         state.retired.add(session);
         ownershipGeneration += 1;
       }
@@ -2411,6 +2427,7 @@ const ops = {
         retirementError = error;
       }
     });
+    if (!needsRetirement) return { closed: false };
 
     const owned = [...(state.sessions.get(session) ?? [])];
     const outcomes = await retireTabs(owned, timeoutMs);

@@ -1809,6 +1809,49 @@ test("retired UUID persistence is garbage-collected after all create leases sett
   await gc.runOp("close", { session: "retired-0" }, 1_000);
 });
 
+test("claimless close bursts cannot overflow the retired-owner ledger across restart", async () => {
+  const retired = Array.from({ length: 2_048 }, (_, index) => `retired-${index}`);
+  const storedSession = {
+    ghostBrowserSession: BROWSER_SESSION,
+    ghostTabs: { version: 2, tabs: [], sessions: [], retired },
+  };
+  let writes = 0;
+  let largestPublication = 0;
+  globalThis.chrome = chromeMock({
+    persistSession: async (value) => {
+      writes += 1;
+      largestPublication = Math.max(
+        largestPublication,
+        value.ghostTabs?.retired?.length ?? 0,
+      );
+      Object.assign(storedSession, structuredClone(value));
+    },
+    restoreSession: async () => structuredClone(storedSession),
+  });
+  const first = await import(`../extension/ops.js?claimless-close-cap=${Date.now()}`);
+  await first.restoreTabsFromSession();
+  const restoreWrites = writes;
+
+  await Promise.all(
+    Array.from({ length: 2_049 }, (_, index) =>
+      first.runOp("close", { session: `claimless-${index}` }, 1_000)),
+  );
+
+  assert.equal(writes, restoreWrites, "claimless closes do not publish retirement tombstones");
+  assert.equal(largestPublication, 2_048);
+  assert.equal(storedSession.ghostTabs.retired.length, 2_048);
+  await assert.rejects(
+    first.runOp("open", { session: "claimless-2048", url: "https://late.example/" }, 1_000),
+    (error) => error instanceof RelayOpError
+      && /workspace has been released.*retry.*fresh workspace/i.test(error.message),
+  );
+
+  const restarted = await import(`../extension/ops.js?claimless-close-restart=${Date.now()}`);
+  await restarted.restoreTabsFromSession();
+  assert.equal(storedSession.ghostTabs.retired.length, 2_048);
+  assert.equal(largestPublication, 2_048, "a fresh worker never receives an oversized ledger");
+});
+
 test("an indeterminate remove failure retains the tab for close retry", async () => {
   const removed = [];
   let removeAttempts = 0;

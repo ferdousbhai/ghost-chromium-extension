@@ -27,10 +27,12 @@ const extensionDir = join(here, "..", "extension");
 const headless = process.argv.includes("--headless");
 
 const { RelayHub, attachRelay } = await import(join(repoRoot, "packages/daemon/dist/relay.js"));
-const { relayBackend } = await import(join(repoRoot, "packages/extensions/dist/index.js"));
-const { GhostBrowserSession } = await import(
-  join(repoRoot, "packages/extensions/dist/extensions/browser-session.js")
-);
+const {
+  browserSessionFor,
+  closeAllBrowserSessions,
+  closeBrowserSession,
+  relayBackend,
+} = await import(join(repoRoot, "packages/extensions/dist/index.js"));
 const { createServer } = await import("node:http");
 
 const TOKEN = "0123456789abcdef".repeat(4);
@@ -43,6 +45,7 @@ const record = (name, ok, detail) => {
 let chromium;
 let profileDir;
 let ghostHome;
+let otherGhostHome;
 let server;
 let hub;
 let fixtureServer;
@@ -154,8 +157,7 @@ try {
 
   // 4. Drive one full round through the real session layer, so URL policy, ref
   //    bookkeeping, and the read budget are all in the path.
-  const session = new GhostBrowserSession({
-    homeDir: ghostHome,
+  const sessionOptions = {
     backend: relayBackend({ transport: hub }),
     idleTimeoutMs: 0,
     actionTimeoutMs: 30_000,
@@ -163,7 +165,8 @@ try {
     // asserting against someone else's search page, and the URL policy refuses
     // local addresses unless the session was configured to allow them.
     allowLocal: true,
-  });
+  };
+  const session = browserSessionFor(ghostHome, sessionOptions);
 
   const opened = await session.open("https://example.com");
   record("open", opened.url.includes("example.com"), `${opened.url} — ${opened.title}`);
@@ -229,45 +232,53 @@ try {
     submitted.url,
   );
 
-  // 5b. Two conversations at once. This is the one thing no fake can prove: the
-  //     extension serves every session over a single socket, so if any of the
-  //     attach state, the isolated world, or the ref table were still global,
-  //     one session's `open` would silently invalidate the other's refs.
-  const other = new GhostBrowserSession({
-    homeDir: ghostHome,
+  // 5b. Exercise the production ownership model: one resolved ghost home is one
+  //     shared workspace across conversations, with multiple tabs; another home
+  //     gets a separate protocol owner over the same extension socket.
+  const sameGhost = browserSessionFor(join(ghostHome, "."), {
+    ...sessionOptions,
     backend: relayBackend({ transport: hub }),
-    idleTimeoutMs: 0,
-    actionTimeoutMs: 30_000,
-    allowLocal: true,
   });
-  await other.open(fixtureUrl);
+  record(
+    "same-home conversations reuse one browser workspace",
+    sameGhost === session,
+    `resolved registry key ${ghostHome}`,
+  );
+
+  const firstTab = (await session.tabs({ op: "list" })).active;
+  const created = await sameGhost.tabs({ op: "create", url: `${fixtureUrl}?second-tab=1` });
+  const shared = await session.tabs({ op: "list" });
+  record(
+    "one ghost-wide workspace owns multiple tabs",
+    shared.tabs.length === 2 && created.active !== firstTab && shared.active === created.active,
+    `tabs ${shared.tabs.map((tab) => tab.id).join(", ")}; active ${shared.active}`,
+  );
+
+  otherGhostHome = await mkdtemp(join(tmpdir(), "ghost-relay-smoke-other-home-"));
+  const otherGhost = browserSessionFor(otherGhostHome, {
+    ...sessionOptions,
+    backend: relayBackend({ transport: hub }),
+  });
+  await otherGhost.open(`${fixtureUrl}?other-ghost=1`);
   const mine = await session.tabs({ op: "list" });
-  const theirs = await other.tabs({ op: "list" });
+  const theirs = await otherGhost.tabs({ op: "list" });
   record(
-    "each conversation sees only its own tab",
-    mine.tabs.length === 1 && theirs.tabs.length === 1 && mine.active !== theirs.active,
-    `this session drives ${mine.active}, the other drives ${theirs.active}`,
+    "separate ghost homes keep separate browser workspaces",
+    mine.tabs.length === 2 && theirs.tabs.length === 1
+      && mine.tabs.every((tab) => !theirs.tabs.some((otherTab) => otherTab.id === tab.id)),
+    `first ghost: ${mine.tabs.map((tab) => tab.id).join(", ")}; other: ${theirs.active}`,
   );
 
-  // Mint refs in one session, then make the other navigate its own tab. Under a
-  // shared world the second open would tear down the first session's refs.
-  // (This session is on /submitted from the Enter test; go back to the form.)
-  await session.open(fixtureUrl);
-  const { matches: minted } = await session.find("input#q", { limit: 1 });
-  await other.open(`${fixtureUrl}?other=1`);
-  const stillMine = await session.type({ ref: minted[0].ref, text: "isolated", submit: false });
-  const { matches: afterOther } = await session.find("input#q", { limit: 1 });
+  await closeBrowserSession(otherGhostHome);
+  const afterOtherClosed = await session.tabs({ op: "list" });
   record(
-    "a second conversation does not invalidate the first's refs",
-    minted.length === 1 && stillMine.submitted === false && afterOther[0]?.value === "isolated",
-    `ref ${minted[0].ref} still resolved after the other session navigated`,
+    "closing another ghost leaves this workspace",
+    afterOtherClosed.tabs.length === 2,
+    `still owns ${afterOtherClosed.tabs.map((tab) => tab.id).join(", ")}`,
   );
 
-  const otherClosed = await other.close();
-  record("closing one conversation leaves the other's tab", otherClosed, `still on ${(await session.tabs({ op: "list" })).active}`);
-
-  const closed = await session.close();
-  record("close the tab", closed, "the browser itself stayed open");
+  await closeBrowserSession(ghostHome);
+  record("close the ghost-wide workspace", true, "the browser itself stayed open");
 
   // 6. The popup is the only way an owner ever pairs, so a syntax error in it
   //    is a ship-blocker that no unit test would catch. Only its rendering is
@@ -277,13 +288,14 @@ try {
 } catch (error) {
   record("smoke run", false, error?.message ?? String(error));
 } finally {
+  await closeAllBrowserSessions().catch(() => {});
   await hub?.close().catch(() => {});
   await new Promise((resolve) => (server ? server.close(resolve) : resolve()));
   await new Promise((resolve) => (fixtureServer ? fixtureServer.close(resolve) : resolve()));
   chromium?.kill("SIGTERM");
   await new Promise((resolve) => setTimeout(resolve, 500));
   chromium?.kill("SIGKILL");
-  for (const dir of [profileDir, ghostHome]) {
+  for (const dir of [profileDir, ghostHome, otherGhostHome]) {
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
