@@ -48,6 +48,9 @@ const CDP_VERSION = "1.3";
 /** URLs `chrome.debugger` cannot attach to. */
 const INELIGIBLE_URL = /^(chrome|devtools|edge|view-source|chrome-extension|chrome-untrusted|chrome-search|about):/i;
 const SETTLE_WATCH_MS = 900;
+const STORAGE_TIMEOUT_MS = 750;
+const RESTORE_TIMEOUT_MS = 1_000;
+const DETACH_TIMEOUT_MS = 750;
 /** Chrome's own texture limits; a taller capture comes back blank or fails. */
 const MAX_CAPTURE_PX = 16_384;
 const RING_LIMIT = 200;
@@ -138,17 +141,75 @@ function ownershipSnapshot() {
   };
 }
 
+function scheduleOwnershipRepair() {
+  void serializeOwnership(() => persistOwnership()).catch(() => {});
+}
+
+function schedulePoisonRepair() {
+  void serializeOwnership(() => persistCurrentPoison()).catch(() => {});
+}
+
+function sameSnapshot(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function boundedStorageMutation(promise, what, repair) {
+  let expired = false;
+  void promise.then(
+    () => {
+      if (expired) repair();
+    },
+    () => {},
+  );
+  try {
+    return await withApiTimeout(promise, STORAGE_TIMEOUT_MS, what);
+  } catch (error) {
+    expired = true;
+    throw error;
+  }
+}
+
+function setOwnershipSnapshot(snapshot) {
+  return boundedStorageMutation(
+    chrome.storage.session.set({ [SESSION_KEY]: snapshot }),
+    "saving browser ownership",
+    () => {
+      if (!sameSnapshot(snapshot, ownershipSnapshot())) scheduleOwnershipRepair();
+    },
+  );
+}
+
+function persistCurrentPoison() {
+  if (ownershipPoison.size === 0) {
+    return boundedStorageMutation(
+      chrome.storage.local.remove(POISON_KEY),
+      "clearing browser ownership recovery",
+      () => {
+        if (ownershipPoison.size > 0) schedulePoisonRepair();
+      },
+    );
+  }
+  const snapshot = poisonSnapshot();
+  return boundedStorageMutation(
+    chrome.storage.local.set({ [POISON_KEY]: snapshot }),
+    "saving browser ownership recovery",
+    () => {
+      if (!sameSnapshot(snapshot, poisonSnapshot())) schedulePoisonRepair();
+    },
+  );
+}
+
 async function persistOwnership() {
-  await chrome.storage.session.set({ [SESSION_KEY]: ownershipSnapshot() });
+  await setOwnershipSnapshot(ownershipSnapshot());
   if (ownershipPoison.size > 0) {
     ownershipPoison.clear();
-    await chrome.storage.local.remove(POISON_KEY).catch(() => {});
+    await persistCurrentPoison().catch(() => {});
   }
 }
 
 async function persistPoison(session, tabId) {
   ownershipPoison.set(tabId, session);
-  await chrome.storage.local.set({ [POISON_KEY]: poisonSnapshot() });
+  await persistCurrentPoison();
 }
 
 function poisonSnapshot() {
@@ -177,11 +238,7 @@ function parsePoison(value) {
 
 async function clearPoison(tabId) {
   ownershipPoison.delete(tabId);
-  if (ownershipPoison.size === 0) {
-    await chrome.storage.local.remove(POISON_KEY).catch(() => {});
-  } else {
-    await chrome.storage.local.set({ [POISON_KEY]: poisonSnapshot() }).catch(() => {});
-  }
+  await persistCurrentPoison().catch(() => {});
 }
 
 function noSuchTab(error, tabId) {
@@ -236,8 +293,16 @@ export function restoreTabsFromSession() {
     let poison;
     try {
       [stored, poison] = await Promise.all([
-        chrome.storage.session.get({ [SESSION_KEY]: null }),
-        chrome.storage.local.get({ [POISON_KEY]: null }),
+        withApiTimeout(
+          chrome.storage.session.get({ [SESSION_KEY]: null }),
+          RESTORE_TIMEOUT_MS,
+          "restoring browser ownership",
+        ),
+        withApiTimeout(
+          chrome.storage.local.get({ [POISON_KEY]: null }),
+          RESTORE_TIMEOUT_MS,
+          "restoring browser ownership recovery",
+        ),
       ]);
     } catch (error) {
       throw failed(
@@ -264,7 +329,11 @@ export function restoreTabsFromSession() {
         if (durable) continue;
         let live;
         try {
-          live = await liveTabOrNull(tab);
+          live = await withApiTimeout(
+            liveTabOrNull(tab),
+            RESTORE_TIMEOUT_MS,
+            `restoring uncertain tab ${tab}`,
+          );
         } catch (error) {
           verificationError ??= error;
           unresolved.set(tab, session);
@@ -275,7 +344,7 @@ export function restoreTabsFromSession() {
       ownershipPoison.clear();
       for (const [tab, session] of unresolved) ownershipPoison.set(tab, session);
       if (unresolved.size > 0) {
-        await chrome.storage.local.set({ [POISON_KEY]: poisonSnapshot() }).catch(() => {});
+        await persistCurrentPoison().catch(() => {});
         const tab = unresolved.keys().next().value;
         throw failed(
           FAILURES.browserUnavailable,
@@ -286,7 +355,7 @@ export function restoreTabsFromSession() {
                 + `${verificationError?.message ?? verificationError}.`),
         );
       } else {
-        await chrome.storage.local.remove(POISON_KEY).catch(() => {});
+        await persistCurrentPoison().catch(() => {});
       }
     }
     if (saved === null || saved === undefined) {
@@ -313,7 +382,11 @@ export function restoreTabsFromSession() {
     for (const id of saved.tabs) {
       let tab;
       try {
-        tab = await liveTabOrNull(id);
+        tab = await withApiTimeout(
+          liveTabOrNull(id),
+          RESTORE_TIMEOUT_MS,
+          `restoring tab ${id}`,
+        );
       } catch (error) {
         throw failed(
           FAILURES.browserUnavailable,
@@ -401,13 +474,14 @@ async function claimTab(session, tabId, timeoutMs) {
     );
   }
 
-  let poisonError = null;
-  try {
-    await serializeOwnership(() => persistPoison(session, tabId));
-  } catch (error) {
-    poisonError = error;
-  }
-  const removal = await removeTab(tabId, timeoutMs);
+  const [poisonResult, removal] = await Promise.all([
+    serializeOwnership(() => persistPoison(session, tabId)).then(
+      () => ({ error: null }),
+      (error) => ({ error }),
+    ),
+    removeTab(tabId, timeoutMs),
+  ]);
+  const poisonError = poisonResult.error;
   if (removal.authoritative) {
     forgetTab(tabId);
     await serializeOwnership(() => clearPoison(tabId));
@@ -449,6 +523,19 @@ function cleanupBudget(timeoutMs) {
   return Math.max(100, Math.floor(timeoutMs * 0.8));
 }
 
+async function tryDetach(tabId, timeoutMs = DETACH_TIMEOUT_MS) {
+  try {
+    await withApiTimeout(
+      Promise.resolve().then(() => chrome.debugger.detach({ tabId })),
+      Math.min(DETACH_TIMEOUT_MS, cleanupBudget(timeoutMs)),
+      `detaching tab ${tabId}`,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Try to prove one tab absent without trusting an indeterminate Chrome error. */
 async function removeTab(tabId, timeoutMs) {
   const budget = cleanupBudget(timeoutMs);
@@ -476,13 +563,9 @@ async function removeTab(tabId, timeoutMs) {
 /** Close one claimed tab without forgetting a live tab Chromium refused to close. */
 async function retireTab(tabId, timeoutMs) {
   if (isAttached(tabId)) {
-    await withTimeout(
-      detachStale(tabId),
-      cleanupBudget(timeoutMs),
-      `detaching tab ${tabId}`,
-    ).catch(() => {});
+    const detached = await tryDetach(tabId, timeoutMs);
     const tab = state.tabs.get(tabId);
-    if (tab) resetAttachment(tab);
+    if (detached && tab) resetAttachment(tab);
   }
   const removal = await removeTab(tabId, timeoutMs);
   if (removal.authoritative) {
@@ -689,6 +772,26 @@ function withTimeout(promise, timeoutMs, what) {
       );
     }),
   ]);
+}
+
+function withApiTimeout(promise, timeoutMs, what) {
+  const signal = AbortSignal.timeout(timeoutMs);
+  return new Promise((resolve, reject) => {
+    const onTimeout = () => reject(
+      failed(FAILURES.timeout, `The browser did not finish ${what} in time.`),
+    );
+    signal.addEventListener("abort", onTimeout, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onTimeout);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onTimeout);
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
@@ -1638,10 +1741,16 @@ const ops = {
  * a reconnecting backend still names the same tab and re-attaches on its next op.
  */
 export async function releaseAllTabs() {
+  const attached = [];
   for (const [tabId, tab] of state.tabs) {
-    if (tab.attached) await detachStale(tabId);
-    resetAttachment(tab);
+    if (tab.attached) attached.push(tabId);
+    else resetAttachment(tab);
   }
+  await Promise.all(attached.map(async (tabId) => {
+    if (!await tryDetach(tabId)) return;
+    const tab = state.tabs.get(tabId);
+    if (tab) resetAttachment(tab);
+  }));
 }
 
 export function startOp(op, args, timeoutMs) {

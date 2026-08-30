@@ -179,6 +179,46 @@ test("an indeterminate ownership restore fails closed before dialing", async () 
   assert.match(status.lastError, /could not restore browser ownership.*storage unavailable/i);
 });
 
+test("a timed-out ownership read releases connect for the alarm retry", async () => {
+  const firstRead = deferred();
+  const reconnects = [];
+  const sockets = [];
+  let reads = 0;
+  globalThis.chrome = chromeMock({
+    loadSettings: async () => ({ port: 7717, token: "paired", enabled: true }),
+    restoreSession: () => {
+      reads += 1;
+      return reads === 1 ? firstRead.promise : Promise.resolve({ ghostTabs: null });
+    },
+  });
+  globalThis.setTimeout = (callback) => {
+    reconnects.push(callback);
+    return reconnects.length;
+  };
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor(url) {
+      this.readyState = FakeWebSocket.CONNECTING;
+      sockets.push(url);
+    }
+  };
+
+  await import(`../extension/background.js?restore-timeout=${Date.now()}`);
+  await new Promise((resolve) => originalSetTimeout(resolve, 1_100));
+  await settle();
+  assert.equal(reads, 1);
+  assert.deepEqual(sockets, []);
+  assert.equal(reconnects.length, 1);
+
+  reconnects[0]();
+  await settle();
+  assert.equal(reads, 2);
+  assert.deepEqual(sockets, ["ws://127.0.0.1:7717/relay"]);
+  firstRead.resolve({ ghostTabs: null });
+});
+
 test("a failed dial releases the latch and reconnects once", async () => {
   let constructions = 0;
   const reconnects = [];

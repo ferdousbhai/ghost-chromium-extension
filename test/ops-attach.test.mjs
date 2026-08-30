@@ -225,6 +225,84 @@ test("release invalidates an in-flight attach and the stale success detaches its
   );
 });
 
+test("release attempts every attached tab and retains an indeterminate detach for retry", async () => {
+  const firstDetach = deferred();
+  const detached = [];
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    detach: ({ tabId }) => {
+      detached.push(tabId);
+      return tabId === 17 && detached.filter((id) => id === 17).length === 1
+        ? firstDetach.promise
+        : Promise.resolve();
+    },
+    sendCommand: async (_target, method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 9 };
+      if (method === "Runtime.evaluate") {
+        return { result: { value: { url: "https://example.com/", title: "E", text: "ok" } } };
+      }
+      return {};
+    },
+  });
+  const { isAttached, releaseAllTabs, runOp } = await import(
+    `../extension/ops.js?release-detach-timeout=${Date.now()}`
+  );
+  await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
+  await runOp("tabs", { session: "s1", op: "create", url: "https://second.example/" }, 1_000);
+  await runOp("read", { session: "s1", tab: "17" }, 1_000);
+  await runOp("read", { session: "s1", tab: "18" }, 1_000);
+
+  await releaseAllTabs();
+  assert.deepEqual(detached, [17, 18]);
+  assert.equal(isAttached(17), true, "a timed-out detach remains visible for retry");
+  assert.equal(isAttached(18), false, "later tabs are still released");
+
+  await releaseAllTabs();
+  assert.deepEqual(detached, [17, 18, 17]);
+  assert.equal(isAttached(17), false);
+  firstDetach.resolve();
+});
+
+test("close retries an indeterminate debugger detach instead of marking it released", async () => {
+  const firstDetach = deferred();
+  let detachAttempts = 0;
+  let removeAttempts = 0;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    detach: () => {
+      detachAttempts += 1;
+      return detachAttempts === 1 ? firstDetach.promise : Promise.resolve();
+    },
+    sendCommand: async (_target, method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 9 };
+      if (method === "Runtime.evaluate") {
+        return { result: { value: { url: "https://example.com/", title: "E", text: "ok" } } };
+      }
+      return {};
+    },
+    tabRemove: async () => {
+      removeAttempts += 1;
+      if (removeAttempts === 1) throw new Error("Chromium refused the close");
+    },
+  });
+  const { isAttached, runOp } = await import(`../extension/ops.js?close-detach-timeout=${Date.now()}`);
+  await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
+  await runOp("read", { session: "s1", tab: "17" }, 1_000);
+
+  await assert.rejects(
+    runOp("close", { session: "s1" }, 1_000),
+    (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
+  );
+  assert.equal(isAttached(17), true);
+
+  assert.equal((await runOp("close", { session: "s1" }, 1_000)).closed, true);
+  assert.equal(detachAttempts, 2);
+  assert.equal(isAttached(17), false);
+  firstDetach.resolve();
+});
+
 test("two tabs keep their own attachment and isolated world", async () => {
   const attachTargets = [];
   const worlds = [];
@@ -428,6 +506,95 @@ test("a claim is not acknowledged until storage accepts it", async () => {
   assert.equal(acknowledged, true);
 });
 
+test("a timed-out ownership write cannot block close and repairs a late stale write", async () => {
+  const firstWrite = deferred();
+  let storedSession = { ghostTabs: null };
+  let storedLocal = { ghostOwnershipPoison: null };
+  let writes = 0;
+  let removals = 0;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistLocal: async (value) => { storedLocal = structuredClone(value); },
+    persistSession: async (value) => {
+      writes += 1;
+      if (writes === 1) await firstWrite.promise;
+      storedSession = structuredClone(value);
+    },
+    removeLocal: async () => { storedLocal = { ghostOwnershipPoison: null }; },
+    restoreLocal: async () => structuredClone(storedLocal),
+    restoreSession: async () => structuredClone(storedSession),
+    tabRemove: async () => {
+      removals += 1;
+      if (removals === 1) throw new Error("Chromium refused the rollback");
+    },
+  });
+  const writer = await import(`../extension/ops.js?write-timeout=${Date.now()}`);
+
+  await assert.rejects(
+    writer.runOp("open", { session: "timed-write", url: "https://example.com/" }, 2_000),
+    (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
+  );
+  assert.ok(writes >= 2, "a timed-out first claim must not retain the ownership lane");
+  assert.equal((await writer.runOp("close", { session: "timed-write" }, 2_000)).closed, true);
+
+  firstWrite.resolve();
+  for (let attempt = 0; attempt < 20; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(storedSession, {
+    ghostTabs: { version: 2, tabs: [], sessions: [], retired: ["timed-write"] },
+  });
+  assert.deepEqual(storedLocal, { ghostOwnershipPoison: null });
+
+  const restarted = await import(`../extension/ops.js?write-timeout-restart=${Date.now()}`);
+  await restarted.restoreTabsFromSession();
+  await assert.rejects(
+    restarted.runOp("open", { session: "timed-write", url: "https://late.example/" }, 1_000),
+    (error) => error instanceof RelayOpError && /session is closed/.test(error.message),
+  );
+});
+
+test("a timed-out poison publication releases close and repairs its late result", async () => {
+  const poisonWrite = deferred();
+  let storedSession = { ghostTabs: null };
+  let storedLocal = { ghostOwnershipPoison: null };
+  let sessionWrites = 0;
+  let localWrites = 0;
+  let removals = 0;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistLocal: async (value) => {
+      localWrites += 1;
+      if (localWrites === 1) await poisonWrite.promise;
+      storedLocal = structuredClone(value);
+    },
+    persistSession: async (value) => {
+      sessionWrites += 1;
+      if (sessionWrites === 1) throw new Error("session storage unavailable");
+      storedSession = structuredClone(value);
+    },
+    removeLocal: async () => { storedLocal = { ghostOwnershipPoison: null }; },
+    restoreLocal: async () => structuredClone(storedLocal),
+    restoreSession: async () => structuredClone(storedSession),
+    tabRemove: async () => {
+      removals += 1;
+      if (removals === 1) throw new Error("Chromium refused the rollback");
+    },
+  });
+  const writer = await import(`../extension/ops.js?poison-timeout=${Date.now()}`);
+
+  await assert.rejects(
+    writer.runOp("open", { session: "timed-poison", url: "https://example.com/" }, 2_000),
+    (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
+  );
+  assert.equal((await writer.runOp("close", { session: "timed-poison" }, 2_000)).closed, true);
+
+  poisonWrite.resolve();
+  for (let attempt = 0; attempt < 20; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(storedLocal, { ghostOwnershipPoison: null });
+  assert.deepEqual(storedSession, {
+    ghostTabs: { version: 2, tabs: [], sessions: [], retired: ["timed-poison"] },
+  });
+});
+
 test("a rejected claim publication closes the unowned new tab", async () => {
   const removed = [];
   globalThis.chrome = chromeMock({
@@ -573,6 +740,38 @@ test("restore fails closed when storage or tab existence is indeterminate", asyn
       && error.failure === "browser_unavailable"
       && /verify restored tab 17/.test(error.message),
   );
+});
+
+test("a timed-out restored tab lookup releases ownership for a later retry", async () => {
+  const firstLookup = deferred();
+  let lookups = 0;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    restoreSession: async () => ({
+      ghostTabs: {
+        version: 2,
+        tabs: [17],
+        sessions: [["restored", [17]]],
+        retired: [],
+      },
+    }),
+    tabGet: async () => {
+      lookups += 1;
+      if (lookups === 1) return firstLookup.promise;
+      return { id: 17, windowId: 4, status: "complete" };
+    },
+  });
+  const restoring = await import(`../extension/ops.js?restore-tab-timeout=${Date.now()}`);
+
+  await assert.rejects(
+    restoring.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError
+      && error.failure === "browser_unavailable"
+      && /did not finish restoring tab 17/.test(error.message),
+  );
+  await restoring.restoreTabsFromSession();
+  assert.equal(lookups, 2);
+  firstLookup.resolve({ id: 17, windowId: 4, status: "complete" });
 });
 
 test("a partial session close keeps the refused live tab for retry", async () => {
