@@ -40,7 +40,10 @@ function chromeMock({
   attach,
   detach = async () => {},
   getTargets,
+  persistSession = async () => {},
+  restoreSession = async () => ({ ghostTabs: null }),
   sendCommand = async () => ({}),
+  tabGet,
   tabRemove = () => {},
 }) {
   const tabs = new Map();
@@ -68,8 +71,8 @@ function chromeMock({
     },
     storage: {
       session: {
-        get: async () => ({ ghostTabs: null }),
-        set: async () => {},
+        get: restoreSession,
+        set: persistSession,
       },
     },
     tabs: {
@@ -85,11 +88,16 @@ function chromeMock({
         tabs.set(tab.id, tab);
         return redacted(tab);
       },
-      get: async (id) => redacted(tabs.get(id)) ?? null,
+      get: async (id) => {
+        const tab = redacted(tabs.get(id));
+        if (tabGet) return tabGet(id, tab);
+        if (!tab) throw new Error(`No tab with id: ${id}.`);
+        return tab;
+      },
       onRemoved: eventHook(),
       onUpdated: eventHook(),
       remove: async (id) => {
-        tabRemove(id);
+        await tabRemove(id);
         tabs.delete(id);
       },
       update: async (id, update) => {
@@ -302,6 +310,22 @@ test("a session sees, drives, and closes only the tabs it opened", async () => {
   assert.deepEqual(removed, []);
 });
 
+test("protocol-3 tab creation refuses a missing owner session", async () => {
+  globalThis.chrome = chromeMock({ attach: async () => {} });
+  const { runOp } = await import(`../extension/ops.js?missing-owner=${Date.now()}`);
+
+  for (const [op, args] of [
+    ["open", { url: "https://example.com/" }],
+    ["tabs", { op: "create", url: "https://example.com/" }],
+  ]) {
+    await assert.rejects(
+      runOp(op, args, 1_000),
+      (error) => error instanceof RelayOpError && error.failure === "invalid_input",
+    );
+  }
+  assert.deepEqual((await runOp("status", {}, 1_000)).tabs, []);
+});
+
 test("closing a session sweeps every tab it opened, not just the last one", async () => {
   const removed = [];
   globalThis.chrome = chromeMock({
@@ -344,6 +368,107 @@ test("session close sweeps older tabs after the current tab is gone", async () =
   assert.deepEqual(removed, [18, 17]);
 });
 
+test("a worker restart restores a durably published session claim", async () => {
+  let stored = { ghostTabs: null };
+  const removed = [];
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistSession: async (value) => { stored = structuredClone(value); },
+    restoreSession: async () => structuredClone(stored),
+    tabRemove: async (id) => { removed.push(id); },
+  });
+  const first = await import(`../extension/ops.js?persist-owner=${Date.now()}`);
+  await first.runOp("open", { session: "durable", url: "https://example.com/" }, 1_000);
+  assert.deepEqual(stored, {
+    ghostTabs: {
+      version: 1,
+      tabs: [17],
+      sessions: [["durable", [17]]],
+    },
+  });
+
+  const restarted = await import(`../extension/ops.js?restore-owner=${Date.now()}`);
+  await restarted.restoreTabsFromSession();
+  const closed = await restarted.runOp("close", { session: "durable" }, 1_000);
+  assert.equal(closed.closed, true);
+  assert.deepEqual(removed, [17]);
+});
+
+test("a claim is not acknowledged until storage accepts it", async () => {
+  const stored = deferred();
+  let acknowledged = false;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistSession: () => stored.promise,
+  });
+  const { runOp } = await import(`../extension/ops.js?claim-barrier=${Date.now()}`);
+  const opening = runOp("open", { session: "s1", url: "https://example.com/" }, 5_000)
+    .then((result) => {
+      acknowledged = true;
+      return result;
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(acknowledged, false);
+
+  stored.resolve();
+  await opening;
+  assert.equal(acknowledged, true);
+});
+
+test("a rejected claim publication closes the unowned new tab", async () => {
+  const removed = [];
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistSession: async () => { throw new Error("session storage unavailable"); },
+    tabRemove: async (id) => { removed.push(id); },
+  });
+  const { runOp } = await import(`../extension/ops.js?claim-rollback=${Date.now()}`);
+
+  await assert.rejects(
+    runOp("open", { session: "s1", url: "https://example.com/" }, 1_000),
+    (error) => error instanceof RelayOpError
+      && error.failure === "browser_unavailable"
+      && /rolled back/.test(error.message),
+  );
+  assert.deepEqual(removed, [17]);
+});
+
+test("restore fails closed when storage or tab existence is indeterminate", async () => {
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    restoreSession: async () => { throw new Error("session storage unavailable"); },
+  });
+  const storageFailure = await import(`../extension/ops.js?restore-storage-failure=${Date.now()}`);
+  await assert.rejects(
+    storageFailure.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError
+      && error.failure === "browser_unavailable"
+      && /restore browser ownership/.test(error.message),
+  );
+
+  let stored = { ghostTabs: null };
+  let failLookup = false;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistSession: async (value) => { stored = structuredClone(value); },
+    restoreSession: async () => structuredClone(stored),
+    tabGet: async (_id, tab) => {
+      if (failLookup) throw new Error("tabs service unavailable");
+      return tab;
+    },
+  });
+  const writer = await import(`../extension/ops.js?restore-tab-writer=${Date.now()}`);
+  await writer.runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
+  failLookup = true;
+  const tabFailure = await import(`../extension/ops.js?restore-tab-failure=${Date.now()}`);
+  await assert.rejects(
+    tabFailure.restoreTabsFromSession(),
+    (error) => error instanceof RelayOpError
+      && error.failure === "browser_unavailable"
+      && /verify restored tab 17/.test(error.message),
+  );
+});
+
 test("a partial session close keeps the refused live tab for retry", async () => {
   const removed = [];
   let refuseSecond = true;
@@ -374,6 +499,69 @@ test("a partial session close keeps the refused live tab for retry", async () =>
   const retried = await runOp("close", { session: "s1" }, 1_000);
   assert.equal(retried.closed, true);
   assert.deepEqual(removed, [17, 18]);
+});
+
+test("an indeterminate remove failure retains the tab for close retry", async () => {
+  const removed = [];
+  let removeAttempts = 0;
+  let verificationFailure = false;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    tabGet: async (_id, tab) => {
+      if (verificationFailure) {
+        verificationFailure = false;
+        throw new Error("tabs service unavailable");
+      }
+      return tab;
+    },
+    tabRemove: async (id) => {
+      removeAttempts += 1;
+      if (removeAttempts === 1) {
+        verificationFailure = true;
+        throw new Error("Chromium refused the close");
+      }
+      removed.push(id);
+    },
+  });
+  const { runOp } = await import(`../extension/ops.js?indeterminate-close=${Date.now()}`);
+  await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
+
+  await assert.rejects(
+    runOp("close", { session: "s1" }, 1_000),
+    (error) => error instanceof RelayOpError
+      && error.failure === "browser_unavailable"
+      && /could not be verified/.test(error.message),
+  );
+  const retried = await runOp("close", { session: "s1" }, 1_000);
+  assert.equal(retried.closed, true);
+  assert.equal(removeAttempts, 2);
+  assert.deepEqual(removed, [17]);
+});
+
+test("the exact no-such-tab result authoritatively completes a failed close", async () => {
+  let removeAttempts = 0;
+  let missing = false;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    tabGet: async (id, tab) => {
+      if (missing) throw new Error(`No tab with id: ${id}.`);
+      return tab;
+    },
+    tabRemove: async () => {
+      removeAttempts += 1;
+      missing = true;
+      throw new Error("remove response was lost");
+    },
+  });
+  const { runOp } = await import(`../extension/ops.js?authoritative-close=${Date.now()}`);
+  await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
+
+  const closed = await runOp("close", { session: "s1" }, 1_000);
+  assert.equal(closed.closed, false);
+  assert.equal(removeAttempts, 1);
+  const again = await runOp("close", { session: "s1" }, 1_000);
+  assert.equal(again.closed, false);
+  assert.equal(removeAttempts, 1);
 });
 
 test("find clamps relay-provided limits before evaluating page code", async () => {

@@ -140,6 +140,39 @@ test("connect is single-flight while settings and session restoration await", as
   assert.deepEqual(sockets, ["ws://127.0.0.1:7717/relay"]);
 });
 
+test("an indeterminate ownership restore fails closed before dialing", async () => {
+  const reconnects = [];
+  const sockets = [];
+  globalThis.chrome = chromeMock({
+    loadSettings: async () => ({ port: 7717, token: "paired", enabled: true }),
+    restoreSession: async () => { throw new Error("session storage unavailable"); },
+  });
+  globalThis.setTimeout = (callback) => {
+    reconnects.push(callback);
+    return reconnects.length;
+  };
+  globalThis.WebSocket = class FakeWebSocket {
+    constructor(url) {
+      sockets.push(url);
+    }
+  };
+
+  await import(`../extension/background.js?restore-failure=${Date.now()}`);
+  await settle();
+  assert.deepEqual(sockets, []);
+  assert.equal(reconnects.length, 1);
+
+  let status;
+  chrome.runtime.onMessage.emit(
+    { type: "ghost-relay-status" },
+    { id: chrome.runtime.id, url: chrome.runtime.getURL("popup.html") },
+    (value) => { status = value; },
+  );
+  await settle();
+  assert.equal(status.connected, false);
+  assert.match(status.lastError, /could not restore browser ownership.*storage unavailable/i);
+});
+
 test("a failed dial releases the latch and reconnects once", async () => {
   let constructions = 0;
   const reconnects = [];
@@ -432,7 +465,9 @@ test("a late operation result cannot cross into a replacement socket", async () 
       title: "Example",
     }],
     loadSettings: async () => stored,
-    restoreSession: async () => ({ ghostTabs: { tabs: [17] } }),
+    restoreSession: async () => ({
+      ghostTabs: { version: 1, tabs: [17], sessions: [["socket-session", [17]]] },
+    }),
     tabApi: {
       get: async () => {
         tabReads += 1;
