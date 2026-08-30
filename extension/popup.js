@@ -3,11 +3,9 @@
  * matters — a switch that stops the ghost driving this browser, immediately,
  * without unpairing anything or hunting for the daemon.
  *
- * It holds no state of its own. Settings live in `chrome.storage.local` (the
- * service worker watches it and re-dials on change) and live status is asked for
- * over `chrome.runtime.sendMessage`, because a popup and a service worker are
- * different documents with different lifetimes and sharing a variable between
- * them is how you get a status light that lies.
+ * It holds no state of its own. The service worker owns settings durability and
+ * live status; the popup reaches both over `chrome.runtime.sendMessage`, because
+ * this short-lived document cannot arbitrate writes that may outlive it.
  */
 const dot = document.getElementById("dot");
 const statusText = document.getElementById("statusText");
@@ -26,12 +24,6 @@ let settingsSnapshot = { ...DEFAULT_SETTINGS };
 let refreshInFlight = null;
 let mutationInFlight = null;
 let savedTimer = null;
-let settingsMutationRevision = 0;
-let settingsRepairInFlight = null;
-const settingsRepairKeys = new Set();
-const latestSettings = new Map(
-  Object.entries(DEFAULT_SETTINGS).map(([key, value]) => [key, { revision: 0, value }]),
-);
 
 function withDeadline(promise, message) {
   const signal = AbortSignal.timeout(POPUP_API_TIMEOUT_MS);
@@ -49,68 +41,6 @@ function withDeadline(promise, message) {
       },
     );
   });
-}
-
-function normalizeSettings(value = {}) {
-  return {
-    port: Number(value.port) || DEFAULT_SETTINGS.port,
-    token: typeof value.token === "string" ? value.token : "",
-    enabled: value.enabled !== false,
-  };
-}
-
-function queueSettingsRepair(keys) {
-  for (const key of keys) settingsRepairKeys.add(key);
-  void startSettingsRepair();
-}
-
-function persistSettingsPatch(patch, revisions) {
-  const raw = chrome.storage.local.set(patch);
-  void raw.then(
-    () => {
-      const stale = Object.keys(patch).filter(
-        (key) => latestSettings.get(key)?.revision !== revisions.get(key),
-      );
-      if (stale.length > 0) queueSettingsRepair(stale);
-    },
-    () => {},
-  );
-  return withDeadline(raw, "Chromium did not save the relay settings in time.");
-}
-
-function startSettingsRepair() {
-  if (settingsRepairInFlight !== null || settingsRepairKeys.size === 0) {
-    return settingsRepairInFlight ?? Promise.resolve();
-  }
-  const keys = [...settingsRepairKeys];
-  settingsRepairKeys.clear();
-  const patch = {};
-  const revisions = new Map();
-  for (const key of keys) {
-    const latest = latestSettings.get(key);
-    if (!latest) continue;
-    patch[key] = latest.value;
-    revisions.set(key, latest.revision);
-  }
-  const attempt = persistSettingsPatch(patch, revisions)
-    .catch(() => {
-      for (const key of keys) settingsRepairKeys.add(key);
-    })
-    .finally(() => {
-      if (settingsRepairInFlight === attempt) settingsRepairInFlight = null;
-    });
-  settingsRepairInFlight = attempt;
-  return attempt;
-}
-
-function saveSettingsPatch(patch) {
-  settingsMutationRevision += 1;
-  const revisions = new Map();
-  for (const [key, value] of Object.entries(patch)) {
-    latestSettings.set(key, { revision: settingsMutationRevision, value });
-    revisions.set(key, settingsMutationRevision);
-  }
-  return persistSettingsPatch(patch, revisions);
 }
 
 function render(status) {
@@ -165,32 +95,26 @@ function fallbackStatus(lastError = "") {
 }
 
 async function refreshNow() {
-  let settings;
-  try {
-    settings = normalizeSettings(await withDeadline(
-      chrome.storage.local.get(DEFAULT_SETTINGS),
-      "Chromium did not return the relay settings in time.",
-    ));
-    settingsSnapshot = settings;
-  } catch (error) {
-    render(fallbackStatus(`Could not read relay settings: ${error?.message ?? error}`));
-    return;
-  }
-  if (document.activeElement !== tokenInput) tokenInput.value = settings.token;
-  if (document.activeElement !== portInput) portInput.value = settings.port;
-
   let status;
   try {
     status = await withDeadline(
       chrome.runtime.sendMessage({ type: "ghost-relay-status" }),
       "The relay worker did not answer status in time.",
     );
-  } catch {
+  } catch (error) {
     // The worker is asleep; sending the message wakes it, so the next tick
-    // answers. Show what storage knows in the meantime.
-    status = null;
+    // answers. Keep the last complete settings snapshot in the meantime.
+    render(fallbackStatus(error?.message ?? String(error)));
+    return;
   }
-  render(status ?? fallbackStatus());
+  settingsSnapshot = {
+    port: Number(status.port) || DEFAULT_SETTINGS.port,
+    token: typeof status.token === "string" ? status.token : "",
+    enabled: status.enabled !== false,
+  };
+  if (document.activeElement !== tokenInput) tokenInput.value = settingsSnapshot.token;
+  if (document.activeElement !== portInput) portInput.value = settingsSnapshot.port;
+  render(status);
 }
 
 function refreshSingleFlight() {
@@ -203,8 +127,18 @@ function refreshSingleFlight() {
 }
 
 function refresh() {
-  if (settingsRepairKeys.size > 0) void startSettingsRepair();
   return mutationInFlight ?? refreshSingleFlight();
+}
+
+async function updateSettings(settings) {
+  const response = await withDeadline(
+    chrome.runtime.sendMessage({ type: "ghost-relay-settings-update", settings }),
+    "The relay worker did not save the settings in time.",
+  );
+  if (response?.ok !== true) {
+    throw new Error(response?.error || "The relay worker refused the settings update.");
+  }
+  settingsSnapshot = response.settings;
 }
 
 function showMutationError(error) {
@@ -242,19 +176,12 @@ saveButton.addEventListener("click", () => void mutateSettings(async () => {
     token: tokenInput.value.trim(),
     port: Number(portInput.value) || DEFAULT_SETTINGS.port,
   };
-  await saveSettingsPatch(next);
-  settingsSnapshot = { ...settingsSnapshot, ...next };
+  await updateSettings(next);
   showSaved();
 }));
 
 toggleButton.addEventListener("click", () => void mutateSettings(async () => {
-  const stored = await withDeadline(
-    chrome.storage.local.get({ enabled: true }),
-    "Chromium did not return the relay setting in time.",
-  );
-  const enabled = stored.enabled === false;
-  await saveSettingsPatch({ enabled });
-  settingsSnapshot = { ...settingsSnapshot, enabled };
+  await updateSettings({ enabled: !settingsSnapshot.enabled });
 }));
 
 void refresh();

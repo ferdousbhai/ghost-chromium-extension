@@ -6,6 +6,7 @@ import { RelayOpError } from "../extension/protocol.js";
 const originalChrome = globalThis.chrome;
 const INCARNATION_A = "11111111-1111-4111-8111-111111111111";
 const INCARNATION_B = "22222222-2222-4222-8222-222222222222";
+const BROWSER_SESSION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 afterEach(() => {
   if (originalChrome === undefined) delete globalThis.chrome;
@@ -544,6 +545,54 @@ test("a worker restart restores a durably published session claim", async () => 
   assert.deepEqual(removed, [17]);
 });
 
+test("a Chromium restart never adopts a reused tab id from the prior browser session", async () => {
+  const oldSnapshot = {
+    version: 2,
+    tabs: [17],
+    sessions: [["old-browser", [17]]],
+    retired: [],
+  };
+  const storedLocal = {
+    ghostOwnershipPoison: { version: 1, claims: [["old-browser", 17]] },
+    ghostOwnershipFence: {
+      version: 2,
+      browserSession: BROWSER_SESSION,
+      revision: 9,
+      snapshot: oldSnapshot,
+    },
+  };
+  const storedSession = {
+    ghostTabs: null,
+    ghostTabsRevision: null,
+    ghostBrowserSession: null,
+  };
+  let tabReads = 0;
+  globalThis.chrome = chromeMock({
+    persistFence: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
+    persistSession: async (value) => { Object.assign(storedSession, structuredClone(value)); },
+    removeLocal: async () => { storedLocal.ghostOwnershipPoison = null; },
+    restoreLocal: async () => structuredClone(storedLocal),
+    restoreSession: async () => structuredClone(storedSession),
+    tabGet: async () => {
+      tabReads += 1;
+      return { id: 17, windowId: 8, status: "complete", active: true };
+    },
+  });
+  const restarted = await import(`../extension/ops.js?browser-session-restart=${Date.now()}`);
+
+  await restarted.restoreTabsFromSession();
+  assert.equal(tabReads, 0, "the unrelated reused id is never queried or admitted");
+  assert.notEqual(storedSession.ghostBrowserSession, BROWSER_SESSION);
+  assert.deepEqual(storedSession.ghostTabs, {
+    version: 2,
+    tabs: [],
+    sessions: [],
+    retired: [],
+  });
+  assert.deepEqual((await restarted.runOp("status", {}, 1_000)).tabs, []);
+  assert.equal(storedLocal.ghostOwnershipPoison, null);
+});
+
 test("a new daemon tombstones a pending old-daemon create before admitting work", async () => {
   const created = deferred();
   const removed = [];
@@ -843,6 +892,7 @@ test("a failed late ownership repair stays fenced across a fresh worker module",
     storedLocal.ghostOwnershipFence.revision > storedSession.ghostTabsRevision,
     "the durable fence remains newer than the stale session snapshot",
   );
+  const activeBrowserSession = storedSession.ghostBrowserSession;
   await assert.rejects(
     ops.runOp("open", { session: "other-owner", url: "https://other.example/" }, 1_000),
     (error) => error instanceof RelayOpError
@@ -851,6 +901,7 @@ test("a failed late ownership repair stays fenced across a fresh worker module",
 
   const restarted = await import(`../extension/ops.js?ownership-fence-restart=${Date.now()}`);
   await restarted.restoreTabsFromSession();
+  assert.equal(storedSession.ghostBrowserSession, activeBrowserSession);
   assert.equal(writes, 5, "a fresh worker republishes the newer durable fence");
   assert.deepEqual(storedSession.ghostTabs, {
     version: 2,
@@ -907,7 +958,11 @@ test("a timed-out poison publication releases close and repairs its late result"
 });
 
 test("poison-only live ownership is reverified and promoted on a repeated restore", async () => {
-  const storedSession = { ghostTabs: null, ghostTabsRevision: null };
+  const storedSession = {
+    ghostTabs: null,
+    ghostTabsRevision: null,
+    ghostBrowserSession: BROWSER_SESSION,
+  };
   const storedLocal = {
     ghostOwnershipPoison: { version: 1, claims: [["poison-owner", 17]] },
     ghostOwnershipFence: null,
@@ -932,7 +987,8 @@ test("poison-only live ownership is reverified and promoted on a repeated restor
     (error) => error instanceof RelayOpError
       && /ownership of tab 17 is indeterminate.*temporarily unavailable/i.test(error.message),
   );
-  assert.deepEqual(storedSession, { ghostTabs: null, ghostTabsRevision: null });
+  assert.equal(storedSession.ghostTabs, null);
+  assert.equal(storedSession.ghostTabsRevision, null);
   assert.notEqual(storedLocal.ghostOwnershipPoison, null);
 
   await ops.restoreTabsFromSession();
@@ -966,7 +1022,7 @@ test("a rejected claim publication closes the unowned new tab", async () => {
 test("double claim persistence failure stays poisoned across a worker restart", async () => {
   let failPersistence = true;
   let failRemoval = true;
-  let storedSession = { ghostTabs: null };
+  let storedSession = { ghostTabs: null, ghostBrowserSession: BROWSER_SESSION };
   let storedLocal = { ghostOwnershipPoison: null };
   let persistenceAttempts = 0;
   globalThis.chrome = chromeMock({
@@ -1112,11 +1168,17 @@ test("restore rejects equal ownership revisions with different snapshots", async
   globalThis.chrome = chromeMock({
     restoreLocal: async () => ({
       ghostOwnershipPoison: null,
-      ghostOwnershipFence: { version: 1, revision: 7, snapshot: fenceSnapshot },
+      ghostOwnershipFence: {
+        version: 2,
+        browserSession: BROWSER_SESSION,
+        revision: 7,
+        snapshot: fenceSnapshot,
+      },
     }),
     restoreSession: async () => ({
       ghostTabs: sessionSnapshot,
       ghostTabsRevision: 7,
+      ghostBrowserSession: BROWSER_SESSION,
     }),
   });
   const restoring = await import(`../extension/ops.js?restore-fence-conflict=${Date.now()}`);
@@ -1135,6 +1197,7 @@ test("a timed-out restored tab lookup releases ownership for a later retry", asy
   globalThis.chrome = chromeMock({
     attach: async () => {},
     restoreSession: async () => ({
+      ghostBrowserSession: BROWSER_SESSION,
       ghostTabs: {
         version: 2,
         tabs: [17],
@@ -1359,6 +1422,7 @@ test("retired UUID persistence is garbage-collected after all create leases sett
     attach: async () => {},
     persistSession: async (value) => { storedSession = structuredClone(value); },
     restoreSession: async () => ({
+      ghostBrowserSession: BROWSER_SESSION,
       ghostTabs: { version: 2, tabs: [], sessions: [], retired },
     }),
   });

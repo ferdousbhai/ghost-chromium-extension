@@ -10,6 +10,7 @@ const originalSetInterval = globalThis.setInterval;
 const originalClearInterval = globalThis.clearInterval;
 const INCARNATION_A = "11111111-1111-4111-8111-111111111111";
 const INCARNATION_B = "22222222-2222-4222-8222-222222222222";
+const BROWSER_SESSION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 afterEach(() => {
   if (originalChrome === undefined) delete globalThis.chrome;
@@ -46,6 +47,8 @@ function chromeMock({
   badges = [],
   debuggerTargets = async () => [],
   loadSettings,
+  setBadgeColor = async () => {},
+  setBadgeText = async ({ text }) => badges.push(text),
   persistFence = async () => {},
   persistLocal = async () => {},
   removeLocal = async () => {},
@@ -57,8 +60,8 @@ function chromeMock({
 }) {
   return {
     action: {
-      setBadgeText: async ({ text }) => badges.push(text),
-      setBadgeBackgroundColor: async () => {},
+      setBadgeText,
+      setBadgeBackgroundColor: setBadgeColor,
     },
     alarms: {
       create() {},
@@ -317,6 +320,39 @@ test("a failed dial releases the latch and reconnects once", async () => {
   assert.equal(constructions, 2);
 });
 
+test("hung cosmetic badge I/O cannot pin unpaired alarm or settings recovery", async () => {
+  const never = deferred();
+  const sockets = [];
+  let settings = { port: 7717, token: "", enabled: true };
+  globalThis.chrome = chromeMock({
+    loadSettings: async () => settings,
+    setBadgeColor: () => never.promise,
+    setBadgeText: () => never.promise,
+  });
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor(url) {
+      this.readyState = FakeWebSocket.CONNECTING;
+      sockets.push(url);
+    }
+  };
+
+  await import(`../extension/background.js?badge-hang=${Date.now()}`);
+  await settle();
+  chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
+  await settle();
+  assert.deepEqual(sockets, []);
+
+  settings = { ...settings, token: "paired" };
+  chrome.storage.onChanged.emit({ token: { oldValue: "", newValue: "paired" } }, "local");
+  for (let attempt = 0; attempt < 20 && sockets.length === 0; attempt += 1) await settle();
+  assert.deepEqual(sockets, ["ws://127.0.0.1:7717/relay"]);
+  never.resolve();
+  await settle();
+});
+
 test("reconnect attempts share one cancelable timer and recover through an alarm", async () => {
   const timers = new Map();
   const sockets = [];
@@ -457,6 +493,7 @@ test("only this extension's popup can read live relay status", async () => {
   assert.deepEqual(status, {
     connected: false,
     paired: false,
+    token: "",
     enabled: true,
     port: 7717,
     lastError: "Not paired yet — run `ghostd relay-token` and paste the token below.",
@@ -903,6 +940,7 @@ test("a late operation result cannot cross into a replacement socket", async () 
     loadSettings: async () => stored,
     restoreIncarnation: async () => ({ ghostDaemonIncarnation: INCARNATION_A }),
     restoreSession: async () => ({
+      ghostBrowserSession: BROWSER_SESSION,
       ghostTabs: {
         version: 2,
         tabs: [17],

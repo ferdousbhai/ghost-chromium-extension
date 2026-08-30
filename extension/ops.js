@@ -167,14 +167,16 @@ const attachBarriers = new Map();
 
 const SESSION_KEY = "ghostTabs";
 const SESSION_REVISION_KEY = "ghostTabsRevision";
+const BROWSER_SESSION_KEY = "ghostBrowserSession";
 const POISON_KEY = "ghostOwnershipPoison";
 const OWNERSHIP_FENCE_KEY = "ghostOwnershipFence";
 const INCARNATION_KEY = "ghostDaemonIncarnation";
 const SESSION_STATE_VERSION = 2;
-const OWNERSHIP_FENCE_VERSION = 1;
+const OWNERSHIP_FENCE_VERSION = 2;
 const INCARNATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 let ownershipTail = Promise.resolve();
 let ownershipPublicationRevision = 0;
+let browserSessionId = null;
 const ownershipPoison = new Map();
 
 function serializeOwnership(work) {
@@ -278,8 +280,10 @@ async function boundedStorageMutation(promise, what, repair) {
 }
 
 async function setOwnershipSnapshot(snapshot) {
+  browserSessionId ??= crypto.randomUUID();
   const publication = {
     version: OWNERSHIP_FENCE_VERSION,
+    browserSession: browserSessionId,
     revision: ownershipPublicationRevision + 1,
     snapshot,
   };
@@ -296,6 +300,7 @@ async function setOwnershipSnapshot(snapshot) {
     chrome.storage.session.set({
       [SESSION_KEY]: snapshot,
       [SESSION_REVISION_KEY]: publication.revision,
+      [BROWSER_SESSION_KEY]: browserSessionId,
     }),
     "saving browser ownership",
     () => {
@@ -431,14 +436,16 @@ function validStoredOwnership(saved) {
 function parseOwnershipPublication(value) {
   if (value === null || value === undefined) return null;
   if (typeof value !== "object" || Array.isArray(value)
-      || Object.keys(value).sort().join(",") !== "revision,snapshot,version"
+      || Object.keys(value).sort().join(",") !== "browserSession,revision,snapshot,version"
       || value.version !== OWNERSHIP_FENCE_VERSION
+      || typeof value.browserSession !== "string"
+      || !INCARNATION_PATTERN.test(value.browserSession)
       || !Number.isSafeInteger(value.revision) || value.revision < 1
       || !validStoredOwnership(value.snapshot)) return undefined;
   return value;
 }
 
-function selectStoredOwnership(stored, fenced) {
+function selectStoredOwnership(stored, fenced, currentBrowserSession) {
   const snapshot = stored[SESSION_KEY];
   const rawRevision = stored[SESSION_REVISION_KEY];
   let sessionPublication = null;
@@ -457,13 +464,16 @@ function selectStoredOwnership(stored, fenced) {
 
   const fencePublication = parseOwnershipPublication(fenced[OWNERSHIP_FENCE_KEY]);
   if (fencePublication === undefined) return undefined;
-  if (sessionPublication === null) return fencePublication;
-  if (fencePublication === null) return sessionPublication;
-  if (sessionPublication.revision === fencePublication.revision
-      && !sameSnapshot(sessionPublication.snapshot, fencePublication.snapshot)) return undefined;
-  return sessionPublication.revision > fencePublication.revision
+  const currentFence = fencePublication?.browserSession === currentBrowserSession
+    ? fencePublication
+    : null;
+  if (sessionPublication === null) return currentFence;
+  if (currentFence === null) return sessionPublication;
+  if (sessionPublication.revision === currentFence.revision
+      && !sameSnapshot(sessionPublication.snapshot, currentFence.snapshot)) return undefined;
+  return sessionPublication.revision > currentFence.revision
     ? sessionPublication
-    : fencePublication;
+    : currentFence;
 }
 
 export function restoreTabsFromSession() {
@@ -482,6 +492,7 @@ export function restoreTabsFromSession() {
           chrome.storage.session.get({
             [SESSION_KEY]: null,
             [SESSION_REVISION_KEY]: null,
+            [BROWSER_SESSION_KEY]: null,
           }),
           RESTORE_TIMEOUT_MS,
           "restoring browser ownership",
@@ -501,7 +512,26 @@ export function restoreTabsFromSession() {
         `Could not restore browser ownership: ${error?.message ?? error}.`,
       );
     }
-    const publication = selectStoredOwnership(stored, local);
+    const rawBrowserSession = stored[BROWSER_SESSION_KEY];
+    const freshBrowserSession = rawBrowserSession === null || rawBrowserSession === undefined;
+    if (!freshBrowserSession
+        && (typeof rawBrowserSession !== "string" || !INCARNATION_PATTERN.test(rawBrowserSession))) {
+      throw failed(
+        FAILURES.browserUnavailable,
+        "Stored browser-session identity is invalid; reload the Ghost extension.",
+      );
+    }
+    if (freshBrowserSession
+        && (stored[SESSION_KEY] !== null && stored[SESSION_KEY] !== undefined
+          || stored[SESSION_REVISION_KEY] !== null
+            && stored[SESSION_REVISION_KEY] !== undefined)) {
+      throw failed(
+        FAILURES.browserUnavailable,
+        "Stored browser ownership has no browser-session identity; reload the Ghost extension.",
+      );
+    }
+    browserSessionId = freshBrowserSession ? crypto.randomUUID() : rawBrowserSession;
+    const publication = selectStoredOwnership(stored, local, browserSessionId);
     if (publication === undefined) {
       throw failed(
         FAILURES.browserUnavailable,
@@ -522,6 +552,12 @@ export function restoreTabsFromSession() {
           FAILURES.browserUnavailable,
           "Stored browser ownership recovery is invalid; reload the Ghost extension.",
         );
+      }
+      if (freshBrowserSession) {
+        ownershipPoison.clear();
+        for (const [tab, session] of poisonClaims) ownershipPoison.set(tab, session);
+        await persistOwnership();
+        return;
       }
       let verificationError = null;
       for (const [tab, session] of poisonClaims) {
@@ -560,6 +596,10 @@ export function restoreTabsFromSession() {
             + `${verificationError?.message ?? verificationError}.`,
         );
       }
+    }
+    if (freshBrowserSession) {
+      await persistOwnership();
+      return;
     }
     const applyGeneration = ownershipGeneration;
     if (saved === null) {

@@ -21,8 +21,9 @@
  * is where these were learned the expensive way.
  *
  * **Pairing is a token, typed once.** The popup asks for the string
- * `ghostd relay-token` prints, keeps it in `chrome.storage.local`, and sends it in
- * the one field a browser `WebSocket` lets you set: the subprotocol list.
+ * `ghostd relay-token` prints; this worker keeps it in `chrome.storage.local`
+ * and sends it in the one field a browser `WebSocket` lets you set: the
+ * subprotocol list.
  */
 import { PROTOCOL_VERSION, RELAY_PATH, SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX, toErrorFrame } from "./protocol.js";
 import {
@@ -42,7 +43,11 @@ const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 10_000;
 const PROTOCOL_RETRY_MS = 60_000;
 const SETTINGS_TIMEOUT_MS = 1_000;
+const SETTINGS_FENCE_KEY = "ghostRelaySettingsFence";
+const SETTINGS_FENCE_VERSION = 1;
 const KEEPALIVE_ALARM = "ghost-relay-keepalive";
+const settingsStorage = chrome.storage.local;
+const actionApi = chrome.action;
 
 let ws = null;
 /**
@@ -61,6 +66,11 @@ let connectEpoch = 0;
 let settingsGeneration = 0;
 let settingsCache = null;
 let settingsInFlight = null;
+let settingsRevision = 0;
+let settingsDesired = null;
+let settingsRepairPending = false;
+let settingsRepairInFlight = null;
+let settingsMutationTail = Promise.resolve();
 let reconnectDelay = RECONNECT_MIN_MS;
 let reconnectTimer = null;
 let reconnectTimerIncompatible = false;
@@ -88,6 +98,77 @@ function normalizeSettings(stored = {}) {
   };
 }
 
+function sameSettings(left, right) {
+  return left.port === right.port
+    && left.token === right.token
+    && left.enabled === right.enabled;
+}
+
+function parseSettingsFence(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "revision,settings,version"
+      || value.version !== SETTINGS_FENCE_VERSION
+      || !Number.isSafeInteger(value.revision) || value.revision < 1
+      || typeof value.settings !== "object" || value.settings === null
+      || Array.isArray(value.settings)
+      || Object.keys(value.settings).sort().join(",") !== "enabled,port,token"
+      || !Number.isSafeInteger(value.settings.port)
+      || value.settings.port < 1 || value.settings.port > 65_535
+      || typeof value.settings.token !== "string"
+      || typeof value.settings.enabled !== "boolean") return undefined;
+  return value;
+}
+
+function scheduleSettingsRepair() {
+  settingsRepairPending = true;
+  if (settingsRepairInFlight !== null || settingsDesired === null) return;
+  const revision = settingsRevision;
+  const desired = settingsDesired;
+  const publication = {
+    version: SETTINGS_FENCE_VERSION,
+    revision,
+    settings: desired,
+  };
+  settingsRepairPending = false;
+  const attempt = (async () => {
+    const fenceWrite = settingsStorage.set({ [SETTINGS_FENCE_KEY]: publication });
+    observeSettingsWrite(fenceWrite, revision);
+    await withPreparationTimeout(
+      fenceWrite,
+      SETTINGS_TIMEOUT_MS,
+      "Chromium did not repair the relay settings fence in time.",
+    );
+    const rawWrite = settingsStorage.set(desired);
+    observeSettingsWrite(rawWrite, revision);
+    await withPreparationTimeout(
+      rawWrite,
+      SETTINGS_TIMEOUT_MS,
+      "Chromium did not repair the relay settings in time.",
+    );
+  })()
+    .catch(() => {
+      settingsRepairPending = true;
+    })
+    .finally(() => {
+      if (settingsRepairInFlight === attempt) settingsRepairInFlight = null;
+      if (revision !== settingsRevision) {
+        settingsRepairPending = true;
+        queueMicrotask(scheduleSettingsRepair);
+      }
+    });
+  settingsRepairInFlight = attempt;
+}
+
+function observeSettingsWrite(raw, revision) {
+  void raw.then(
+    () => {
+      if (revision !== settingsRevision) scheduleSettingsRepair();
+    },
+    () => {},
+  );
+}
+
 function withPreparationTimeout(promise, timeoutMs, message) {
   const signal = AbortSignal.timeout(timeoutMs);
   return new Promise((resolve, reject) => {
@@ -112,12 +193,32 @@ function loadSettings() {
 
   const generation = settingsGeneration;
   const attempt = withPreparationTimeout(
-    chrome.storage.local.get({ port: DEFAULT_PORT, token: "", enabled: true }),
+    settingsStorage.get({
+      port: DEFAULT_PORT,
+      token: "",
+      enabled: true,
+      [SETTINGS_FENCE_KEY]: null,
+    }),
     SETTINGS_TIMEOUT_MS,
     "Chromium did not return the relay settings in time.",
   )
     .then(
-      (stored) => ({ settings: normalizeSettings(stored), cacheable: true }),
+      (stored) => {
+        const fence = parseSettingsFence(stored[SETTINGS_FENCE_KEY]);
+        if (fence === undefined) {
+          throw new Error("Stored relay settings recovery is invalid; reload the extension.");
+        }
+        const raw = normalizeSettings(stored);
+        const settings = fence?.settings ?? raw;
+        if (fence !== null) {
+          settingsRevision = Math.max(settingsRevision, fence.revision);
+          settingsDesired = settings;
+          if (!sameSettings(raw, settings)) scheduleSettingsRepair();
+        } else {
+          settingsDesired ??= settings;
+        }
+        return { settings: { ...settings, unavailable: null }, cacheable: true };
+      },
       (error) => ({
         settings: {
           ...normalizeSettings(),
@@ -141,24 +242,95 @@ function loadSettings() {
   return attempt;
 }
 
+function serializeSettingsMutation(work) {
+  const task = settingsMutationTail.then(work, work);
+  settingsMutationTail = task.then(() => undefined, () => undefined);
+  return task;
+}
+
+function updateRelaySettings(patch) {
+  return serializeSettingsMutation(async () => {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new Error("The relay settings update must be an object.");
+    }
+    const keys = Object.keys(patch);
+    if (keys.length === 0 || keys.some((key) => !["port", "token", "enabled"].includes(key))) {
+      throw new Error("The relay settings update contains an unsupported field.");
+    }
+    if (Object.hasOwn(patch, "port")
+        && (!Number.isSafeInteger(patch.port) || patch.port < 1 || patch.port > 65_535)) {
+      throw new Error("The relay port must be an integer from 1 through 65535.");
+    }
+    if (Object.hasOwn(patch, "token") && typeof patch.token !== "string") {
+      throw new Error("The relay token must be a string.");
+    }
+    if (Object.hasOwn(patch, "enabled") && typeof patch.enabled !== "boolean") {
+      throw new Error("The relay enabled setting must be a boolean.");
+    }
+
+    const current = await loadSettings();
+    if (current.unavailable !== null) throw new Error(current.unavailable);
+    const next = {
+      port: patch.port ?? current.port,
+      token: patch.token?.trim() ?? current.token,
+      enabled: patch.enabled ?? current.enabled,
+    };
+    const publication = {
+      version: SETTINGS_FENCE_VERSION,
+      revision: settingsRevision + 1,
+      settings: next,
+    };
+    settingsRevision = publication.revision;
+    settingsDesired = next;
+    settingsCache = { ...next, unavailable: null };
+    const fenceWrite = settingsStorage.set({ [SETTINGS_FENCE_KEY]: publication });
+    observeSettingsWrite(fenceWrite, publication.revision);
+    try {
+      await withPreparationTimeout(
+        fenceWrite,
+        SETTINGS_TIMEOUT_MS,
+        "Chromium did not fence the relay settings in time.",
+      );
+    } catch (error) {
+      scheduleSettingsRepair();
+      throw error;
+    }
+    const raw = settingsStorage.set(next);
+    observeSettingsWrite(raw, publication.revision);
+    try {
+      await withPreparationTimeout(
+        raw,
+        SETTINGS_TIMEOUT_MS,
+        "Chromium did not save the relay settings in time.",
+      );
+    } catch (error) {
+      scheduleSettingsRepair();
+      throw error;
+    }
+    return next;
+  });
+}
+
 function invalidateSettings() {
   settingsGeneration += 1;
   settingsCache = null;
   settingsInFlight = null;
 }
 
-async function setBadge(status) {
+function setBadge(status) {
   const look = {
     on: { text: "on", color: "#1a7f37" },
     paused: { text: "||", color: "#9a6700" },
     off: { text: "off", color: "#8b8b8b" },
   }[status];
-  try {
-    await chrome.action.setBadgeText({ text: look.text });
-    await chrome.action.setBadgeBackgroundColor({ color: look.color });
-  } catch {
-    // Cosmetic.
-  }
+  // Cosmetic calls never own connection progress: Chrome may leave either
+  // Promise pending while the action UI is rebuilding.
+  void Promise.resolve()
+    .then(() => actionApi.setBadgeText({ text: look.text }))
+    .catch(() => {});
+  void Promise.resolve()
+    .then(() => actionApi.setBadgeBackgroundColor({ color: look.color }))
+    .catch(() => {});
 }
 
 function sendTo(socket, frame) {
@@ -417,6 +589,7 @@ installOpsListeners(notice);
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === KEEPALIVE_ALARM) {
+    if (settingsRepairPending) scheduleSettingsRepair();
     void repairBrowserPersistence().catch(() => {});
     void sweepRetiredTabs().catch(() => {});
     void connect();
@@ -468,8 +641,18 @@ function isPopupSender(sender) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
-  if (message?.type !== "ghost-relay-status") return undefined;
   if (!isPopupSender(sender)) return undefined;
+  if (message?.type === "ghost-relay-settings-update") {
+    void updateRelaySettings(message.settings).then(
+      (settings) => respond({ ok: true, settings }),
+      (error) => respond({
+        ok: false,
+        error: error?.message ?? String(error),
+      }),
+    );
+    return true;
+  }
+  if (message?.type !== "ghost-relay-status") return undefined;
   void (async () => {
     const settings = await loadSettings();
     let tabs = [];
@@ -482,6 +665,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     respond({
       connected: ws !== null && welcomedSocket === ws && ws.readyState === WebSocket.OPEN,
       paired: settings.token !== "",
+      token: settings.token,
       enabled: settings.enabled,
       port: settings.port,
       lastError,

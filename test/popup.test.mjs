@@ -75,25 +75,28 @@ async function settle() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-test("interval refresh is bounded and single-flight when storage hangs", async () => {
-  const firstRead = deferred();
+test("interval refresh is bounded and single-flight when the worker hangs", async () => {
+  const firstStatus = deferred();
   const intervals = [];
-  let reads = 0;
+  let requests = 0;
   const document = popupDocument();
   globalThis.document = document;
   globalThis.chrome = {
-    storage: {
-      local: {
-        get: () => {
-          reads += 1;
-          return reads === 1
-            ? firstRead.promise
-            : Promise.resolve({ port: 7717, token: "paired", enabled: true });
-        },
-        set: async () => {},
+    runtime: {
+      sendMessage: () => {
+        requests += 1;
+        return requests === 1
+          ? firstStatus.promise
+          : Promise.resolve({
+            connected: false,
+            paired: true,
+            token: "paired",
+            port: 7717,
+            enabled: true,
+            tabs: [],
+          });
       },
     },
-    runtime: { sendMessage: async () => ({ connected: false, paired: true, tabs: [] }) },
   };
   globalThis.setInterval = (callback) => {
     intervals.push(callback);
@@ -106,41 +109,44 @@ test("interval refresh is bounded and single-flight when storage hangs", async (
   intervals[0]();
   intervals[0]();
   await settle();
-  assert.equal(reads, 1, "timer ticks coalesce behind the in-flight refresh");
+  assert.equal(requests, 1, "timer ticks coalesce behind the in-flight refresh");
 
   await new Promise((resolve) => setTimeout(resolve, 1_100));
   await settle();
-  assert.match(document.elements.detail.textContent, /did not return the relay settings in time/i);
+  assert.match(document.elements.detail.textContent, /did not answer status in time/i);
 
   intervals[0]();
   await settle();
-  assert.equal(reads, 2, "the next tick retries after the bounded failure");
-  firstRead.resolve({ port: 9999, token: "stale", enabled: true });
+  assert.equal(requests, 2, "the next tick retries after the bounded failure");
+  firstStatus.resolve({ connected: false, paired: false, token: "", tabs: [] });
 });
 
 test("save and toggle are bounded and never overlap", async () => {
-  const firstWrite = deferred();
-  const writes = [];
-  let settingReads = 0;
+  const firstUpdate = deferred();
+  const updates = [];
   const document = popupDocument();
   globalThis.document = document;
   globalThis.chrome = {
-    storage: {
-      local: {
-        get: async (defaults) => {
-          if (Object.hasOwn(defaults, "port")) {
-            settingReads += 1;
-            return { port: 7717, token: "paired", enabled: true };
-          }
-          return { enabled: true };
-        },
-        set: (value) => {
-          writes.push(value);
-          return writes.length === 1 ? firstWrite.promise : Promise.resolve();
-        },
+    runtime: {
+      sendMessage: async (message) => {
+        if (message.type === "ghost-relay-status") {
+          return {
+            connected: false,
+            paired: true,
+            token: "paired",
+            port: 7717,
+            enabled: true,
+            tabs: [],
+          };
+        }
+        updates.push(message.settings);
+        if (updates.length === 1) return firstUpdate.promise;
+        return {
+          ok: true,
+          settings: { port: 8828, token: "new-token", enabled: false },
+        };
       },
     },
-    runtime: { sendMessage: async () => ({ connected: false, paired: true, tabs: [] }) },
   };
   globalThis.setInterval = () => 1;
   globalThis.clearInterval = () => {};
@@ -153,7 +159,7 @@ test("save and toggle are bounded and never overlap", async () => {
   document.elements.save.emit("click");
   document.elements.toggle.emit("click");
   await settle();
-  assert.deepEqual(writes, [{ token: "new-token", port: 8828 }]);
+  assert.deepEqual(updates, [{ token: "new-token", port: 8828 }]);
   assert.equal(document.elements.save.disabled, true);
   assert.equal(document.elements.toggle.disabled, true);
 
@@ -161,57 +167,58 @@ test("save and toggle are bounded and never overlap", async () => {
   await settle();
   assert.equal(document.elements.save.disabled, false);
   assert.equal(document.elements.toggle.disabled, false);
-  assert.match(document.elements.detail.textContent, /did not save the relay settings in time/i);
+  assert.match(document.elements.detail.textContent, /did not save the settings in time/i);
 
-  firstWrite.resolve();
+  firstUpdate.resolve({ ok: false, error: "stale update finished late" });
   document.elements.toggle.emit("click");
-  for (let attempt = 0; attempt < 20 && writes.length < 2; attempt += 1) await settle();
-  assert.deepEqual(writes[1], { enabled: false });
-  assert.ok(settingReads >= 1);
+  for (let attempt = 0; attempt < 20 && updates.length < 2; attempt += 1) await settle();
+  assert.deepEqual(updates[1], { enabled: false });
 });
 
-test("a late timed-out save republishes the newest settings generation", async () => {
-  const firstWrite = deferred();
-  const writes = [];
-  const stored = { port: 7717, token: "paired", enabled: true };
+test("settings mutations are delegated to the durable worker boundary", async () => {
+  const messages = [];
   const document = popupDocument();
   globalThis.document = document;
   globalThis.chrome = {
     storage: {
       local: {
-        get: async (defaults) => Object.hasOwn(defaults, "port")
-          ? { ...stored }
-          : { enabled: stored.enabled },
-        set: async (value) => {
-          writes.push(structuredClone(value));
-          if (writes.length === 1) await firstWrite.promise;
-          Object.assign(stored, value);
-        },
+        get: async () => { throw new Error("the popup must not read settings storage"); },
+        set: async () => { throw new Error("the popup must not write settings storage"); },
       },
     },
-    runtime: { sendMessage: async () => ({ connected: false, paired: true, tabs: [] }) },
+    runtime: {
+      sendMessage: async (message) => {
+        messages.push(structuredClone(message));
+        if (message.type === "ghost-relay-status") {
+          return {
+            connected: false,
+            paired: true,
+            token: "paired",
+            port: 7717,
+            enabled: true,
+            tabs: [],
+          };
+        }
+        return {
+          ok: true,
+          settings: { port: 8222, token: "newest-token", enabled: true },
+        };
+      },
+    },
   };
   globalThis.setInterval = () => 1;
   globalThis.clearInterval = () => {};
 
   await import(`../extension/popup.js?late-save=${Date.now()}`);
   await settle();
-  document.elements.token.value = "first-token";
-  document.elements.port.value = "8111";
-  document.elements.save.emit("click");
-  await new Promise((resolve) => setTimeout(resolve, 1_100));
-  await settle();
-
   document.elements.token.value = "newest-token";
   document.elements.port.value = "8222";
   document.elements.save.emit("click");
-  for (let attempt = 0; attempt < 20 && writes.length < 2; attempt += 1) await settle();
-  assert.deepEqual(stored, { port: 8222, token: "newest-token", enabled: true });
-
-  firstWrite.resolve();
-  for (let attempt = 0; attempt < 20 && writes.length < 3; attempt += 1) await settle();
-  assert.deepEqual(writes[2], { port: 8222, token: "newest-token" });
-  assert.deepEqual(stored, { port: 8222, token: "newest-token", enabled: true });
+  for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) await settle();
+  assert.deepEqual(messages[1], {
+    type: "ghost-relay-settings-update",
+    settings: { token: "newest-token", port: 8222 },
+  });
 });
 
 test("a ghost tab without title or URL falls back to its tab id, including zero", async () => {

@@ -61,6 +61,11 @@ Click the extension, paste the token, **Save & connect**. It is kept in
 only after a compatible ghostd has answered the protocol handshake, `||` when
 that authenticated connection is paused, and `off` otherwise.
 
+The popup is disposable UI: the background worker serializes settings changes
+and stores a revisioned recovery copy before acknowledging them. A timed-out old
+Chromium write therefore cannot overwrite a newer choice after the popup closes.
+Badge updates are cosmetic and never block connection or alarm retries.
+
 The current relay protocol is 4. An older daemon or extension is refused
 before either side accepts browser work; update the older Ghost package. The
 extension probes again after a one-minute cool-down, or reload it from
@@ -154,6 +159,11 @@ alarm even after ghostd has rotated to a fresh browser owner id. Tombstones are
 discarded only once no late create handler can still produce a tab. Chrome
 settings and ownership storage calls are bounded as well, so one silent API call
 cannot pin the reconnect loop or extension popup indefinitely.
+
+Ownership recovery is scoped to Chromium's current browser session. An MV3
+worker restart recovers the same ghost-owned tabs, while a full Chromium restart
+mints a fresh identity and never adopts a reused numeric tab id from the prior
+browser process.
 
 Each ghostd process also announces a fresh incarnation in the protocol-4
 welcome. The extension retires claims left by an earlier crashed process before
