@@ -4,6 +4,8 @@ import { afterEach, test } from "node:test";
 import { RelayOpError } from "../extension/protocol.js";
 
 const originalChrome = globalThis.chrome;
+const INCARNATION_A = "11111111-1111-4111-8111-111111111111";
+const INCARNATION_B = "22222222-2222-4222-8222-222222222222";
 
 afterEach(() => {
   if (originalChrome === undefined) delete globalThis.chrome;
@@ -535,6 +537,101 @@ test("a worker restart restores a durably published session claim", async () => 
   const closed = await restarted.runOp("close", { session: "durable" }, 1_000);
   assert.equal(closed.closed, true);
   assert.deepEqual(removed, [17]);
+});
+
+test("a new daemon tombstones a pending old-daemon create before admitting work", async () => {
+  const created = deferred();
+  const removed = [];
+  let storedSession = { ghostTabs: null };
+  const storedLocal = {
+    ghostOwnershipPoison: null,
+    ghostDaemonIncarnation: INCARNATION_A,
+  };
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
+    persistSession: async (value) => { storedSession = structuredClone(value); },
+    restoreLocal: async (defaults) => Object.hasOwn(defaults, "ghostDaemonIncarnation")
+      ? { ghostDaemonIncarnation: storedLocal.ghostDaemonIncarnation }
+      : { ghostOwnershipPoison: storedLocal.ghostOwnershipPoison },
+    tabCreate: async ({ url }, tabs) => {
+      await created.promise;
+      const tab = { id: 17, windowId: 4, status: "complete", url, title: "Late tab" };
+      tabs.set(tab.id, tab);
+      return tab;
+    },
+    tabRemove: async (id) => { removed.push(id); },
+  });
+  const ops = await import(`../extension/ops.js?incarnation-create-lease=${Date.now()}`);
+
+  const opening = ops.runOp(
+    "open",
+    { session: "crashed-owner", url: "https://late.example/" },
+    5_000,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await ops.reconcileDaemonIncarnation(INCARNATION_B);
+  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
+  assert.deepEqual(storedSession.ghostTabs.retired, ["crashed-owner"]);
+
+  created.resolve();
+  await assert.rejects(
+    opening,
+    (error) => error instanceof RelayOpError && /session is closed/i.test(error.message),
+  );
+  for (let attempt = 0;
+    attempt < 20 && storedSession.ghostTabs.retired.length > 0;
+    attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(removed, [17]);
+  assert.deepEqual(storedSession, {
+    ghostTabs: { version: 2, tabs: [], sessions: [], retired: [] },
+  });
+});
+
+test("overlapping incarnation changes repair an out-of-order timed-out marker write", async () => {
+  const staleWrite = deferred();
+  const storedLocal = {
+    ghostOwnershipPoison: null,
+    ghostDaemonIncarnation: "33333333-3333-4333-8333-333333333333",
+  };
+  let writes = 0;
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistLocal: async (value) => {
+      writes += 1;
+      if (writes === 1) await staleWrite.promise;
+      Object.assign(storedLocal, structuredClone(value));
+    },
+    restoreLocal: async (defaults) => Object.hasOwn(defaults, "ghostDaemonIncarnation")
+      ? { ghostDaemonIncarnation: storedLocal.ghostDaemonIncarnation }
+      : { ghostOwnershipPoison: storedLocal.ghostOwnershipPoison },
+  });
+  const ops = await import(`../extension/ops.js?incarnation-write-order=${Date.now()}`);
+
+  const first = ops.reconcileDaemonIncarnation(INCARNATION_A);
+  for (let attempt = 0; attempt < 20 && writes === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const second = ops.reconcileDaemonIncarnation(INCARNATION_B);
+
+  await assert.rejects(
+    first,
+    (error) => error instanceof RelayOpError && /save the daemon incarnation/i.test(error.message),
+  );
+  await second;
+  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
+
+  staleWrite.resolve();
+  for (let attempt = 0;
+    attempt < 30 && (writes < 3 || storedLocal.ghostDaemonIncarnation !== INCARNATION_B);
+    attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(writes, 3, "the late stale marker queues exactly one newest-marker repair");
+  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
 });
 
 test("a claim is not acknowledged until storage accepts it", async () => {

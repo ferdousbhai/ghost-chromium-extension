@@ -3,14 +3,14 @@
  *
  * Three rules run through this file.
  *
- * **The tab is the unit of isolation.** One extension serves every ghost and
- * every ghost through a single socket, so tab state cannot be global: each op
+ * **The tab is the unit of isolation.** One extension serves every ghost through
+ * a single socket, so tab state cannot be global: each op
  * names the tab it acts on and gets that tab's own attach state and isolated
  * world. Two tabs cannot reset each other's world or invalidate each other's
  * refs. `state.tabs` maps a claimed tab id to that state;
  * the ghost never touches a tab the owner opened. `close` shuts every tab the
- * caller's ghost-wide owner opened and detaches from them, never the browser, which has
- * the rest of the owner's day in it.
+ * caller's ghost-wide owner opened and detaches from them, never the browser,
+ * which has the rest of the owner's day in it.
  *
  * **`chrome.debugger` is the only way in.** There is no `chrome.scripting`, no
  * content script, and no `host_permissions` in the manifest. The debugger grant
@@ -68,6 +68,9 @@ const creatingSessions = new Map();
 const recentRetired = new Set();
 let ownershipGeneration = 0;
 let sweepInFlight = null;
+let incarnationTail = Promise.resolve();
+let incarnationPublication = null;
+let incarnationRepairScheduled = false;
 
 function freshTabState() {
   return {
@@ -162,6 +165,24 @@ function serializeOwnership(work) {
   const task = ownershipTail.then(work, work);
   ownershipTail = task.then(() => undefined, () => undefined);
   return task;
+}
+
+function serializeIncarnation(work) {
+  const task = incarnationTail.then(work, work);
+  incarnationTail = task.then(() => undefined, () => undefined);
+  return task;
+}
+
+function scheduleIncarnationRepair() {
+  if (incarnationRepairScheduled) return;
+  incarnationRepairScheduled = true;
+  const task = serializeIncarnation(async () => {
+    incarnationRepairScheduled = false;
+    const publication = incarnationPublication;
+    if (publication === null) return;
+    await persistIncarnation(publication).catch(() => {});
+  });
+  void task.catch(() => {});
 }
 
 function ownershipSnapshot() {
@@ -476,15 +497,28 @@ export function restoreTabsFromSession() {
   });
 }
 
-/** Retire every claim whose owning daemon process can no longer close it. */
-export async function reconcileDaemonIncarnation(incarnation) {
-  if (typeof incarnation !== "string" || !INCARNATION_PATTERN.test(incarnation)) {
+async function persistIncarnation(publication) {
+  try {
+    await boundedStorageMutation(
+      Promise.resolve().then(() => chrome.storage.local.set({
+        [INCARNATION_KEY]: publication.incarnation,
+      })),
+      "saving the daemon incarnation",
+      () => {
+        if (incarnationPublication?.generation !== publication.generation) {
+          scheduleIncarnationRepair();
+        }
+      },
+    );
+  } catch (error) {
     throw failed(
       FAILURES.browserUnavailable,
-      "ghostd did not provide a valid browser ownership incarnation. Update Ghost and reload the extension.",
+      `Could not save the daemon incarnation: ${error?.message ?? error}.`,
     );
   }
+}
 
+async function reconcileIncarnation(incarnation) {
   const changed = await serializeOwnership(async () => {
     let stored;
     try {
@@ -510,7 +544,8 @@ export async function reconcileDaemonIncarnation(incarnation) {
     if (previous === incarnation) return false;
 
     let retirementAdded = false;
-    for (const session of state.sessions.keys()) {
+    const priorOwners = new Set([...state.sessions.keys(), ...creatingSessions.keys()]);
+    for (const session of priorOwners) {
       if (state.retired.has(session)) continue;
       state.retired.add(session);
       ownershipGeneration += 1;
@@ -529,18 +564,24 @@ export async function reconcileDaemonIncarnation(incarnation) {
         + "claim(s) that Chromium has not retired yet. The relay will retry automatically.",
     );
   }
-  try {
-    await withApiTimeout(
-      chrome.storage.local.set({ [INCARNATION_KEY]: incarnation }),
-      STORAGE_TIMEOUT_MS,
-      "saving the daemon incarnation",
-    );
-  } catch (error) {
+  const publication = {
+    incarnation,
+    generation: (incarnationPublication?.generation ?? 0) + 1,
+  };
+  incarnationPublication = publication;
+  await persistIncarnation(publication);
+}
+
+/** Retire every claim and create lease whose owning daemon can no longer close it. */
+export async function reconcileDaemonIncarnation(incarnation) {
+  if (typeof incarnation !== "string" || !INCARNATION_PATTERN.test(incarnation)) {
     throw failed(
       FAILURES.browserUnavailable,
-      `Could not save the daemon incarnation: ${error?.message ?? error}.`,
+      "ghostd did not provide a valid browser ownership incarnation. Update Ghost and reload the extension.",
     );
   }
+
+  return serializeIncarnation(() => reconcileIncarnation(incarnation));
 }
 
 function resetAttachment(tab) {
