@@ -1,11 +1,13 @@
 #!/usr/bin/env bun
 /**
- * Live smoke test: a real ghostd, a real Chromium, a real page.
+ * Live smoke test: the real relay extension, a real Chromium, and real pages.
  *
- * The unit tests cover the protocol against a scripted transport and the hub
- * against a fake extension. Neither of them can tell you whether `chrome.debugger`
- * actually attaches, whether a dispatched mouse event lands on the link the model
- * asked for, or whether `Page.captureScreenshot` returns pixels. This does.
+ * It uses Ghost's production RelayHub and browser-session code behind an
+ * in-process ephemeral HTTP server; it does not launch the full ghostd process.
+ * Unit tests cover the protocol against a scripted transport and the hub against
+ * a fake extension. Neither can tell you whether `chrome.debugger` actually
+ * attaches, whether dispatched input lands, or whether screenshots contain
+ * pixels. This does.
  *
  *     bun packages/chromium-extension/contrib/smoke.mjs
  *
@@ -103,7 +105,7 @@ try {
     process.exit(2);
   }
 
-  // 1. A daemon-shaped relay on an ephemeral loopback port.
+  // 1. An in-process relay harness on an ephemeral loopback port.
   hub = new RelayHub({ token: TOKEN, pingIntervalMs: 20_000 });
   server = createServer((_request, response) => response.writeHead(404).end());
   attachRelay(server, hub);
@@ -280,11 +282,12 @@ try {
   await closeBrowserSession(ghostHome);
   record("close the ghost-wide workspace", true, "the browser itself stayed open");
 
-  // 6. The popup is the only way an owner ever pairs, so a syntax error in it
-  //    is a ship-blocker that no unit test would catch. Only its rendering is
-  //    assertable here — see checkPopup.
+  // 6. Opening popup.html as an ordinary extension tab is not the browser-action
+  //    popup: sender.tab is present, so production correctly withholds settings
+  //    and live status. It can still prove the page and script render their
+  //    unauthorized fallback without weakening that boundary.
   const popup = await checkPopup(base, extensionId);
-  record("popup renders and reports the connection", popup.ok, popup.detail);
+  record("ordinary popup page renders without exposing relay settings", popup.ok, popup.detail);
 } catch (error) {
   record("smoke run", false, error?.message ?? String(error));
 } finally {
@@ -356,9 +359,9 @@ async function pairViaCdp(base, relayPort) {
 }
 
 /**
- * Open the popup in a normal tab and read back what it rendered. A popup that
- * throws on load looks exactly like a popup that is merely empty, which is how a
- * broken pairing UI ships.
+ * Open popup.html as an ordinary extension tab and read its unauthorized
+ * fallback. This deliberately cannot exercise live action-popup state: the
+ * background rejects any status/settings sender with `sender.tab` present.
  */
 async function checkPopup(base, extensionId) {
   if (!extensionId) return { ok: false, detail: "no extension id" };
@@ -375,7 +378,7 @@ async function checkPopup(base, extensionId) {
       socket.onopen = resolve;
       socket.onerror = () => reject(new Error("could not attach to the popup"));
     });
-    // Give popup.js its first refresh() round trip to the service worker.
+    // Give popup.js its first rejected refresh round trip to the service worker.
     await new Promise((resolve) => setTimeout(resolve, 1_500));
     const answer = await new Promise((resolve, reject) => {
       socket.onmessage = (event) => {
@@ -402,15 +405,14 @@ async function checkPopup(base, extensionId) {
       return { ok: false, detail: `popup evaluate failed: ${JSON.stringify(answer?.result)}` };
     }
     const rendered = JSON.parse(raw);
-    // Connection state is deliberately unobservable from here: `isPopupSender`
-    // releases live relay status only to the real extension popup, and this
-    // opens popup.html as a tab, so `sender.tab` is set and the request is
-    // refused. What this step is for is the thing no unit test covers — that
-    // the page parses, runs, and renders its controls.
-    const ok = typeof rendered.status === "string" && rendered.status !== ""
-      && rendered.token === 64
+    const ok = rendered.status === "Not paired"
+      && typeof rendered.detail === "string" && rendered.detail !== ""
+      && rendered.token === 0
       && rendered.toggle === "Pause";
-    return { ok, detail: `rendered, token ${rendered.token} chars, toggle ${JSON.stringify(rendered.toggle)}` };
+    return {
+      ok,
+      detail: `unauthorized fallback ${JSON.stringify(rendered.status)}, token ${rendered.token} chars`,
+    };
   } finally {
     socket.close();
     await fetch(`${base}/json/close/${created.id}`).catch(() => {});
