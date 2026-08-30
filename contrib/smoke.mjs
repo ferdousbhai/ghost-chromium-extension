@@ -159,6 +159,10 @@ try {
     backend: relayBackend({ transport: hub }),
     idleTimeoutMs: 0,
     actionTimeoutMs: 30_000,
+    // The typing step below serves its own fixture on loopback rather than
+    // asserting against someone else's search page, and the URL policy refuses
+    // local addresses unless the session was configured to allow them.
+    allowLocal: true,
   });
 
   const opened = await session.open("https://example.com");
@@ -171,11 +175,13 @@ try {
     `${read.totalLength} chars, title ${JSON.stringify(read.title)}`,
   );
 
-  const found = await session.find("Learn more", { limit: 5 });
+  // `find` answers with the page it searched alongside the matches, so the model
+  // is told where the refs came from; the matches are one field of that.
+  const { matches } = await session.find("Learn more", { limit: 5 });
   record(
     "find",
-    found.length > 0 && found[0].ref === "e1",
-    found.map((m) => `${m.ref}<${m.tag}> ${JSON.stringify(m.text.slice(0, 30))}`).join(", "),
+    matches.length > 0 && matches[0].ref === "e1",
+    matches.map((m) => `${m.ref}<${m.tag}> ${JSON.stringify(m.text.slice(0, 30))}`).join(", "),
   );
 
   const clicked = await session.click({ ref: "e1" });
@@ -204,12 +210,12 @@ try {
   const fixtureUrl = `http://127.0.0.1:${fixtureServer.address().port}/`;
 
   await session.open(fixtureUrl, { allowLocal: true });
-  const fields = await session.find("input#q", { limit: 3 });
+  const { matches: fields } = await session.find("input#q", { limit: 3 });
   record("find a field by selector", fields.length === 1 && fields[0].value === "prefilled text",
     fields.map((m) => `${m.ref}<${m.tag}> value=${JSON.stringify(m.value ?? "")}`).join(", "));
 
   const typed = await session.type({ ref: "e1", text: "letterpress", submit: false });
-  const afterType = await session.find("input#q", { limit: 1 });
+  const { matches: afterType } = await session.find("input#q", { limit: 1 });
   record(
     "type replaces the field's value",
     typed.submitted === false && afterType[0]?.value === "letterpress",
@@ -223,11 +229,49 @@ try {
     submitted.url,
   );
 
+  // 5b. Two conversations at once. This is the one thing no fake can prove: the
+  //     extension serves every session over a single socket, so if any of the
+  //     attach state, the isolated world, or the ref table were still global,
+  //     one session's `open` would silently invalidate the other's refs.
+  const other = new GhostBrowserSession({
+    homeDir: ghostHome,
+    backend: relayBackend({ transport: hub }),
+    idleTimeoutMs: 0,
+    actionTimeoutMs: 30_000,
+    allowLocal: true,
+  });
+  await other.open(fixtureUrl);
+  const mine = await session.tabs({ op: "list" });
+  const theirs = await other.tabs({ op: "list" });
+  record(
+    "each conversation sees only its own tab",
+    mine.tabs.length === 1 && theirs.tabs.length === 1 && mine.active !== theirs.active,
+    `this session drives ${mine.active}, the other drives ${theirs.active}`,
+  );
+
+  // Mint refs in one session, then make the other navigate its own tab. Under a
+  // shared world the second open would tear down the first session's refs.
+  // (This session is on /submitted from the Enter test; go back to the form.)
+  await session.open(fixtureUrl);
+  const { matches: minted } = await session.find("input#q", { limit: 1 });
+  await other.open(`${fixtureUrl}?other=1`);
+  const stillMine = await session.type({ ref: minted[0].ref, text: "isolated", submit: false });
+  const { matches: afterOther } = await session.find("input#q", { limit: 1 });
+  record(
+    "a second conversation does not invalidate the first's refs",
+    minted.length === 1 && stillMine.submitted === false && afterOther[0]?.value === "isolated",
+    `ref ${minted[0].ref} still resolved after the other session navigated`,
+  );
+
+  const otherClosed = await other.close();
+  record("closing one conversation leaves the other's tab", otherClosed, `still on ${(await session.tabs({ op: "list" })).active}`);
+
   const closed = await session.close();
   record("close the tab", closed, "the browser itself stayed open");
 
   // 6. The popup is the only way an owner ever pairs, so a syntax error in it
-  //    is a ship-blocker that no unit test would catch.
+  //    is a ship-blocker that no unit test would catch. Only its rendering is
+  //    assertable here — see checkPopup.
   const popup = await checkPopup(base, extensionId);
   record("popup renders and reports the connection", popup.ok, popup.detail);
 } catch (error) {
@@ -346,10 +390,15 @@ async function checkPopup(base, extensionId) {
       return { ok: false, detail: `popup evaluate failed: ${JSON.stringify(answer?.result)}` };
     }
     const rendered = JSON.parse(raw);
-    const ok = rendered.status === "Connected to ghostd"
+    // Connection state is deliberately unobservable from here: `isPopupSender`
+    // releases live relay status only to the real extension popup, and this
+    // opens popup.html as a tab, so `sender.tab` is set and the request is
+    // refused. What this step is for is the thing no unit test covers — that
+    // the page parses, runs, and renders its controls.
+    const ok = typeof rendered.status === "string" && rendered.status !== ""
       && rendered.token === 64
       && rendered.toggle === "Pause";
-    return { ok, detail: `status ${JSON.stringify(rendered.status)}, token ${rendered.token} chars` };
+    return { ok, detail: `rendered, token ${rendered.token} chars, toggle ${JSON.stringify(rendered.toggle)}` };
   } finally {
     socket.close();
     await fetch(`${base}/json/close/${created.id}`).catch(() => {});
