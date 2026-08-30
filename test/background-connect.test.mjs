@@ -7,6 +7,8 @@ const originalWebSocket = globalThis.WebSocket;
 const originalSetTimeout = globalThis.setTimeout;
 const originalSetInterval = globalThis.setInterval;
 const originalClearInterval = globalThis.clearInterval;
+const INCARNATION_A = "11111111-1111-4111-8111-111111111111";
+const INCARNATION_B = "22222222-2222-4222-8222-222222222222";
 
 afterEach(() => {
   if (originalChrome === undefined) delete globalThis.chrome;
@@ -42,6 +44,11 @@ function chromeMock({
   badges = [],
   debuggerTargets = async () => [],
   loadSettings,
+  persistLocal = async () => {},
+  removeLocal = async () => {},
+  restoreIncarnation = async () => ({ ghostDaemonIncarnation: null }),
+  restorePoison = async () => ({ ghostOwnershipPoison: null }),
+  persistSession = async () => {},
   restoreSession = async () => ({ ghostTabId: null }),
   tabApi = {},
 }) {
@@ -70,16 +77,18 @@ function chromeMock({
     storage: {
       local: {
         get: (defaults) => Object.hasOwn(defaults, "ghostOwnershipPoison")
-          ? Promise.resolve({ ghostOwnershipPoison: null })
-          : loadSettings(defaults),
-        remove: async () => {},
-        set: async () => {},
+          ? restorePoison(defaults)
+          : (Object.hasOwn(defaults, "ghostDaemonIncarnation")
+            ? restoreIncarnation(defaults)
+            : loadSettings(defaults)),
+        remove: removeLocal,
+        set: persistLocal,
       },
       onChanged: eventHook(),
       session: {
         get: restoreSession,
         remove: async () => {},
-        set: async () => {},
+        set: persistSession,
       },
     },
     tabs: {
@@ -439,8 +448,14 @@ test("the popup reports a nonempty list of tabs owned by the relay", async () =>
   socket.readyState = WebSocket.OPEN;
   socket.onopen();
   socket.onmessage({
-    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "ghostd" }),
+    data: JSON.stringify({
+      t: "welcome",
+      protocol: PROTOCOL_VERSION,
+      daemon: "ghostd",
+      incarnation: INCARNATION_A,
+    }),
   });
+  await settle();
   socket.onmessage({
     data: JSON.stringify({
       t: "req",
@@ -554,19 +569,25 @@ test("settings are cached and an open socket stays off until a compatible welcom
   socket.readyState = WebSocket.OPEN;
   socket.onopen();
   await settle();
-  assert.deepEqual(socket.sent.map((frame) => frame.t), ["hello"]);
+  assert.deepEqual(socket.sent, []);
   assert.equal(badges.at(-1), "off");
 
   // Requests are not accepted merely because TCP/WebSocket setup completed.
   socket.onmessage({ data: JSON.stringify({ t: "req", id: 1, op: "status", args: {} }) });
   await settle();
-  assert.deepEqual(socket.sent.map((frame) => frame.t), ["hello"]);
+  assert.deepEqual(socket.sent, []);
 
   socket.onmessage({
-    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "ghostd" }),
+    data: JSON.stringify({
+      t: "welcome",
+      protocol: PROTOCOL_VERSION,
+      daemon: "ghostd",
+      incarnation: INCARNATION_A,
+    }),
   });
   await settle();
   assert.equal(badges.at(-1), "on");
+  assert.equal(socket.sent.at(-1).t, "hello");
 
   socket.onmessage({ data: JSON.stringify({ t: "req", id: 2, op: "status", args: {} }) });
   await settle();
@@ -588,7 +609,135 @@ test("settings are cached and an open socket stays off until a compatible welcom
   assert.equal(settingsReads, 2);
 });
 
-test("an old protocol-2 daemon is refused with update guidance", async () => {
+test("a new daemon incarnation retires crash-orphaned claims before hello", async () => {
+  const removal = deferred();
+  const sockets = [];
+  const timeouts = [];
+  let live = false;
+  let storedSession = { ghostTabs: null };
+  const storedLocal = {
+    ghostOwnershipPoison: null,
+    ghostDaemonIncarnation: null,
+  };
+  const tab = {
+    id: 91,
+    windowId: 4,
+    status: "complete",
+    url: "https://crash.example/",
+    title: "Crash claim",
+  };
+  globalThis.chrome = chromeMock({
+    debuggerTargets: async () => live
+      ? [{ tabId: tab.id, type: "page", attached: false, url: tab.url, title: tab.title }]
+      : [],
+    loadSettings: async () => ({ port: 7717, token: "paired", enabled: true }),
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
+    removeLocal: async (key) => { storedLocal[key] = null; },
+    restoreIncarnation: async () => ({
+      ghostDaemonIncarnation: storedLocal.ghostDaemonIncarnation,
+    }),
+    restorePoison: async () => ({ ghostOwnershipPoison: storedLocal.ghostOwnershipPoison }),
+    persistSession: async (value) => { storedSession = structuredClone(value); },
+    restoreSession: async () => structuredClone(storedSession),
+    tabApi: {
+      create: async () => {
+        live = true;
+        return tab;
+      },
+      get: async () => live ? tab : null,
+      remove: async () => {
+        await removal.promise;
+        live = false;
+      },
+    },
+  });
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+  globalThis.setTimeout = (callback, delay) => {
+    timeouts.push({ callback, delay });
+    return timeouts.length;
+  };
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.sent = [];
+      sockets.push(this);
+    }
+
+    send(raw) {
+      this.sent.push(JSON.parse(raw));
+    }
+
+    close() {
+      this.readyState = 3;
+    }
+  };
+
+  await import(`../extension/background.js?daemon-incarnation=${Date.now()}`);
+  await settle();
+  const first = sockets[0];
+  first.readyState = WebSocket.OPEN;
+  first.onopen();
+  first.onmessage({
+    data: JSON.stringify({
+      t: "welcome",
+      protocol: PROTOCOL_VERSION,
+      daemon: "ghostd",
+      incarnation: INCARNATION_A,
+    }),
+  });
+  await settle();
+  assert.equal(first.sent.at(-1).t, "hello");
+  first.onmessage({
+    data: JSON.stringify({
+      t: "req",
+      id: 61,
+      op: "open",
+      args: { session: "lost-daemon", url: tab.url },
+      timeoutMs: 1_000,
+    }),
+  });
+  assert.equal((await responseFor(first, 61)).ok, true);
+  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_A);
+  assert.deepEqual(storedSession.ghostTabs.sessions, [["lost-daemon", [91]]]);
+
+  first.readyState = 3;
+  const timersBeforeCrash = timeouts.length;
+  first.onclose({ code: 1006, reason: "" });
+  await settle();
+  const reconnect = timeouts.slice(timersBeforeCrash).find(({ delay }) => delay === 1_000);
+  assert.ok(reconnect);
+  reconnect.callback();
+  await settle();
+
+  const replacement = sockets[1];
+  replacement.readyState = WebSocket.OPEN;
+  replacement.onopen();
+  replacement.onmessage({
+    data: JSON.stringify({
+      t: "welcome",
+      protocol: PROTOCOL_VERSION,
+      daemon: "ghostd",
+      incarnation: INCARNATION_B,
+    }),
+  });
+  await settle();
+  assert.deepEqual(replacement.sent, [], "the new daemon is not admitted before old claims retire");
+
+  removal.resolve();
+  for (let attempt = 0; attempt < 30 && replacement.sent.length === 0; attempt += 1) await settle();
+  assert.equal(replacement.sent.at(-1).t, "hello");
+  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
+  assert.deepEqual(storedSession, {
+    ghostTabs: { version: 2, tabs: [], sessions: [], retired: [] },
+  });
+  assert.equal(live, false);
+});
+
+test("an old protocol-3 daemon is refused with update guidance", async () => {
   const sockets = [];
   const reconnects = [];
   globalThis.chrome = chromeMock({
@@ -626,14 +775,18 @@ test("an old protocol-2 daemon is refused with update guidance", async () => {
   const socket = sockets[0];
   socket.readyState = WebSocket.OPEN;
   socket.onopen();
-  assert.equal(socket.sent.at(-1).protocol, 3);
+  assert.deepEqual(socket.sent, []);
 
   socket.onmessage({
-    data: JSON.stringify({ t: "welcome", protocol: 2, daemon: "old-ghostd" }),
+    data: JSON.stringify({
+      t: "welcome",
+      protocol: PROTOCOL_VERSION - 1,
+      daemon: "old-ghostd",
+    }),
   });
   await settle();
   assert.equal(socket.closes[0].code, 4000);
-  assert.match(socket.closes[0].reason, /speaks relay protocol 2.*speaks 3/i);
+  assert.match(socket.closes[0].reason, /speaks relay protocol 3.*speaks 4/i);
   assert.match(socket.closes[0].reason, /update whichever is older/i);
 
   socket.onclose({ code: 4000, reason: socket.closes[0].reason });
@@ -652,7 +805,12 @@ test("an old protocol-2 daemon is refused with update guidance", async () => {
   recovered.readyState = WebSocket.OPEN;
   recovered.onopen();
   recovered.onmessage({
-    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "updated-ghostd" }),
+    data: JSON.stringify({
+      t: "welcome",
+      protocol: PROTOCOL_VERSION,
+      daemon: "updated-ghostd",
+      incarnation: INCARNATION_A,
+    }),
   });
   await settle();
   assert.equal(recovered.sent.at(-1).protocol, PROTOCOL_VERSION);
@@ -673,6 +831,7 @@ test("a late operation result cannot cross into a replacement socket", async () 
       title: "Example",
     }],
     loadSettings: async () => stored,
+    restoreIncarnation: async () => ({ ghostDaemonIncarnation: INCARNATION_A }),
     restoreSession: async () => ({
       ghostTabs: {
         version: 2,
@@ -716,7 +875,12 @@ test("a late operation result cannot cross into a replacement socket", async () 
   first.readyState = WebSocket.OPEN;
   first.onopen();
   first.onmessage({
-    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "ghostd" }),
+    data: JSON.stringify({
+      t: "welcome",
+      protocol: PROTOCOL_VERSION,
+      daemon: "ghostd",
+      incarnation: INCARNATION_A,
+    }),
   });
   await settle();
 
@@ -731,7 +895,12 @@ test("a late operation result cannot cross into a replacement socket", async () 
   second.readyState = WebSocket.OPEN;
   second.onopen();
   second.onmessage({
-    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "ghostd" }),
+    data: JSON.stringify({
+      t: "welcome",
+      protocol: PROTOCOL_VERSION,
+      daemon: "ghostd",
+      incarnation: INCARNATION_A,
+    }),
   });
 
   statusRead.resolve(tab);
@@ -811,7 +980,12 @@ test("close tombstones on the response deadline and cleans up a late tab creatio
   socket.readyState = WebSocket.OPEN;
   socket.onopen();
   socket.onmessage({
-    data: JSON.stringify({ t: "welcome", protocol: PROTOCOL_VERSION, daemon: "ghostd" }),
+    data: JSON.stringify({
+      t: "welcome",
+      protocol: PROTOCOL_VERSION,
+      daemon: "ghostd",
+      incarnation: INCARNATION_A,
+    }),
   });
   await settle();
 

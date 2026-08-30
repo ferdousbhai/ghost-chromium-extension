@@ -19,6 +19,39 @@ const saveButton = document.getElementById("save");
 const savedFlag = document.getElementById("saved");
 const toggleButton = document.getElementById("toggle");
 const enabledLabel = document.getElementById("enabledLabel");
+const POPUP_API_TIMEOUT_MS = 1_000;
+const DEFAULT_SETTINGS = { port: 7717, token: "", enabled: true };
+
+let settingsSnapshot = { ...DEFAULT_SETTINGS };
+let refreshInFlight = null;
+let mutationInFlight = null;
+let savedTimer = null;
+
+function withDeadline(promise, message) {
+  const signal = AbortSignal.timeout(POPUP_API_TIMEOUT_MS);
+  return new Promise((resolve, reject) => {
+    const onTimeout = () => reject(new Error(message));
+    signal.addEventListener("abort", onTimeout, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onTimeout);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onTimeout);
+        reject(error);
+      },
+    );
+  });
+}
+
+function normalizeSettings(value = {}) {
+  return {
+    port: Number(value.port) || DEFAULT_SETTINGS.port,
+    token: typeof value.token === "string" ? value.token : "",
+    enabled: value.enabled !== false,
+  };
+}
 
 function render(status) {
   const connected = status.connected === true;
@@ -37,14 +70,19 @@ function render(status) {
       ? "Retrying. Is ghostd running?"
       : "Run `ghostd relay-token` in a terminal and paste the token below."));
 
-  // One tab per conversation, so there may be several open at once.
+  // One browser workspace per ghost, which may hold several tabs at once.
   const tabs = Array.isArray(status.tabs) ? status.tabs : [];
   if (tabs.length > 0) {
     tabBox.hidden = false;
     tabBox.innerHTML = "";
     const label = document.createElement("strong");
     label.textContent = tabs.length === 1 ? "Ghost's tab: " : `Ghost's tabs (${tabs.length}): `;
-    const named = tabs.map((tab) => tab.title || tab.url || "").join(", ");
+    const named = tabs
+      .map((tab) => tab.title || tab.url
+        || (tab.id !== undefined && tab.id !== null && tab.id !== ""
+          ? `Tab ${tab.id}`
+          : "Untitled tab"))
+      .join(", ");
     tabBox.append(label, document.createTextNode(named));
   } else {
     tabBox.hidden = true;
@@ -56,45 +94,113 @@ function render(status) {
   toggleButton.textContent = enabled ? "Pause" : "Resume";
 }
 
-async function refresh() {
-  const settings = await chrome.storage.local.get({ port: 7717, token: "", enabled: true });
-  if (document.activeElement !== tokenInput) tokenInput.value = settings.token ?? "";
-  if (document.activeElement !== portInput) portInput.value = settings.port ?? 7717;
+function fallbackStatus(lastError = "") {
+  return {
+    connected: false,
+    paired: settingsSnapshot.token !== "",
+    enabled: settingsSnapshot.enabled,
+    lastError,
+    tabs: [],
+  };
+}
+
+async function refreshNow() {
+  let settings;
+  try {
+    settings = normalizeSettings(await withDeadline(
+      chrome.storage.local.get(DEFAULT_SETTINGS),
+      "Chromium did not return the relay settings in time.",
+    ));
+    settingsSnapshot = settings;
+  } catch (error) {
+    render(fallbackStatus(`Could not read relay settings: ${error?.message ?? error}`));
+    return;
+  }
+  if (document.activeElement !== tokenInput) tokenInput.value = settings.token;
+  if (document.activeElement !== portInput) portInput.value = settings.port;
 
   let status;
   try {
-    status = await chrome.runtime.sendMessage({ type: "ghost-relay-status" });
+    status = await withDeadline(
+      chrome.runtime.sendMessage({ type: "ghost-relay-status" }),
+      "The relay worker did not answer status in time.",
+    );
   } catch {
     // The worker is asleep; sending the message wakes it, so the next tick
     // answers. Show what storage knows in the meantime.
     status = null;
   }
-  render(status ?? {
-    connected: false,
-    paired: (settings.token ?? "") !== "",
-    enabled: settings.enabled !== false,
-    lastError: "",
-    tabs: [],
-  });
+  render(status ?? fallbackStatus());
 }
 
-saveButton.addEventListener("click", async () => {
-  const token = tokenInput.value.trim();
-  const port = Number(portInput.value) || 7717;
-  await chrome.storage.local.set({ token, port });
-  savedFlag.hidden = false;
-  setTimeout(() => {
-    savedFlag.hidden = true;
-  }, 1_500);
-  // Give the worker a moment to re-dial before asking how it went.
-  setTimeout(() => void refresh(), 600);
-});
+function refreshSingleFlight() {
+  if (refreshInFlight !== null) return refreshInFlight;
+  const attempt = refreshNow().finally(() => {
+    if (refreshInFlight === attempt) refreshInFlight = null;
+  });
+  refreshInFlight = attempt;
+  return attempt;
+}
 
-toggleButton.addEventListener("click", async () => {
-  const { enabled } = await chrome.storage.local.get({ enabled: true });
-  await chrome.storage.local.set({ enabled: enabled === false });
-  await refresh();
-});
+function refresh() {
+  return mutationInFlight ?? refreshSingleFlight();
+}
+
+function showMutationError(error) {
+  render(fallbackStatus(`Could not update relay settings: ${error?.message ?? error}`));
+}
+
+function mutateSettings(work) {
+  if (mutationInFlight !== null) return mutationInFlight;
+  saveButton.disabled = true;
+  toggleButton.disabled = true;
+  const attempt = (async () => {
+    if (refreshInFlight !== null) await refreshInFlight;
+    await work();
+    await refreshSingleFlight();
+  })().catch(showMutationError).finally(() => {
+    if (mutationInFlight === attempt) mutationInFlight = null;
+    saveButton.disabled = false;
+    toggleButton.disabled = false;
+  });
+  mutationInFlight = attempt;
+  return attempt;
+}
+
+function showSaved() {
+  savedFlag.hidden = false;
+  if (savedTimer !== null) clearTimeout(savedTimer);
+  savedTimer = setTimeout(() => {
+    savedFlag.hidden = true;
+    savedTimer = null;
+  }, 1_500);
+}
+
+saveButton.addEventListener("click", () => void mutateSettings(async () => {
+  const next = {
+    token: tokenInput.value.trim(),
+    port: Number(portInput.value) || DEFAULT_SETTINGS.port,
+  };
+  await withDeadline(
+    chrome.storage.local.set(next),
+    "Chromium did not save the relay settings in time.",
+  );
+  settingsSnapshot = { ...settingsSnapshot, ...next };
+  showSaved();
+}));
+
+toggleButton.addEventListener("click", () => void mutateSettings(async () => {
+  const stored = await withDeadline(
+    chrome.storage.local.get({ enabled: true }),
+    "Chromium did not return the relay setting in time.",
+  );
+  const enabled = stored.enabled === false;
+  await withDeadline(
+    chrome.storage.local.set({ enabled }),
+    "Chromium did not save the relay setting in time.",
+  );
+  settingsSnapshot = { ...settingsSnapshot, enabled };
+}));
 
 void refresh();
 setInterval(() => void refresh(), 2_000);

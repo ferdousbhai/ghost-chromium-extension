@@ -452,7 +452,7 @@ test("a session sees, drives, and closes only the tabs it opened", async () => {
   assert.deepEqual(removed, []);
 });
 
-test("protocol-3 tab creation refuses a missing owner session", async () => {
+test("protocol-4 tab creation refuses a missing owner session", async () => {
   globalThis.chrome = chromeMock({ attach: async () => {} });
   const { runOp } = await import(`../extension/ops.js?missing-owner=${Date.now()}`);
 

@@ -4,12 +4,12 @@
  * Three rules run through this file.
  *
  * **The tab is the unit of isolation.** One extension serves every ghost and
- * every conversation through a single socket, so nothing here may be global: each
- * op names the tab it acts on and gets that tab's own attach state and isolated
- * world. Two conversations driving two tabs cannot reset each other's world or
- * invalidate each other's refs. `state.tabs` maps a claimed tab id to that state;
+ * every ghost through a single socket, so tab state cannot be global: each op
+ * names the tab it acts on and gets that tab's own attach state and isolated
+ * world. Two tabs cannot reset each other's world or invalidate each other's
+ * refs. `state.tabs` maps a claimed tab id to that state;
  * the ghost never touches a tab the owner opened. `close` shuts every tab the
- * caller's session opened and detaches from them, never the browser, which has
+ * caller's ghost-wide owner opened and detaches from them, never the browser, which has
  * the rest of the owner's day in it.
  *
  * **`chrome.debugger` is the only way in.** There is no `chrome.scripting`, no
@@ -59,8 +59,8 @@ const RING_LIMIT = 200;
 
 /**
  * `tabs`: claimed tab id -> that tab's CDP state. Nothing about a page lives
- * outside it. `sessions`: session id -> the tabs that session claimed, which is
- * what keeps one conversation from listing, driving, or closing another's tab
+ * outside it. `sessions`: ghost-wide protocol owner id -> its claimed tabs,
+ * which keeps one ghost from listing, driving, or closing another ghost's tab
  * over the socket they share.
  */
 const state = { tabs: new Map(), sessions: new Map(), retired: new Set() };
@@ -87,7 +87,7 @@ function freshTabState() {
     attachGeneration: 0,
     /**
      * What this tab has said since its last `console`/`network` op. Per tab, not
-     * shared: one chatty page must not evict another conversation's lines, and a
+     * shared: one chatty page must not evict another tab's lines, and a
      * tab that goes away takes its buffers with it.
      */
     consoleRing: [],
@@ -102,7 +102,7 @@ function clearWorld(tabId) {
   if (tab) tab.worldContextId = null;
 }
 
-/** The tabs one session has claimed, tracked from its first `open`. */
+/** The tabs one ghost-wide protocol owner has claimed, tracked from its first `open`. */
 function sessionTabs(session) {
   let owned = state.sessions.get(session);
   if (!owned) {
@@ -112,7 +112,7 @@ function sessionTabs(session) {
   return owned;
 }
 
-/** Whether this session is the one that opened this tab. */
+/** Whether this ghost-wide protocol owner is the one that opened this tab. */
 function owns(session, tabId) {
   return typeof session === "string" && state.sessions.get(session)?.has(tabId) === true;
 }
@@ -152,7 +152,9 @@ const attachBarriers = new Map();
 
 const SESSION_KEY = "ghostTabs";
 const POISON_KEY = "ghostOwnershipPoison";
+const INCARNATION_KEY = "ghostDaemonIncarnation";
 const SESSION_STATE_VERSION = 2;
+const INCARNATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 let ownershipTail = Promise.resolve();
 const ownershipPoison = new Map();
 
@@ -472,6 +474,73 @@ export function restoreTabsFromSession() {
       );
     }
   });
+}
+
+/** Retire every claim whose owning daemon process can no longer close it. */
+export async function reconcileDaemonIncarnation(incarnation) {
+  if (typeof incarnation !== "string" || !INCARNATION_PATTERN.test(incarnation)) {
+    throw failed(
+      FAILURES.browserUnavailable,
+      "ghostd did not provide a valid browser ownership incarnation. Update Ghost and reload the extension.",
+    );
+  }
+
+  const changed = await serializeOwnership(async () => {
+    let stored;
+    try {
+      stored = await withApiTimeout(
+        chrome.storage.local.get({ [INCARNATION_KEY]: null }),
+        RESTORE_TIMEOUT_MS,
+        "restoring the daemon incarnation",
+      );
+    } catch (error) {
+      throw failed(
+        FAILURES.browserUnavailable,
+        `Could not restore the daemon incarnation: ${error?.message ?? error}.`,
+      );
+    }
+    const previous = stored[INCARNATION_KEY];
+    if (previous !== null && previous !== undefined
+        && (typeof previous !== "string" || !INCARNATION_PATTERN.test(previous))) {
+      throw failed(
+        FAILURES.browserUnavailable,
+        "Stored daemon incarnation is invalid; reload the Ghost extension.",
+      );
+    }
+    if (previous === incarnation) return false;
+
+    let retirementAdded = false;
+    for (const session of state.sessions.keys()) {
+      if (state.retired.has(session)) continue;
+      state.retired.add(session);
+      ownershipGeneration += 1;
+      retirementAdded = true;
+    }
+    if (retirementAdded) await persistOwnership();
+    return true;
+  });
+  if (!changed) return;
+
+  await sweepRetiredTabs();
+  if (state.sessions.size > 0) {
+    throw failed(
+      FAILURES.browserUnavailable,
+      `The previous ghostd process left ${state.sessions.size} browser ownership `
+        + "claim(s) that Chromium has not retired yet. The relay will retry automatically.",
+    );
+  }
+  try {
+    await withApiTimeout(
+      chrome.storage.local.set({ [INCARNATION_KEY]: incarnation }),
+      STORAGE_TIMEOUT_MS,
+      "saving the daemon incarnation",
+    );
+  } catch (error) {
+    throw failed(
+      FAILURES.browserUnavailable,
+      `Could not save the daemon incarnation: ${error?.message ?? error}.`,
+    );
+  }
 }
 
 function resetAttachment(tab) {
@@ -917,8 +986,8 @@ function withApiTimeout(promise, timeoutMs, what) {
 
 /**
  * The claimed tab this op names, as `args.tab`, or null when it names none we
- * hold. Every page op carries it: the extension holds no "current" tab, because
- * the socket is shared by every conversation.
+ * hold. Every page op carries it: the extension holds no global "current" tab,
+ * because the socket is shared by every ghost.
  */
 function claimedTab(args) {
   const raw = args?.tab;
@@ -966,8 +1035,8 @@ async function tabSnapshot(tabId, targets = null) {
 }
 
 /**
- * The asking session's tabs, with the metadata `tabSnapshot` can see. `active`
- * marks the one it drives, which is that session's answer alone. One
+ * The asking ghost-wide owner's tabs, with the metadata `tabSnapshot` can see.
+ * `active` marks the one it drives, which is that owner's answer alone. One
  * `getTargets()` call serves the whole list.
  */
 /** The `{ tabs, active }` shape every `tabs` op answers with. */
@@ -980,8 +1049,8 @@ async function tabsAnswer(session, active) {
 
 async function tabInfos(session, active) {
   const targets = await chrome.debugger.getTargets().catch(() => []);
-  // A session sees the tabs it opened. The popup asks with no session and sees
-  // them all, because that view is the owner's, not a conversation's.
+  // A protocol owner sees the tabs its ghost opened. The popup asks with no
+  // owner id and sees them all, because that view belongs to the machine owner.
   const ids = session === null
     ? [...state.tabs.keys()]
     : [...(state.sessions.get(session) ?? [])];
@@ -1377,11 +1446,11 @@ const ops = {
     const tabId = claimedTab(args);
     const entry = tabId === null ? undefined : state.tabs.get(tabId);
     // Every claimed tab, not just the caller's: this is what the popup shows the
-    // owner, and several conversations may be holding tabs at once.
+    // machine owner, and several ghosts may be holding tabs at once.
     return {
       attached: entry?.attached === true,
       banned: entry?.banned === true,
-      // No session: this is the popup, and the owner's view is every ghost tab.
+      // No protocol owner: this is the popup, whose view is every ghost tab.
       tabs: await tabInfos(null, tabId),
     };
   },
@@ -1747,8 +1816,7 @@ const ops = {
 
   async tabs(args, timeoutMs) {
     const op = typeof args.op === "string" ? args.op : "list";
-    // `active` is the caller's own tab, not a browser-wide one: the tab list is
-    // shared, but which tab a conversation drives is that conversation's alone.
+    // `active` is this ghost workspace's tab, not a browser-wide one.
     const caller = claimedTab(args);
 
     if (op === "list") {
@@ -1785,8 +1853,8 @@ const ops = {
     }
 
     if (op === "switch") {
-      // Switching re-points this caller only; the tab keeps whatever attachment
-      // and isolated world it already had, so another conversation's refs survive.
+      // Switching re-points this ghost workspace only; the tab keeps whatever
+      // attachment and isolated world it already had, so another ghost's refs survive.
       await chrome.tabs.update(id, { active: true }).catch(() => {});
       return { ...(await tabsAnswer(args.session, id)), page: await summary(id) };
     }
@@ -1804,11 +1872,11 @@ const ops = {
   },
 
   async close(args, timeoutMs) {
-    // Session teardown closes every tab this session opened, not just the one it
-    // was last driving: `tabs create` re-points the caller, and without this the
-    // tabs it moved off would be left in the owner's browser with nothing owning
-    // them. Other conversations keep their own tabs, and the browser keeps the
-    // rest of the owner's day in it.
+    // Ghost-workspace teardown closes every tab this protocol owner opened, not
+    // just the one it was last driving: `tabs create` re-points the caller, and
+    // without this the tabs it moved off would be left in the owner's browser
+    // with nothing owning them. Other ghosts keep their tabs, and the browser
+    // keeps the rest of the owner's day in it.
     const session = requireOwningSession(args);
     let retirementError = null;
     await serializeOwnership(async () => {
@@ -1860,8 +1928,8 @@ const ops = {
 
 /**
  * Drop every debugger session without closing a tab. The socket going away means
- * every conversation behind it is gone, but the tabs are the owner's to keep;
- * a reconnecting backend still names the same tab and re-attaches on its next op.
+ * every ghost workspace behind it is offline, but the tabs are the owner's to
+ * keep; a reconnecting backend still names the same tab and re-attaches next op.
  */
 export async function releaseAllTabs() {
   const attached = [];

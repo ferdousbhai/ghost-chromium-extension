@@ -1,9 +1,10 @@
 # Ghost browser relay (Chromium extension)
 
 The ghost drives **tabs it created in the browser you are already signed into**.
-Every page operation names the tab it acts on, and each conversation may own
-several: one extension serves them all over one socket without their attachments,
-isolated worlds, or element refs colliding.
+Every page operation names the tab it acts on. Each ghost has one browser
+workspace shared by its conversations and may own several tabs; another ghost's
+workspace remains separate. One extension serves them all over one socket without
+their attachments or isolated worlds colliding.
 
 This is the only browser a ghost has. There is no second profile to fall back to,
 so until this extension pairs, browser calls fail and say so; if Chromium is not
@@ -60,7 +61,7 @@ Click the extension, paste the token, **Save & connect**. It is kept in
 only after a compatible ghostd has answered the protocol handshake, `||` when
 that authenticated connection is paused, and `off` otherwise.
 
-The current relay protocol is 3. A protocol-2 daemon or extension is refused
+The current relay protocol is 4. An older daemon or extension is refused
 before either side accepts browser work; update the older Ghost package. The
 extension probes again after a one-minute cool-down, or reload it from
 `chrome://extensions` to retry immediately after updating either side.
@@ -100,9 +101,9 @@ And on the extension side:
   being debugged" banner. Dismissing that banner detaches the debugger and locks
   the relay out of the tab until it navigates.
 - **Only tabs created by the ghost.** It never adopts a tab you opened. The
-  `tabs` operation can create, select, or close one of those tabs; session `close`
-  attempts every tab that conversation opened, leaving other conversations' tabs
-  and the browser itself open.
+  `tabs` operation can create, select, or close one of those tabs. Conversations
+  of the same ghost share that workspace; terminal ghost teardown attempts every
+  tab in it, leaving other ghosts' tabs and the browser itself open.
 - **Pause** in the popup refuses every request instantly, without unpairing.
 - The extension re-checks the URL scheme itself: it does not have to trust the
   daemon in order to be safe to install.
@@ -146,13 +147,18 @@ operation and drops a late result if the socket that requested it has gone away.
 Chromium's `chrome.debugger.sendCommand()` Promise has no cancellation signal,
 and the relay protocol has no cancel frame, so a deadline bounds the reply but
 does not claim to abort a CDP command already accepted by Chromium. A terminal
-session close first publishes a durable retirement marker, then makes bounded
+Ghost-workspace close first publishes a durable retirement marker, then makes bounded
 attempts against every known tab. Late tab creation observes that marker and
 removes itself; uncertain removals remain owned and are retried by the keepalive
-alarm even after ghostd has rotated to a fresh browser session. Tombstones are
+alarm even after ghostd has rotated to a fresh browser owner id. Tombstones are
 discarded only once no late create handler can still produce a tab. Chrome
 settings and ownership storage calls are bounded as well, so one silent API call
 cannot pin the reconnect loop or extension popup indefinitely.
+
+Each ghostd process also announces a fresh incarnation in the protocol-4
+welcome. The extension retires claims left by an earlier crashed process before
+it sends hello or accepts new work; an ordinary reconnect to the same process
+keeps the ghost's workspace intact.
 
 ## Element refs
 

@@ -27,6 +27,7 @@
 import { PROTOCOL_VERSION, RELAY_PATH, SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX, toErrorFrame } from "./protocol.js";
 import {
   installOpsListeners,
+  reconcileDaemonIncarnation,
   releaseAllTabs,
   restoreTabsFromSession,
   runOp,
@@ -227,19 +228,9 @@ async function connectOnce(epoch) {
       socket.close(1000, "superseded");
       return;
     }
-    // The backoff is NOT reset here: a socket opens even against a daemon whose
-    // protocol we cannot speak, and resetting now is exactly what turns that into
-    // a 1s storm. It is reset only once `welcome` is accepted (see handleFrame).
-    sendTo(socket, {
-      t: "hello",
-      protocol: PROTOCOL_VERSION,
-      agent: `ghost-relay/${chrome.runtime.getManifest().version}`,
-      browser: /Chrom(e|ium)\/[\d.]+/.exec(navigator.userAgent)?.[0] ?? "Chromium",
-    });
-    clearInterval(pingTimer ?? undefined);
-    // Not liveness — this is what keeps the service worker from being reaped
-    // between two of the ghost's tool calls.
-    pingTimer = setInterval(() => notice("ping", null), PING_INTERVAL_MS);
+    // A socket is not admitted yet. Protocol 4 waits for the daemon's
+    // incarnation-bearing welcome and retires claims from an earlier daemon
+    // process before sending hello.
     void setBadge("off");
   };
 
@@ -364,12 +355,31 @@ async function handleFrame(socket, raw) {
       socket.close(4000, lastError);
       return;
     }
+    try {
+      await reconcileDaemonIncarnation(frame.incarnation);
+    } catch (error) {
+      if (ws !== socket) return;
+      lastError = error?.message ?? String(error);
+      socket.close(4000, lastError.slice(0, 120));
+      return;
+    }
+    if (ws !== socket) return;
+    sendTo(socket, {
+      t: "hello",
+      protocol: PROTOCOL_VERSION,
+      agent: `ghost-relay/${chrome.runtime.getManifest().version}`,
+      browser: /Chrom(e|ium)\/[\d.]+/.exec(navigator.userAgent)?.[0] ?? "Chromium",
+    });
     // A compatible daemon has greeted us: only now is the connection truly good,
     // so only now is the backoff safe to reset.
     protocolIncompatible = false;
     reconnectDelay = RECONNECT_MIN_MS;
     welcomedSocket = socket;
     lastError = "";
+    clearInterval(pingTimer ?? undefined);
+    // Not liveness — this is what keeps the service worker from being reaped
+    // between two of the ghost's tool calls.
+    pingTimer = setInterval(() => notice("ping", null), PING_INTERVAL_MS);
     void refreshBadge();
     return;
   }
