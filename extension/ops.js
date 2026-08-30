@@ -53,6 +53,8 @@ const RESTORE_TIMEOUT_MS = 1_000;
 const DETACH_TIMEOUT_MS = 750;
 const RETIRED_SWEEP_TIMEOUT_MS = 1_000;
 const RECENT_RETIRED_LIMIT = 1_024;
+const RELEASED_WORKSPACE_MESSAGE =
+  "This ghost browser workspace has been released. Retry the browser action so Ghost can open a fresh workspace.";
 /** Chrome's own texture limits; a taller capture comes back blank or fails. */
 const MAX_CAPTURE_PX = 16_384;
 const RING_LIMIT = 200;
@@ -123,7 +125,10 @@ function owns(session, tabId) {
 function requireOwningSession(args) {
   const session = args?.session;
   if (typeof session !== "string" || session === "") {
-    throw failed(FAILURES.invalidInput, "A tab-creating operation needs a session id.");
+    throw failed(
+      FAILURES.invalidInput,
+      "The relay request is missing its ghost browser workspace owner. Update Ghost and reload the extension.",
+    );
   }
   return session;
 }
@@ -543,15 +548,26 @@ async function reconcileIncarnation(incarnation) {
     }
     if (previous === incarnation) return false;
 
-    let retirementAdded = false;
     const priorOwners = new Set([...state.sessions.keys(), ...creatingSessions.keys()]);
     for (const session of priorOwners) {
       if (state.retired.has(session)) continue;
       state.retired.add(session);
       ownershipGeneration += 1;
-      retirementAdded = true;
     }
-    if (retirementAdded) await persistOwnership();
+    // A prior failed attempt may have added the tombstone only in memory. Every
+    // retry with live claims or create leases republishes the complete snapshot
+    // before the new daemon incarnation can be admitted.
+    if (priorOwners.size > 0) {
+      try {
+        await persistOwnership();
+      } catch (error) {
+        throw failed(
+          FAILURES.browserUnavailable,
+          `Could not durably retire browser work from the previous ghostd: `
+            + `${error?.message ?? error}. The relay will retry automatically.`,
+        );
+      }
+    }
     return true;
   });
   if (!changed) return;
@@ -633,7 +649,7 @@ async function claimTab(session, tabId, timeoutMs) {
     }
     throw failed(
       FAILURES.browserUnavailable,
-      "This browser session is closed. Open through a fresh session.",
+      RELEASED_WORKSPACE_MESSAGE,
     );
   }
 
@@ -1890,7 +1906,11 @@ const ops = {
 
     const id = args.id === undefined ? caller : claimedTab({ tab: args.id, session: args.session });
     if (id === null) {
-      throw failed(FAILURES.invalidInput, `${args.id ?? "(no id)"} is not one of this session's tabs.`);
+      throw failed(
+        FAILURES.invalidInput,
+        `${args.id ?? "(no id)"} is not one of this ghost browser workspace's tabs. `
+          + "Run tabs list to get a current tab id.",
+      );
     }
 
     if (op === "switch") {
@@ -1943,8 +1963,10 @@ const ops = {
     if (retirementError !== null || failures.length > 0) {
       throw failed(
         FAILURES.browserUnavailable,
-        `Browser session close needs retry: ${failures.length} of ${owned.length} tabs remain `
-          + `uncertain${retirementError === null ? "." : "; its retirement marker was not saved."}`,
+        `Ghost browser workspace release needs retry: ${failures.length} of ${owned.length} tabs `
+          + `remain uncertain${retirementError === null
+            ? "."
+            : "; its retirement marker was not saved."} Retry close.`,
         {
           tabs: failures,
           ...(retirementError === null
@@ -1958,8 +1980,8 @@ const ops = {
     } catch (error) {
       throw failed(
         FAILURES.browserUnavailable,
-        `Browser session close needs retry: its completed retirement could not be saved: `
-          + `${error?.message ?? error}.`,
+        `Ghost browser workspace release needs retry: its completed retirement could not be `
+          + `saved: ${error?.message ?? error}. Retry close.`,
       );
     }
     return { closed: outcomes.some((outcome) => outcome.status === "fulfilled" && outcome.value) };
@@ -1996,14 +2018,15 @@ export function startOp(op, args, timeoutMs) {
   if (session !== null && isRetired(session) && op !== "close") {
     throw failed(
       FAILURES.browserUnavailable,
-      "This browser session is closed. Open through a fresh session.",
+      RELEASED_WORKSPACE_MESSAGE,
     );
   }
   if (ownershipPoison.size > 0 && op !== "close" && op !== "status") {
     const tab = ownershipPoison.keys().next().value;
     throw failed(
       FAILURES.browserUnavailable,
-      `Browser ownership of tab ${tab} is indeterminate. Retry session close.`,
+      `Browser ownership of tab ${tab} is indeterminate. Retry the ghost browser workspace `
+        + "close before any other browser action.",
     );
   }
   const budget = Math.max(1_000, timeoutMs || 30_000);

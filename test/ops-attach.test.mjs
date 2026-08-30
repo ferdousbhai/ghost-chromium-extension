@@ -392,8 +392,8 @@ test("two tabs keep their own attachment and isolated world", async () => {
   assert.equal(isAttached(18), true);
   assert.deepEqual(worlds, [{ tabId: 17, contextId: 10 }, { tabId: 18, contextId: 11 }]);
 
-  // A navigation on one tab drops only that tab's world, so the other
-  // conversation's refs survive.
+  // A navigation on one tab drops only that tab's world, so the other tab's
+  // refs survive.
   chrome.debugger.onEvent.emit({ tabId: 17 }, "Page.frameNavigated", { frame: { id: "main" } });
   await runOp("read", { session: "s1", tab: "18" }, 1_000);
   assert.equal(worlds.length, 2, "tab 18 must reuse its own world");
@@ -413,8 +413,8 @@ test("status names every claimed tab so the popup can show them", async () => {
   await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
   await runOp("tabs", { session: "s1", op: "create", url: "https://second.example/" }, 1_000);
 
-  // The popup asks without a tab of its own: it is the owner's view of the whole
-  // browser, not one conversation's.
+  // The popup asks without a tab of its own: it is the machine owner's view of
+  // every ghost-created browser tab.
   const all = await runOp("status", {}, 1_000);
   assert.deepEqual(all.tabs.map((tab) => tab.title), ["Tab 17", "Tab 18"]);
   assert.deepEqual(all.tabs.map((tab) => tab.active), [false, false]);
@@ -425,7 +425,7 @@ test("status names every claimed tab so the popup can show them", async () => {
   assert.deepEqual(one.tabs.map((tab) => tab.active), [false, true]);
 });
 
-test("a session sees, drives, and closes only the tabs it opened", async () => {
+test("one ghost workspace cannot see or drive another ghost's tabs", async () => {
   const removed = [];
   globalThis.chrome = chromeMock({
     attach: async () => {},
@@ -435,7 +435,7 @@ test("a session sees, drives, and closes only the tabs it opened", async () => {
   await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
   await runOp("open", { session: "s2", url: "https://second.example/" }, 1_000);
 
-  // One conversation must not learn the other's tab id from the list...
+  // One ghost must not learn another ghost's tab id from the list...
   const mine = await runOp("tabs", { session: "s1", op: "list", tab: "17" }, 1_000);
   assert.deepEqual(mine.tabs.map((tab) => tab.id), ["17"]);
   assert.equal(mine.active, "17");
@@ -444,7 +444,9 @@ test("a session sees, drives, and closes only the tabs it opened", async () => {
   for (const op of ["switch", "close"]) {
     await assert.rejects(
       runOp("tabs", { session: "s1", op, id: "18", tab: "17" }, 1_000),
-      (error) => error instanceof RelayOpError && error.failure === "invalid_input",
+      (error) => error instanceof RelayOpError
+        && error.failure === "invalid_input"
+        && /ghost browser workspace's tabs.*run tabs list/i.test(error.message),
     );
   }
   await assert.rejects(
@@ -454,7 +456,7 @@ test("a session sees, drives, and closes only the tabs it opened", async () => {
   assert.deepEqual(removed, []);
 });
 
-test("protocol-4 tab creation refuses a missing owner session", async () => {
+test("protocol-4 tab creation refuses a missing workspace owner with recovery", async () => {
   globalThis.chrome = chromeMock({ attach: async () => {} });
   const { runOp } = await import(`../extension/ops.js?missing-owner=${Date.now()}`);
 
@@ -464,13 +466,15 @@ test("protocol-4 tab creation refuses a missing owner session", async () => {
   ]) {
     await assert.rejects(
       runOp(op, args, 1_000),
-      (error) => error instanceof RelayOpError && error.failure === "invalid_input",
+      (error) => error instanceof RelayOpError
+        && error.failure === "invalid_input"
+        && /missing its ghost browser workspace owner.*update Ghost.*reload/i.test(error.message),
     );
   }
   assert.deepEqual((await runOp("status", {}, 1_000)).tabs, []);
 });
 
-test("closing a session sweeps every tab it opened, not just the last one", async () => {
+test("releasing a ghost workspace sweeps every tab it opened, not just the last one", async () => {
   const removed = [];
   globalThis.chrome = chromeMock({
     attach: async () => {},
@@ -491,7 +495,7 @@ test("closing a session sweeps every tab it opened, not just the last one", asyn
   assert.deepEqual(other.tabs.map((tab) => tab.id), ["19"]);
 });
 
-test("session close sweeps older tabs after the current tab is gone", async () => {
+test("workspace release sweeps older tabs after the current tab is gone", async () => {
   const removed = [];
   globalThis.chrome = chromeMock({
     attach: async () => {},
@@ -578,7 +582,8 @@ test("a new daemon tombstones a pending old-daemon create before admitting work"
   created.resolve();
   await assert.rejects(
     opening,
-    (error) => error instanceof RelayOpError && /session is closed/i.test(error.message),
+    (error) => error instanceof RelayOpError
+      && /workspace has been released.*retry.*fresh workspace/i.test(error.message),
   );
   for (let attempt = 0;
     attempt < 20 && storedSession.ghostTabs.retired.length > 0;
@@ -589,6 +594,75 @@ test("a new daemon tombstones a pending old-daemon create before admitting work"
   assert.deepEqual(storedSession, {
     ghostTabs: { version: 2, tabs: [], sessions: [], retired: [] },
   });
+});
+
+test("incarnation retry republishes an in-memory create tombstone before worker restart", async () => {
+  const created = deferred();
+  const removed = [];
+  let writes = 0;
+  let storedSession = { ghostTabs: null };
+  const storedLocal = {
+    ghostOwnershipPoison: null,
+    ghostDaemonIncarnation: INCARNATION_A,
+  };
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    persistLocal: async (value) => { Object.assign(storedLocal, structuredClone(value)); },
+    persistSession: async (value) => {
+      writes += 1;
+      if (writes === 1) throw new Error("session storage unavailable");
+      storedSession = structuredClone(value);
+    },
+    restoreLocal: async (defaults) => Object.hasOwn(defaults, "ghostDaemonIncarnation")
+      ? { ghostDaemonIncarnation: storedLocal.ghostDaemonIncarnation }
+      : { ghostOwnershipPoison: storedLocal.ghostOwnershipPoison },
+    restoreSession: async () => structuredClone(storedSession),
+    tabCreate: async ({ url }, tabs) => {
+      await created.promise;
+      const tab = { id: 17, windowId: 4, status: "complete", url, title: "Late tab" };
+      tabs.set(tab.id, tab);
+      return tab;
+    },
+    tabRemove: async (id) => { removed.push(id); },
+  });
+  const first = await import(`../extension/ops.js?incarnation-republish=${Date.now()}`);
+  const opening = first.runOp(
+    "open",
+    { session: "crashed-owner", url: "https://late.example/" },
+    5_000,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await assert.rejects(
+    first.reconcileDaemonIncarnation(INCARNATION_B),
+    (error) => error instanceof RelayOpError
+      && /previous ghostd.*session storage unavailable.*retry automatically/i.test(error.message),
+  );
+  assert.deepEqual(storedSession, { ghostTabs: null });
+
+  await first.reconcileDaemonIncarnation(INCARNATION_B);
+  assert.equal(writes, 2, "the retry republishes an already-present in-memory tombstone");
+  assert.deepEqual(storedSession.ghostTabs.retired, ["crashed-owner"]);
+  assert.equal(storedLocal.ghostDaemonIncarnation, INCARNATION_B);
+
+  const restarted = await import(`../extension/ops.js?incarnation-republish-restart=${Date.now()}`);
+  await restarted.restoreTabsFromSession();
+  await assert.rejects(
+    restarted.runOp("open", { session: "crashed-owner", url: "https://other.example/" }, 1_000),
+    (error) => error instanceof RelayOpError
+      && /workspace has been released.*retry.*fresh workspace/i.test(error.message),
+  );
+
+  created.resolve();
+  await assert.rejects(
+    opening,
+    (error) => error instanceof RelayOpError
+      && /workspace has been released.*retry.*fresh workspace/i.test(error.message),
+  );
+  for (let attempt = 0; attempt < 20 && removed.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(removed, [17]);
 });
 
 test("overlapping incarnation changes repair an out-of-order timed-out marker write", async () => {
@@ -695,7 +769,8 @@ test("a timed-out ownership write cannot block close and repairs a late stale wr
 
   await assert.rejects(
     writer.runOp("open", { session: "timed-write", url: "https://late.example/" }, 1_000),
-    (error) => error instanceof RelayOpError && /session is closed/.test(error.message),
+    (error) => error instanceof RelayOpError
+      && /workspace has been released.*retry.*fresh workspace/i.test(error.message),
   );
   const restarted = await import(`../extension/ops.js?write-timeout-restart=${Date.now()}`);
   await restarted.restoreTabsFromSession();
@@ -805,7 +880,9 @@ test("double claim persistence failure stays poisoned across a worker restart", 
   );
   await assert.rejects(
     restarted.runOp("open", { session: "fresh", url: "https://other.example/" }, 1_000),
-    (error) => error instanceof RelayOpError && /ownership of tab 17 is indeterminate/i.test(error.message),
+    (error) => error instanceof RelayOpError
+      && /ownership of tab 17 is indeterminate/i.test(error.message)
+      && /retry the ghost browser workspace close/i.test(error.message),
   );
 
   failPersistence = false;
@@ -923,7 +1000,7 @@ test("a timed-out restored tab lookup releases ownership for a later retry", asy
   firstLookup.resolve({ id: 17, windowId: 4, status: "complete" });
 });
 
-test("a partial session close keeps the refused live tab for retry", async () => {
+test("a partial workspace release keeps the refused live tab for retry", async () => {
   const removed = [];
   let refuseSecond = true;
   globalThis.chrome = chromeMock({
@@ -946,7 +1023,9 @@ test("a partial session close keeps the refused live tab for retry", async () =>
 
   await assert.rejects(
     runOp("close", { session: "s1" }, 1_000),
-    (error) => error instanceof RelayOpError && error.failure === "browser_unavailable",
+    (error) => error instanceof RelayOpError
+      && error.failure === "browser_unavailable"
+      && /workspace release needs retry.*retry close/i.test(error.message),
   );
   assert.deepEqual(removed, [18], "a failed first tab must not suppress later cleanup attempts");
 
@@ -1124,7 +1203,8 @@ test("retired UUID persistence is garbage-collected after all create leases sett
   });
   await assert.rejects(
     gc.runOp("open", { session: "retired-2047", url: "https://late.example/" }, 1_000),
-    (error) => error instanceof RelayOpError && /session is closed/.test(error.message),
+    (error) => error instanceof RelayOpError
+      && /workspace has been released.*retry.*fresh workspace/i.test(error.message),
   );
   assert.equal(
     (await gc.runOp("open", { session: "retired-0", url: "https://reused.example/" }, 1_000)).id,
@@ -1163,7 +1243,7 @@ test("an indeterminate remove failure retains the tab for close retry", async ()
     runOp("close", { session: "s1" }, 1_000),
     (error) => error instanceof RelayOpError
       && error.failure === "browser_unavailable"
-      && /needs retry/.test(error.message)
+      && /workspace release needs retry.*retry close/i.test(error.message)
       && /could not be verified/.test(error.details.tabs[0].message),
   );
   const retried = await runOp("close", { session: "s1" }, 1_000);
