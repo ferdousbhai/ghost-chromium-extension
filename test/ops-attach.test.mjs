@@ -469,19 +469,28 @@ test("one ghost workspace cannot see or drive another ghost's tabs", async () =>
 });
 
 test("open closes the load-event gap with the tab's current status", async () => {
+  let snapshotReads = 0;
   globalThis.chrome = chromeMock({
     attach: async () => {},
     tabCreate: async ({ url }, tabs) => {
-      const complete = {
+      const loading = {
         id: 17,
         windowId: 4,
         url,
         title: "Fast page",
-        status: "complete",
+        status: "loading",
       };
-      tabs.set(complete.id, complete);
-      globalThis.chrome.tabs.onUpdated.emit(complete.id, { status: "complete" });
-      return { ...complete, status: "loading" };
+      tabs.set(loading.id, loading);
+      return loading;
+    },
+    tabGet: (id, stale) => {
+      snapshotReads += 1;
+      // This fires synchronously inside tabs.get. Reading before subscribing
+      // would miss the edge, and the deliberately stale snapshot cannot help.
+      if (snapshotReads === 1) {
+        globalThis.chrome.tabs.onUpdated.emit(id, { status: "complete" });
+      }
+      return stale;
     },
   });
   const { runOp } = await import(`../extension/ops.js?load-event-gap=${Date.now()}`);
@@ -494,6 +503,7 @@ test("open closes the load-event gap with the tab's current status", async () =>
 
   assert.equal(opened.id, "17");
   assert.deepEqual(opened.page, { url: "https://fast.example/", title: "Fast page" });
+  assert.ok(snapshotReads >= 1);
 });
 
 test("protocol-4 tab creation refuses a missing workspace owner with recovery", async () => {

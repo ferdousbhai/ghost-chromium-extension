@@ -12,7 +12,9 @@
  *     bun packages/chromium-extension/contrib/smoke.mjs
  *
  * It launches its **own** Chromium against a throwaway `--user-data-dir`, never
- * the owner's profile, and cleans both up. A window appears for a few seconds.
+ * the owner's profile, and forces captures into a throwaway screenshot directory
+ * regardless of the caller's environment. It cleans all of them up. A window
+ * appears for a few seconds.
  * Pass `--headless` to skip the window (note that `chrome.debugger` and real
  * input work fine in Chrome's headless mode, but the screenshot compositor is
  * happier headed).
@@ -20,13 +22,14 @@
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..", "..", "..");
 const extensionDir = join(here, "..", "extension");
 const headless = process.argv.includes("--headless");
+const callerScreenshotDir = process.env.OMARCHY_SCREENSHOT_DIR;
 
 const { RelayHub, attachRelay } = await import(join(repoRoot, "packages/daemon/dist/relay.js"));
 const {
@@ -48,6 +51,7 @@ let chromium;
 let profileDir;
 let ghostHome;
 let otherGhostHome;
+let screenshotDir;
 let server;
 let hub;
 let fixtureServer;
@@ -121,6 +125,8 @@ try {
   //    instead: launch, then drive chrome.storage through the extension page.
   profileDir = await mkdtemp(join(tmpdir(), "ghost-relay-smoke-profile-"));
   ghostHome = await mkdtemp(join(tmpdir(), "ghost-relay-smoke-home-"));
+  screenshotDir = resolve(await mkdtemp(join(tmpdir(), "ghost-relay-smoke-screenshots-")));
+  process.env.OMARCHY_SCREENSHOT_DIR = screenshotDir;
 
   chromium = spawn(binary, [
     `--user-data-dir=${profileDir}`,
@@ -196,7 +202,11 @@ try {
   const bytes = (await readFile(shot.path)).length;
   const isPng = (await readFile(shot.path)).subarray(0, 8)
     .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
-  record("screenshot", isPng && bytes > 1000, `${bytes} bytes of PNG at ${shot.path}`);
+  record(
+    "screenshot",
+    isPng && bytes > 1000,
+    `${bytes} bytes of temporary PNG at ${shot.path}`,
+  );
 
   const back = await session.back();
   record("back", back.moved && back.url.includes("example.com"), `${back.url}`);
@@ -298,7 +308,9 @@ try {
   chromium?.kill("SIGTERM");
   await new Promise((resolve) => setTimeout(resolve, 500));
   chromium?.kill("SIGKILL");
-  for (const dir of [profileDir, ghostHome, otherGhostHome]) {
+  if (callerScreenshotDir === undefined) delete process.env.OMARCHY_SCREENSHOT_DIR;
+  else process.env.OMARCHY_SCREENSHOT_DIR = callerScreenshotDir;
+  for (const dir of [profileDir, ghostHome, otherGhostHome, screenshotDir]) {
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
@@ -371,9 +383,10 @@ async function pairViaCdp(base, relayPort) {
 async function checkPopup(base, extensionId) {
   if (!extensionId) return { ok: false, detail: "no extension id" };
   const url = `chrome-extension://${extensionId}/popup.html`;
-  const created = await fetch(`${base}/json/new?${encodeURIComponent(url)}`, {
+  const deadline = Date.now() + 10_000;
+  const created = await fetch(`${base}/json/new?${encodeURIComponent("about:blank")}`, {
     method: "PUT",
-    signal: AbortSignal.timeout(2_000),
+    signal: AbortSignal.timeout(remainingCdpBudget(deadline)),
   })
     .then((response) => response.json())
     .catch((error) => ({ error: error.message }));
@@ -382,20 +395,44 @@ async function checkPopup(base, extensionId) {
   }
   let socket;
   try {
-    socket = await openCdpSocket(created.webSocketDebuggerUrl, "attach to the popup");
-    const diagnostics = [];
+    socket = await openCdpSocket(
+      created.webSocketDebuggerUrl,
+      "attach to the popup",
+      remainingCdpBudget(deadline),
+    );
+    const diagnostics = { exceptions: [], observationErrors: [] };
     socket.addEventListener("message", (event) => {
       const message = JSON.parse(event.data);
       if (message.method !== "Runtime.exceptionThrown") return;
       const exception = message.params?.exceptionDetails;
-      diagnostics.push(exception?.exception?.description ?? exception?.text ?? "popup exception");
+      if (diagnostics.exceptions.length < 20) {
+        diagnostics.exceptions.push(
+          exception?.exception?.description ?? exception?.text ?? "popup exception",
+        );
+      }
     });
-    await cdpRequest(socket, 1, "Runtime.enable", {}, "enable popup diagnostics");
+    await cdpRequest(
+      socket,
+      1,
+      "Runtime.enable",
+      {},
+      "enable popup diagnostics",
+      remainingCdpBudget(deadline),
+    );
+    const navigation = await cdpRequest(
+      socket,
+      2,
+      "Page.navigate",
+      { url },
+      "navigate to the popup",
+      remainingCdpBudget(deadline),
+    );
+    const navigationError = navigation?.result?.errorText;
+    if (navigationError) throw new Error(`popup navigation failed: ${navigationError}`);
 
     let rendered = null;
     let lastObservation = null;
-    const deadline = Date.now() + 10_000;
-    for (let id = 2; Date.now() <= deadline; id += 1) {
+    for (let id = 3; Date.now() <= deadline; id += 1) {
       try {
         const answer = await cdpRequest(socket, id, "Runtime.evaluate", {
           returnByValue: true,
@@ -407,7 +444,7 @@ async function checkPopup(base, extensionId) {
             token: document.getElementById("token")?.value.length ?? null,
             toggle: document.getElementById("toggle")?.textContent ?? null,
           })`,
-        }, "read popup state");
+        }, "read popup state", remainingCdpBudget(deadline));
         const raw = answer?.result?.result?.value;
         lastObservation = typeof raw === "string" ? JSON.parse(raw) : answer?.result;
         if (lastObservation?.url === url
@@ -418,9 +455,12 @@ async function checkPopup(base, extensionId) {
           break;
         }
       } catch (error) {
-        diagnostics.push(error?.message ?? String(error));
+        if (diagnostics.observationErrors.length < 20) {
+          diagnostics.observationErrors.push(error?.message ?? String(error));
+        }
       }
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      const pause = Math.min(100, deadline - Date.now());
+      if (pause > 0) await new Promise((resolve) => setTimeout(resolve, pause));
     }
     if (rendered === null) {
       return {
@@ -428,13 +468,16 @@ async function checkPopup(base, extensionId) {
         detail: `popup did not settle: ${JSON.stringify({ lastObservation, diagnostics })}`,
       };
     }
-    const ok = rendered.status === "Not paired"
+    const ok = diagnostics.exceptions.length === 0
+      && rendered.status === "Not paired"
       && typeof rendered.detail === "string" && rendered.detail !== ""
       && rendered.token === 0
       && rendered.toggle === "Pause";
     return {
       ok,
-      detail: `unauthorized fallback ${JSON.stringify(rendered.status)}, token ${rendered.token} chars`,
+      detail:
+        `unauthorized fallback ${JSON.stringify(rendered.status)}, token ${rendered.token} chars; `
+        + `diagnostics ${JSON.stringify(diagnostics)}`,
     };
   } finally {
     socket?.close();
