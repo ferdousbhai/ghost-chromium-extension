@@ -37,9 +37,15 @@ test("the real-browser smoke names its harness and preserves popup authorization
   assert.match(smoke, /process\.env\.OMARCHY_SCREENSHOT_DIR = screenshotDir/);
   assert.match(smoke, /delete process\.env\.OMARCHY_SCREENSHOT_DIR/);
   assert.match(smoke, /process\.env\.OMARCHY_SCREENSHOT_DIR = callerScreenshotDir/);
-  assert.match(smoke, /\[profileDir, ghostHome, otherGhostHome, screenshotDir\]/);
+  assert.match(smoke, /removeScratchDirectory\(screenshotDir, "ghost-relay-smoke-screenshots-"\)/);
   assert.match(smoke, /"Runtime\.enable"[\s\S]*"Page\.navigate"/);
   assert.match(smoke, /diagnostics\.exceptions\.length === 0/);
+  assert.match(smoke, /process\.on\("SIGINT"[\s\S]*requestSignalCleanup\("SIGINT", 130\)/);
+  assert.match(smoke, /process\.on\("SIGTERM"[\s\S]*requestSignalCleanup\("SIGTERM", 143\)/);
+  assert.match(smoke, /--wait-for-cleanup-signal/);
+  assert.match(smoke, /cleanupPromise \?\?= runCleanup\(\)/);
+  assert.match(smoke, /markBodyFinished\(\);[\s\S]*await cleanupSmoke\(\)/);
+  assert.match(smoke, /writeSync\(2,/);
 });
 
 test("the reused Lucide icon stays accessible and carries its license notice", async () => {

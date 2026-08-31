@@ -44,6 +44,9 @@ function eventHook() {
       const index = listeners.indexOf(listener);
       if (index !== -1) listeners.splice(index, 1);
     },
+    listenerCount() {
+      return listeners.length;
+    },
   };
 }
 
@@ -488,6 +491,10 @@ test("open closes the load-event gap with the tab's current status", async () =>
       // This fires synchronously inside tabs.get. Reading before subscribing
       // would miss the edge, and the deliberately stale snapshot cannot help.
       if (snapshotReads === 1) {
+        assert.ok(
+          globalThis.chrome.tabs.onUpdated.listenerCount() > 0,
+          "the complete listener must exist before tabs.get reads its snapshot",
+        );
         globalThis.chrome.tabs.onUpdated.emit(id, { status: "complete" });
       }
       return stale;

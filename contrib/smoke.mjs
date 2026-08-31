@@ -20,7 +20,8 @@
  * happier headed).
  */
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtempSync, writeSync } from "node:fs";
+import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,7 +30,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..", "..", "..");
 const extensionDir = join(here, "..", "extension");
 const headless = process.argv.includes("--headless");
+const waitForCleanupSignal = process.argv.includes("--wait-for-cleanup-signal");
 const callerScreenshotDir = process.env.OMARCHY_SCREENSHOT_DIR;
+const CLEANUP_STEP_TIMEOUT_MS = 2_000;
 
 const { RelayHub, attachRelay } = await import(join(repoRoot, "packages/daemon/dist/relay.js"));
 const {
@@ -55,6 +58,13 @@ let screenshotDir;
 let server;
 let hub;
 let fixtureServer;
+let cleanupPromise;
+let signalExitCode;
+let resolveBodyDone;
+let resolveSignalRequested;
+let bodyFinished = false;
+const bodyDone = new Promise((resolve) => { resolveBodyDone = resolve; });
+const signalRequested = new Promise((resolve) => { resolveSignalRequested = resolve; });
 
 /**
  * A page to type into, served from loopback.
@@ -94,6 +104,12 @@ function waitFor(predicate, timeoutMs, what) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     const tick = () => {
+      try {
+        throwIfSignalRequested();
+      } catch (error) {
+        reject(error);
+        return;
+      }
       if (predicate()) return resolve();
       if (Date.now() > deadline) return reject(new Error(`timed out waiting for ${what}`));
       setTimeout(tick, 100);
@@ -102,18 +118,196 @@ function waitFor(predicate, timeoutMs, what) {
   });
 }
 
+function throwIfSignalRequested() {
+  if (signalExitCode !== undefined) {
+    throw new Error(`smoke interrupted with exit status ${signalExitCode}`);
+  }
+}
+
+function markBodyFinished() {
+  if (bodyFinished) return;
+  bodyFinished = true;
+  resolveBodyDone();
+}
+
+function boundedCleanup(work, timeoutMs, what) {
+  let timer;
+  return Promise.race([
+    Promise.resolve().then(work).finally(() => clearTimeout(timer)),
+    new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} timed out`)), timeoutMs);
+    }),
+  ]);
+}
+
+function closeServer(captured) {
+  if (!captured) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    try {
+      captured.close((error) => {
+        if (error && error.code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+        else resolve();
+      });
+    } catch (error) {
+      if (error?.code === "ERR_SERVER_NOT_RUNNING") resolve();
+      else reject(error);
+    }
+  });
+}
+
+function childHasExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (childHasExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (exited) => {
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
+function settlesWithin(promise, timeoutMs) {
+  let timer;
+  return Promise.race([
+    promise.then(() => true).finally(() => clearTimeout(timer)),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    }),
+  ]);
+}
+
+async function stopChromium() {
+  const child = chromium;
+  if (!child || childHasExited(child)) return;
+  child.kill("SIGTERM");
+  if (await waitForChildExit(child, 500)) return;
+  child.kill("SIGKILL");
+  if (!await waitForChildExit(child, 1_000)) {
+    throw new Error(`captured Chromium child ${child.pid} did not exit`);
+  }
+}
+
+async function removeScratchDirectory(dir, prefix) {
+  if (!dir) return;
+  const absolute = resolve(dir);
+  const expectedPrefix = resolve(tmpdir(), prefix);
+  if (!absolute.startsWith(expectedPrefix) || absolute === expectedPrefix) {
+    throw new Error(`refusing to remove non-smoke directory ${absolute}`);
+  }
+  await rm(absolute, { recursive: true, force: true });
+}
+
+async function runCleanup() {
+  const errors = [];
+  let interruptedActiveResources = false;
+  const attempt = async (what, work, timeoutMs = CLEANUP_STEP_TIMEOUT_MS) => {
+    try {
+      await boundedCleanup(work, timeoutMs, what);
+    } catch (error) {
+      errors.push(new Error(`${what}: ${error?.message ?? error}`));
+    }
+  };
+
+  if (signalExitCode !== undefined && !bodyFinished) {
+    // Give signal-aware work one turn to enter the shared finally. If an active
+    // browser operation is stuck, retire its captured transport and child; the
+    // child exit owns those ephemeral tabs, so a later graceful session close
+    // would only report the transport failure this interruption just caused.
+    if (!await settlesWithin(bodyDone, 100)) {
+      interruptedActiveResources = true;
+      await Promise.all([
+        attempt("interrupting the relay hub", () => hub?.close()),
+        attempt("interrupting captured Chromium", stopChromium),
+      ]);
+      await attempt("waiting for the smoke body to stop", () => bodyDone, 5_000);
+    }
+  }
+
+  if (!interruptedActiveResources) {
+    await attempt("closing browser sessions", () => closeAllBrowserSessions());
+  }
+  await attempt("closing the relay hub", () => hub?.close());
+  await Promise.all([
+    attempt("closing the relay server", () => closeServer(server)),
+    attempt("closing the fixture server", () => closeServer(fixtureServer)),
+  ]);
+  await attempt("stopping captured Chromium", stopChromium);
+
+  if (callerScreenshotDir === undefined) delete process.env.OMARCHY_SCREENSHOT_DIR;
+  else process.env.OMARCHY_SCREENSHOT_DIR = callerScreenshotDir;
+
+  await Promise.all([
+    attempt(
+      "removing the Chromium profile",
+      () => removeScratchDirectory(profileDir, "ghost-relay-smoke-profile-"),
+    ),
+    attempt(
+      "removing the ghost home",
+      () => removeScratchDirectory(ghostHome, "ghost-relay-smoke-home-"),
+    ),
+    attempt(
+      "removing the other ghost home",
+      () => removeScratchDirectory(otherGhostHome, "ghost-relay-smoke-other-home-"),
+    ),
+    attempt(
+      "removing screenshots",
+      () => removeScratchDirectory(screenshotDir, "ghost-relay-smoke-screenshots-"),
+    ),
+  ]);
+
+  if (errors.length > 0) {
+    throw new AggregateError(
+      errors,
+      `smoke cleanup failed: ${errors.map((error) => error.message).join("; ")}`,
+    );
+  }
+}
+
+function cleanupSmoke() {
+  cleanupPromise ??= runCleanup();
+  return cleanupPromise;
+}
+
+function requestSignalCleanup(signal, exitCode) {
+  if (signalExitCode !== undefined) return;
+  signalExitCode = exitCode;
+  resolveSignalRequested();
+  void cleanupSmoke().then(
+    () => process.exit(exitCode),
+    (error) => {
+      try {
+        writeSync(2, `${signal} cleanup failed: ${error?.message ?? error}\n`);
+      } catch { /* there is no safer diagnostic channel during signal exit */ }
+      process.exit(exitCode);
+    },
+  );
+}
+
+process.on("SIGINT", () => requestSignalCleanup("SIGINT", 130));
+process.on("SIGTERM", () => requestSignalCleanup("SIGTERM", 143));
+
 try {
   const binary = await findChromium();
+  throwIfSignalRequested();
   if (!binary) {
     process.stderr.write("No chromium on PATH. sudo pacman -S chromium\n");
     process.exit(2);
   }
 
   // 1. An in-process relay harness on an ephemeral loopback port.
+  throwIfSignalRequested();
   hub = new RelayHub({ token: TOKEN, pingIntervalMs: 20_000 });
   server = createServer((_request, response) => response.writeHead(404).end());
   attachRelay(server, hub);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  throwIfSignalRequested();
   const port = server.address().port;
   record("relay listening", true, `ws://127.0.0.1:${port}/relay`);
 
@@ -123,11 +317,17 @@ try {
   //    own first run — simplest reliable path is a preferences-free approach:
   //    write a tiny bootstrap file the extension reads. We do it the honest way
   //    instead: launch, then drive chrome.storage through the extension page.
-  profileDir = await mkdtemp(join(tmpdir(), "ghost-relay-smoke-profile-"));
-  ghostHome = await mkdtemp(join(tmpdir(), "ghost-relay-smoke-home-"));
-  screenshotDir = resolve(await mkdtemp(join(tmpdir(), "ghost-relay-smoke-screenshots-")));
+  // Resource acquisition stays synchronous so a signal handler can never clean
+  // an uncaptured path while a late filesystem operation is still creating it.
+  profileDir = mkdtempSync(join(tmpdir(), "ghost-relay-smoke-profile-"));
+  throwIfSignalRequested();
+  ghostHome = mkdtempSync(join(tmpdir(), "ghost-relay-smoke-home-"));
+  throwIfSignalRequested();
+  screenshotDir = resolve(mkdtempSync(join(tmpdir(), "ghost-relay-smoke-screenshots-")));
+  throwIfSignalRequested();
   process.env.OMARCHY_SCREENSHOT_DIR = screenshotDir;
 
+  throwIfSignalRequested();
   chromium = spawn(binary, [
     `--user-data-dir=${profileDir}`,
     `--load-extension=${extensionDir}`,
@@ -143,6 +343,7 @@ try {
     ...(headless ? ["--headless=new"] : []),
     "about:blank",
   ], { stdio: ["ignore", "pipe", "pipe"] });
+  throwIfSignalRequested();
 
   let devtoolsUrl = "";
   chromium.stderr.on("data", (chunk) => {
@@ -156,11 +357,13 @@ try {
   //    find the extension's service worker target and evaluate `chrome.storage`.
   const base = `http://127.0.0.1:${new URL(devtoolsUrl).port}`;
   const paired = await pairViaCdp(base, port);
+  throwIfSignalRequested();
   record("extension paired", paired.ok, paired.detail);
   if (!paired.ok) throw new Error(paired.detail);
   const extensionId = paired.extensionId;
 
   await waitFor(() => hub.connected, 20_000, "the extension to dial in");
+  throwIfSignalRequested();
   record("extension connected", true, hub.peer ?? "");
 
   // 4. Drive one full round through the real session layer, so URL policy, ref
@@ -174,6 +377,7 @@ try {
     // local addresses unless the session was configured to allow them.
     allowLocal: true,
   };
+  throwIfSignalRequested();
   const session = browserSessionFor(ghostHome, sessionOptions);
 
   const opened = await session.open("https://example.com");
@@ -213,6 +417,7 @@ try {
 
   // 5. Typing, against a local fixture so the assertion is about the relay and
   //    not about someone else's search page.
+  throwIfSignalRequested();
   fixtureServer = createServer((request, response) => {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     response.end(
@@ -222,6 +427,7 @@ try {
     );
   });
   await new Promise((resolve) => fixtureServer.listen(0, "127.0.0.1", resolve));
+  throwIfSignalRequested();
   const fixtureUrl = `http://127.0.0.1:${fixtureServer.address().port}/`;
 
   await session.open(fixtureUrl, { allowLocal: true });
@@ -247,6 +453,7 @@ try {
   // 5b. Exercise the production ownership model: one resolved ghost home is one
   //     shared workspace across conversations, with multiple tabs; another home
   //     gets a separate protocol owner over the same extension socket.
+  throwIfSignalRequested();
   const sameGhost = browserSessionFor(join(ghostHome, "."), {
     ...sessionOptions,
     backend: relayBackend({ transport: hub }),
@@ -266,7 +473,8 @@ try {
     `tabs ${shared.tabs.map((tab) => tab.id).join(", ")}; active ${shared.active}`,
   );
 
-  otherGhostHome = await mkdtemp(join(tmpdir(), "ghost-relay-smoke-other-home-"));
+  otherGhostHome = mkdtempSync(join(tmpdir(), "ghost-relay-smoke-other-home-"));
+  throwIfSignalRequested();
   const otherGhost = browserSessionFor(otherGhostHome, {
     ...sessionOptions,
     backend: relayBackend({ transport: hub }),
@@ -280,6 +488,19 @@ try {
       && mine.tabs.every((tab) => !theirs.tabs.some((otherTab) => otherTab.id === tab.id)),
     `first ghost: ${mine.tabs.map((tab) => tab.id).join(", ")}; other: ${theirs.active}`,
   );
+
+  if (waitForCleanupSignal) {
+    process.stdout.write(`cleanup checkpoint ${JSON.stringify({
+      smokePid: process.pid,
+      chromiumPid: chromium.pid,
+      profileDir,
+      ghostHome,
+      otherGhostHome,
+      screenshotDir,
+    })}\n`);
+    await signalRequested;
+    throwIfSignalRequested();
+  }
 
   await closeBrowserSession(otherGhostHome);
   const afterOtherClosed = await session.tabs({ op: "list" });
@@ -301,20 +522,15 @@ try {
 } catch (error) {
   record("smoke run", false, error?.message ?? String(error));
 } finally {
-  await closeAllBrowserSessions().catch(() => {});
-  await hub?.close().catch(() => {});
-  await new Promise((resolve) => (server ? server.close(resolve) : resolve()));
-  await new Promise((resolve) => (fixtureServer ? fixtureServer.close(resolve) : resolve()));
-  chromium?.kill("SIGTERM");
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  chromium?.kill("SIGKILL");
-  if (callerScreenshotDir === undefined) delete process.env.OMARCHY_SCREENSHOT_DIR;
-  else process.env.OMARCHY_SCREENSHOT_DIR = callerScreenshotDir;
-  for (const dir of [profileDir, ghostHome, otherGhostHome, screenshotDir]) {
-    if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  markBodyFinished();
+  try {
+    await cleanupSmoke();
+  } catch (error) {
+    record("cleanup", false, error?.message ?? String(error));
   }
 }
 
+if (signalExitCode !== undefined) process.exit(signalExitCode);
 const failed = steps.filter((step) => !step.ok);
 process.stdout.write(`\n${steps.length - failed.length}/${steps.length} steps passed\n`);
 process.exit(failed.length === 0 ? 0 : 1);
@@ -328,6 +544,7 @@ async function pairViaCdp(base, relayPort) {
   let lastDetail = "the extension's service worker has not appeared";
   const deadline = Date.now() + 20_000;
   while (Date.now() <= deadline) {
+    throwIfSignalRequested();
     const targets = await fetch(`${base}/json/list`, {
       signal: AbortSignal.timeout(remainingCdpBudget(deadline)),
     }).then((r) => r.json()).catch(() => []);
@@ -381,6 +598,7 @@ async function pairViaCdp(base, relayPort) {
  * background rejects any status/settings sender with `sender.tab` present.
  */
 async function checkPopup(base, extensionId) {
+  throwIfSignalRequested();
   if (!extensionId) return { ok: false, detail: "no extension id" };
   const url = `chrome-extension://${extensionId}/popup.html`;
   const deadline = Date.now() + 10_000;
@@ -433,6 +651,7 @@ async function checkPopup(base, extensionId) {
     let rendered = null;
     let lastObservation = null;
     for (let id = 3; Date.now() <= deadline; id += 1) {
+      throwIfSignalRequested();
       try {
         const answer = await cdpRequest(socket, id, "Runtime.evaluate", {
           returnByValue: true,
