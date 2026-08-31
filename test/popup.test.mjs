@@ -121,6 +121,27 @@ test("interval refresh is bounded and single-flight when the worker hangs", asyn
   firstStatus.resolve({ connected: false, paired: false, token: "", tabs: [] });
 });
 
+test("an extension tab without popup authority renders a bounded fallback", async () => {
+  const document = popupDocument();
+  globalThis.document = document;
+  globalThis.chrome = {
+    runtime: {
+      // Chrome resolves sendMessage with undefined when no listener accepts it.
+      sendMessage: async () => undefined,
+    },
+  };
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+
+  await import(`../extension/popup.js?unauthorized-tab=${Date.now()}`);
+  await settle();
+
+  assert.equal(document.elements.statusText.textContent, "Not paired");
+  assert.match(document.elements.detail.textContent, /did not return status to this page/i);
+  assert.equal(document.elements.token.value, "");
+  assert.equal(document.elements.toggle.textContent, "Pause");
+});
+
 test("save and toggle are bounded and never overlap", async () => {
   const firstUpdate = deferred();
   const updates = [];

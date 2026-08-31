@@ -468,6 +468,34 @@ test("one ghost workspace cannot see or drive another ghost's tabs", async () =>
   assert.deepEqual(removed, []);
 });
 
+test("open closes the load-event gap with the tab's current status", async () => {
+  globalThis.chrome = chromeMock({
+    attach: async () => {},
+    tabCreate: async ({ url }, tabs) => {
+      const complete = {
+        id: 17,
+        windowId: 4,
+        url,
+        title: "Fast page",
+        status: "complete",
+      };
+      tabs.set(complete.id, complete);
+      globalThis.chrome.tabs.onUpdated.emit(complete.id, { status: "complete" });
+      return { ...complete, status: "loading" };
+    },
+  });
+  const { runOp } = await import(`../extension/ops.js?load-event-gap=${Date.now()}`);
+
+  const opened = await runOp(
+    "open",
+    { session: "fast-page", url: "https://fast.example/" },
+    1_000,
+  );
+
+  assert.equal(opened.id, "17");
+  assert.deepEqual(opened.page, { url: "https://fast.example/", title: "Fast page" });
+});
+
 test("protocol-4 tab creation refuses a missing workspace owner with recovery", async () => {
   globalThis.chrome = chromeMock({ attach: async () => {} });
   const { runOp } = await import(`../extension/ops.js?missing-owner=${Date.now()}`);

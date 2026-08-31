@@ -313,49 +313,54 @@ process.exit(failed.length === 0 ? 0 : 1);
  * popup; nothing in the shipped path uses it.
  */
 async function pairViaCdp(base, relayPort) {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    const targets = await fetch(`${base}/json/list`).then((r) => r.json()).catch(() => []);
+  let lastDetail = "the extension's service worker has not appeared";
+  const deadline = Date.now() + 20_000;
+  while (Date.now() <= deadline) {
+    const targets = await fetch(`${base}/json/list`, {
+      signal: AbortSignal.timeout(remainingCdpBudget(deadline)),
+    }).then((r) => r.json()).catch(() => []);
     const worker = targets.find(
       (target) => target.type === "service_worker" && target.url.includes("background.js"),
     );
     if (worker) {
-      // Node 22's own WebSocket client; no dependency needed for a smoke script.
-      const socket = new WebSocket(worker.webSocketDebuggerUrl);
-      await new Promise((resolve, reject) => {
-        socket.onopen = resolve;
-        socket.onerror = () => reject(new Error("could not attach to the service worker"));
-      });
-      const answer = await new Promise((resolve, reject) => {
-        socket.onmessage = (event) => {
-          const message = JSON.parse(event.data);
-          if (message.id === 1) resolve(message);
-        };
-        setTimeout(() => reject(new Error("no answer from the service worker")), 15_000);
-        socket.send(JSON.stringify({
-          id: 1,
-          method: "Runtime.evaluate",
-          params: {
-            awaitPromise: true,
-            returnByValue: true,
-            expression:
-              `chrome.storage.local.set({ token: ${JSON.stringify(TOKEN)}, `
-              + `port: ${relayPort}, enabled: true }).then(() => "stored")`,
-          },
-        }));
-      });
-      socket.close();
-      const value = answer?.result?.result?.value;
-      return value === "stored"
-        ? {
-          ok: true,
-          detail: `token written to chrome.storage.local, port ${relayPort}`,
-          extensionId: new URL(worker.url).host,
+      let socket;
+      try {
+        // Node 22's own WebSocket client; no dependency needed for a smoke script.
+        socket = await openCdpSocket(
+          worker.webSocketDebuggerUrl,
+          "attach to the service worker",
+          remainingCdpBudget(deadline),
+        );
+        const answer = await cdpRequest(socket, 1, "Runtime.evaluate", {
+          awaitPromise: true,
+          returnByValue: true,
+          expression: `(async () => {
+            if (typeof globalThis.chrome?.storage?.local?.set !== "function") {
+              return "storage-unavailable";
+            }
+            await chrome.storage.local.set({ token: ${JSON.stringify(TOKEN)}, port: ${relayPort}, enabled: true });
+            return "stored";
+          })()`,
+        }, "pair the extension", remainingCdpBudget(deadline));
+        const value = answer?.result?.result?.value;
+        if (value === "stored") {
+          return {
+            ok: true,
+            detail: `token written to chrome.storage.local, port ${relayPort}`,
+            extensionId: new URL(worker.url).host,
+          };
         }
-        : { ok: false, detail: JSON.stringify(answer?.result ?? answer) };
+        lastDetail = JSON.stringify(answer?.result ?? answer);
+      } catch (error) {
+        lastDetail = error?.message ?? String(error);
+      } finally {
+        socket?.close();
+      }
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    const pause = Math.min(100, deadline - Date.now());
+    if (pause > 0) await new Promise((resolve) => setTimeout(resolve, pause));
   }
-  return { ok: false, detail: "the extension's service worker never appeared in /json/list" };
+  return { ok: false, detail: `extension pairing did not become ready: ${lastDetail}` };
 }
 
 /**
@@ -366,45 +371,63 @@ async function pairViaCdp(base, relayPort) {
 async function checkPopup(base, extensionId) {
   if (!extensionId) return { ok: false, detail: "no extension id" };
   const url = `chrome-extension://${extensionId}/popup.html`;
-  const created = await fetch(`${base}/json/new?${encodeURIComponent(url)}`, { method: "PUT" })
+  const created = await fetch(`${base}/json/new?${encodeURIComponent(url)}`, {
+    method: "PUT",
+    signal: AbortSignal.timeout(2_000),
+  })
     .then((response) => response.json())
     .catch((error) => ({ error: error.message }));
   if (!created?.webSocketDebuggerUrl) {
     return { ok: false, detail: `could not open the popup: ${JSON.stringify(created)}` };
   }
-  const socket = new WebSocket(created.webSocketDebuggerUrl);
+  let socket;
   try {
-    await new Promise((resolve, reject) => {
-      socket.onopen = resolve;
-      socket.onerror = () => reject(new Error("could not attach to the popup"));
+    socket = await openCdpSocket(created.webSocketDebuggerUrl, "attach to the popup");
+    const diagnostics = [];
+    socket.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (message.method !== "Runtime.exceptionThrown") return;
+      const exception = message.params?.exceptionDetails;
+      diagnostics.push(exception?.exception?.description ?? exception?.text ?? "popup exception");
     });
-    // Give popup.js its first rejected refresh round trip to the service worker.
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-    const answer = await new Promise((resolve, reject) => {
-      socket.onmessage = (event) => {
-        const message = JSON.parse(event.data);
-        if (message.id === 1) resolve(message);
-      };
-      setTimeout(() => reject(new Error("the popup never answered")), 10_000);
-      socket.send(JSON.stringify({
-        id: 1,
-        method: "Runtime.evaluate",
-        params: {
+    await cdpRequest(socket, 1, "Runtime.enable", {}, "enable popup diagnostics");
+
+    let rendered = null;
+    let lastObservation = null;
+    const deadline = Date.now() + 10_000;
+    for (let id = 2; Date.now() <= deadline; id += 1) {
+      try {
+        const answer = await cdpRequest(socket, id, "Runtime.evaluate", {
           returnByValue: true,
           expression: `JSON.stringify({
-            status: document.getElementById("statusText").textContent,
-            detail: document.getElementById("detail").textContent,
-            token: document.getElementById("token").value.length,
-            toggle: document.getElementById("toggle").textContent,
+            url: location.href,
+            ready: document.readyState,
+            status: document.getElementById("statusText")?.textContent ?? null,
+            detail: document.getElementById("detail")?.textContent ?? null,
+            token: document.getElementById("token")?.value.length ?? null,
+            toggle: document.getElementById("toggle")?.textContent ?? null,
           })`,
-        },
-      }));
-    });
-    const raw = answer?.result?.result?.value;
-    if (typeof raw !== "string") {
-      return { ok: false, detail: `popup evaluate failed: ${JSON.stringify(answer?.result)}` };
+        }, "read popup state");
+        const raw = answer?.result?.result?.value;
+        lastObservation = typeof raw === "string" ? JSON.parse(raw) : answer?.result;
+        if (lastObservation?.url === url
+            && lastObservation.ready === "complete"
+            && lastObservation.status !== null
+            && lastObservation.status !== "Checking…") {
+          rendered = lastObservation;
+          break;
+        }
+      } catch (error) {
+        diagnostics.push(error?.message ?? String(error));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    const rendered = JSON.parse(raw);
+    if (rendered === null) {
+      return {
+        ok: false,
+        detail: `popup did not settle: ${JSON.stringify({ lastObservation, diagnostics })}`,
+      };
+    }
     const ok = rendered.status === "Not paired"
       && typeof rendered.detail === "string" && rendered.detail !== ""
       && rendered.token === 0
@@ -414,7 +437,57 @@ async function checkPopup(base, extensionId) {
       detail: `unauthorized fallback ${JSON.stringify(rendered.status)}, token ${rendered.token} chars`,
     };
   } finally {
-    socket.close();
-    await fetch(`${base}/json/close/${created.id}`).catch(() => {});
+    socket?.close();
+    await fetch(`${base}/json/close/${created.id}`, {
+      signal: AbortSignal.timeout(2_000),
+    }).catch(() => {});
   }
+}
+
+function remainingCdpBudget(deadline) {
+  return Math.max(1, Math.min(2_000, deadline - Date.now()));
+}
+
+function openCdpSocket(url, what, timeoutMs = 2_000) {
+  const socket = new WebSocket(url);
+  return new Promise((resolve, reject) => {
+    let timer;
+    const finish = (settle, value) => {
+      clearTimeout(timer);
+      socket.onopen = null;
+      socket.onerror = null;
+      settle(value);
+    };
+    socket.onopen = () => finish(resolve, socket);
+    socket.onerror = () => {
+      socket.close();
+      finish(reject, new Error(`could not ${what}`));
+    };
+    timer = setTimeout(() => {
+      socket.close();
+      finish(reject, new Error(`${what} timed out`));
+    }, timeoutMs);
+  });
+}
+
+function cdpRequest(socket, id, method, params, what, timeoutMs = 2_000) {
+  return new Promise((resolve, reject) => {
+    const finish = (settle, value) => {
+      clearTimeout(timer);
+      socket.removeEventListener("message", onMessage);
+      settle(value);
+    };
+    const onMessage = (event) => {
+      const message = JSON.parse(event.data);
+      if (message.id !== id) return;
+      if (message.error) {
+        finish(reject, new Error(`${what}: ${message.error.message ?? JSON.stringify(message.error)}`));
+      } else {
+        finish(resolve, message);
+      }
+    };
+    const timer = setTimeout(() => finish(reject, new Error(`${what} timed out`)), timeoutMs);
+    socket.addEventListener("message", onMessage);
+    socket.send(JSON.stringify({ id, method, params }));
+  });
 }

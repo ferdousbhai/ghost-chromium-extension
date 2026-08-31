@@ -101,9 +101,12 @@ async function refreshNow() {
       chrome.runtime.sendMessage({ type: "ghost-relay-status" }),
       "The relay worker did not answer status in time.",
     );
+    if (typeof status !== "object" || status === null) {
+      throw new Error("The relay worker did not return status to this page.");
+    }
   } catch (error) {
-    // The worker is asleep; sending the message wakes it, so the next tick
-    // answers. Keep the last complete settings snapshot in the meantime.
+    // A sleeping worker may answer the next tick; an unauthorized extension
+    // page never will. Keep the last complete settings snapshot either way.
     render(fallbackStatus(error?.message ?? String(error)));
     return;
   }

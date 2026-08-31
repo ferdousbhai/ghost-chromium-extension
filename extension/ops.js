@@ -1849,6 +1849,7 @@ async function summary(tabId) {
 function waitForLoad(tabId, timeoutMs) {
   return new Promise((resolve) => {
     let settled = false;
+    let timer;
     const finish = (loaded) => {
       if (settled) return;
       settled = true;
@@ -1865,7 +1866,19 @@ function waitForLoad(tabId, timeoutMs) {
     };
     chrome.tabs.onUpdated.addListener(onUpdated);
     chrome.tabs.onRemoved.addListener(onRemoved);
-    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer = setTimeout(() => finish(false), timeoutMs);
+
+    // `tabs.create`/`tabs.update` may return a stale `loading` snapshot after a
+    // fast page has already emitted its `complete` event. Subscribe first, then
+    // close that event gap with a current status read.
+    void chrome.tabs.get(tabId).then(
+      (tab) => {
+        if (tab?.status === "complete") finish(true);
+      },
+      (error) => {
+        if (noSuchTab(error, tabId)) finish(false);
+      },
+    );
   });
 }
 
