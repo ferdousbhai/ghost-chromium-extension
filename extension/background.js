@@ -33,7 +33,6 @@ import {
   reconcileDaemonIncarnation,
   releaseAllTabs,
   restoreTabsFromSession,
-  runOp,
   startOp,
   sweepRetiredTabs,
 } from "./ops.js";
