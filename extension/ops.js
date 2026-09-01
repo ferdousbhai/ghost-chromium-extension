@@ -1564,10 +1564,14 @@ async function tabSnapshot(tabId, targets = null) {
  * `active` marks the one it drives, which is that owner's answer alone. One
  * `getTargets()` call serves the whole list.
  */
-/** The `{ tabs, active }` shape every `tabs` op answers with. */
+/**
+ * The `{ tabs, active }` shape every `tabs` op answers with. Owner-scoped and
+ * fail closed like `status`: a frame whose session is not a string names no
+ * workspace; only the in-process `allTabInfos` ever passes `null`.
+ */
 async function tabsAnswer(session, active) {
   return {
-    tabs: await tabInfos(session, active),
+    tabs: await tabInfos(typeof session === "string" ? session : "", active),
     active: active === null ? null : String(active),
   };
 }
