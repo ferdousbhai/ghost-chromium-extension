@@ -213,7 +213,7 @@ export const FIND_ELEMENTS_SCRIPT = `({ query, limit }) => {
     const ref = "e" + (results.length + 1);
     const described = ghostDescribe(el, ref, cachedText);
     reg.byEl.set(el, ref);
-    reg.byRef.set(ref, { el: new WeakRef(el), tag: described.tag, text: described.text });
+    reg.byRef.set(ref, { el: new WeakRef(el), tag: described.tag });
     results.push(described);
   };
 
@@ -321,9 +321,10 @@ export const RESOLVE_SCRIPT = `({ ref, selector, clickable }) => {
     try { el = document.querySelector(selector); } catch { return { found: false, reason: "bad-selector" }; }
     if (!el) {
       ghostWalk((node) => {
-        if (el || !node.shadowRoot) return;
+        if (el) return false;
+        if (!node.shadowRoot) return;
         try { el = node.shadowRoot.querySelector(selector); } catch {}
-      });
+      }, ${MAX_FIND_SCAN_ELEMENTS});
     }
     if (!el) return { found: false, reason: "no-match" };
   }
@@ -390,9 +391,10 @@ export const FOCUS_AND_CLEAR_SCRIPT = `({ ref, selector }) => {
     try { el = document.querySelector(selector); } catch { return { found: false, reason: "bad-selector" }; }
     if (!el) {
       ghostWalk((node) => {
-        if (el || !node.shadowRoot) return;
+        if (el) return false;
+        if (!node.shadowRoot) return;
         try { el = node.shadowRoot.querySelector(selector); } catch {}
-      });
+      }, ${MAX_FIND_SCAN_ELEMENTS});
     }
   }
   if (!el) return { found: false, reason: ref ? "stale-ref" : "no-match" };
@@ -439,9 +441,10 @@ export const RESOLVE_NODE_SCRIPT = `({ ref, selector }) => {
   try { el = document.querySelector(selector); } catch { return null; }
   if (!el) {
     ghostWalk((node) => {
-      if (el || !node.shadowRoot) return;
+      if (el) return false;
+      if (!node.shadowRoot) return;
       try { el = node.shadowRoot.querySelector(selector); } catch {}
-    });
+    }, ${MAX_FIND_SCAN_ELEMENTS});
   }
   return el;
 }`;

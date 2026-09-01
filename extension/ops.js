@@ -1655,10 +1655,6 @@ function isCurrentAttach(attempt) {
     && tab.attachGeneration === attempt.generation;
 }
 
-async function detachStale(tabId) {
-  await tryDetach(tabId);
-}
-
 async function ensureAttached(args) {
   const tabId = requireTab(args);
   const tab = state.tabs.get(tabId);
@@ -1720,14 +1716,14 @@ async function ensureAttached(args) {
         await chrome.debugger.attach({ tabId }, CDP_VERSION);
       }
       if (!isCurrentAttach(attempt)) {
-        await detachStale(tabId);
+        await tryDetach(tabId);
         throw invalidatedAttach(tabId);
       }
       tab.attached = true;
       tab.domainsEnabled = false;
       await enableDomains(tabId);
       if (!isCurrentAttach(attempt)) {
-        await detachStale(tabId);
+        await tryDetach(tabId);
         throw invalidatedAttach(tabId);
       }
     })().catch((error) => {
@@ -1983,13 +1979,12 @@ const ops = {
   async status(args) {
     const tabId = claimedTab(args);
     const entry = tabId === null ? undefined : state.tabs.get(tabId);
-    // Every claimed tab, not just the caller's: this is what the popup shows the
-    // machine owner, and several ghosts may be holding tabs at once.
     return {
       attached: entry?.attached === true,
       banned: entry?.banned === true,
-      // No protocol owner: this is the popup, whose view is every ghost tab.
-      tabs: await tabInfos(null, tabId),
+      // A protocol owner sees only its own ghost's tabs. The popup calls with no
+      // session — that view is the machine owner's, and it sees every ghost tab.
+      tabs: await tabInfos(args.session ?? null, tabId),
     };
   },
 

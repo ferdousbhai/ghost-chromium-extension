@@ -713,7 +713,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       lastError,
       tabs,
     });
-  })();
+  })().catch(() => respond(null));
   return true;
 });
 

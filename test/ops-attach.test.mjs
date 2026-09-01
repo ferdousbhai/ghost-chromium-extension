@@ -422,22 +422,23 @@ test("two tabs keep their own attachment and isolated world", async () => {
   assert.equal((await runOp("read", { session: "s1", tab: "18" }, 1_000)).text, "tab 18");
 });
 
-test("status names every claimed tab so the popup can show them", async () => {
+test("status shows the popup every claimed tab but a ghost only its own", async () => {
   globalThis.chrome = chromeMock({ attach: async () => {} });
   const { runOp } = await import(`../extension/ops.js?status-tabs=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
-  await runOp("tabs", { session: "s1", op: "create", url: "https://second.example/" }, 1_000);
+  await runOp("open", { session: "s2", url: "https://second.example/" }, 1_000);
 
-  // The popup asks without a tab of its own: it is the machine owner's view of
-  // every ghost-created browser tab.
+  // The popup asks without a session: it is the machine owner's view of every
+  // ghost-created browser tab.
   const all = await runOp("status", {}, 1_000);
   assert.deepEqual(all.tabs.map((tab) => tab.title), ["Tab 17", "Tab 18"]);
   assert.deepEqual(all.tabs.map((tab) => tab.active), [false, false]);
 
-  const one = await runOp("status", { session: "s1", tab: "18" }, 1_000);
+  // A ghost asking over the wire sees only the tabs its own session claimed.
+  const one = await runOp("status", { session: "s2", tab: "18" }, 1_000);
   assert.equal(one.attached, false);
   assert.equal(one.banned, false);
-  assert.deepEqual(one.tabs.map((tab) => tab.active), [false, true]);
+  assert.deepEqual(one.tabs.map((tab) => [tab.title, tab.active]), [["Tab 18", true]]);
 });
 
 test("one ghost workspace cannot see or drive another ghost's tabs", async () => {

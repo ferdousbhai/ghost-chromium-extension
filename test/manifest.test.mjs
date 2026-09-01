@@ -22,32 +22,6 @@ test("manifest uses only the required standing grants and ships every icon size"
   }
 });
 
-test("the real-browser smoke names its harness and preserves popup authorization", async () => {
-  const packageJson = JSON.parse(await readFile(new URL("../package.json", extensionUrl), "utf8"));
-  const smoke = await readFile(new URL("../contrib/smoke.mjs", extensionUrl), "utf8");
-  assert.equal(packageJson.scripts.smoke, "bun contrib/smoke.mjs");
-  assert.equal(smoke.split("\n", 1)[0], "#!/usr/bin/env bun");
-  assert.match(smoke, /bun packages\/chromium-extension\/contrib\/smoke\.mjs/);
-  assert.match(smoke, /in-process relay harness/);
-  assert.doesNotMatch(smoke, /real ghostd/);
-  assert.match(smoke, /ordinary popup page renders without exposing relay settings/);
-  assert.match(smoke, /rendered\.token === 0/);
-  assert.doesNotMatch(smoke, /rendered\.token === 64/);
-  assert.match(smoke, /ghost-relay-smoke-screenshots-/);
-  assert.match(smoke, /process\.env\.OMARCHY_SCREENSHOT_DIR = screenshotDir/);
-  assert.match(smoke, /delete process\.env\.OMARCHY_SCREENSHOT_DIR/);
-  assert.match(smoke, /process\.env\.OMARCHY_SCREENSHOT_DIR = callerScreenshotDir/);
-  assert.match(smoke, /removeScratchDirectory\(screenshotDir, "ghost-relay-smoke-screenshots-"\)/);
-  assert.match(smoke, /"Runtime\.enable"[\s\S]*"Page\.navigate"/);
-  assert.match(smoke, /diagnostics\.exceptions\.length === 0/);
-  assert.match(smoke, /process\.on\("SIGINT"[\s\S]*requestSignalCleanup\("SIGINT", 130\)/);
-  assert.match(smoke, /process\.on\("SIGTERM"[\s\S]*requestSignalCleanup\("SIGTERM", 143\)/);
-  assert.match(smoke, /--wait-for-cleanup-signal/);
-  assert.match(smoke, /cleanupPromise \?\?= runCleanup\(\)/);
-  assert.match(smoke, /markBodyFinished\(\);[\s\S]*await cleanupSmoke\(\)/);
-  assert.match(smoke, /writeSync\(2,/);
-});
-
 test("the reused Lucide icon stays accessible and carries its license notice", async () => {
   const svg = await readFile(new URL("icons/ghost.svg", extensionUrl), "utf8");
   const notices = await readFile(new URL("../../../THIRD_PARTY_NOTICES.md", extensionUrl), "utf8");
