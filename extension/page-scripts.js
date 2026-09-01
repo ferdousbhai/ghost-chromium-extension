@@ -360,8 +360,15 @@ export const RESOLVE_SCRIPT = `({ ref, selector, clickable }) => {
   const x = Math.floor((left + right) / 2);
   const y = Math.floor((top + bottom) / 2);
   if (clickable) {
-    const topEl = document.elementFromPoint(x, y);
+    let topEl = document.elementFromPoint(x, y);
     if (!topEl) return { found: true, actionable: false, reason: "nothing-at-point", tag };
+    // elementFromPoint stops at a shadow host and contains() does not cross
+    // shadow boundaries, so descend into open roots to reach the real target.
+    while (topEl.shadowRoot) {
+      const inner = topEl.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === topEl) break;
+      topEl = inner;
+    }
     const hit = topEl === el || el.contains(topEl) || topEl.contains(el);
     if (!hit) {
       const blocker = topEl.tagName.toLowerCase()
@@ -404,7 +411,9 @@ export const FOCUS_AND_CLEAR_SCRIPT = `({ ref, selector }) => {
     return { found: true, editable: false, reason: "select", tag };
   }
   try { el.focus({ preventScroll: false }); } catch {}
-  if (document.activeElement !== el && !el.isContentEditable) {
+  // For an element inside an open shadow root, document.activeElement is the
+  // host; the element's own root reports the real focus target.
+  if (el.getRootNode().activeElement !== el && !el.isContentEditable) {
     return { found: true, editable: false, reason: "not-focusable", tag };
   }
 

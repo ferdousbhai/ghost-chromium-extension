@@ -27,6 +27,7 @@
  */
 import { PROTOCOL_VERSION, RELAY_PATH, SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX, toErrorFrame } from "./protocol.js";
 import {
+  allTabInfos,
   installOpsListeners,
   repairBrowserPersistence,
   reconcileDaemonIncarnation,
@@ -699,8 +700,9 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     const settings = await loadSettings();
     let tabs = [];
     try {
-      const status = await runOp("status", {}, 2_000);
-      if (Array.isArray(status.tabs)) tabs = status.tabs;
+      // The popup is the machine owner's surface, so it lists every ghost's
+      // tabs — through the in-process view, never the owner-scoped wire op.
+      tabs = await allTabInfos();
     } catch {
       // No tab yet is the normal case.
     }
@@ -713,7 +715,13 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       lastError,
       tabs,
     });
-  })().catch(() => respond(null));
+  })().catch(() => {
+    // respond itself can throw once the popup's channel is gone; the popup's
+    // own deadline already covers a missing reply.
+    try {
+      respond(null);
+    } catch {}
+  });
   return true;
 });
 

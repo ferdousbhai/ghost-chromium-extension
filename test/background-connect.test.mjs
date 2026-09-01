@@ -1022,7 +1022,13 @@ test("a late operation result cannot cross into a replacement socket", async () 
   await settle();
 
   first.onmessage({
-    data: JSON.stringify({ t: "req", id: 41, op: "status", args: { tab: "17" }, timeoutMs: 1_000 }),
+    data: JSON.stringify({
+      t: "req",
+      id: 41,
+      op: "status",
+      args: { session: "socket-session", tab: "17" },
+      timeoutMs: 1_000,
+    }),
   });
   await settle();
   stored = { ...stored, token: "second-token" };

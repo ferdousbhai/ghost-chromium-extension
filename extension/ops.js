@@ -1572,6 +1572,14 @@ async function tabsAnswer(session, active) {
   };
 }
 
+/**
+ * The machine owner's view of every ghost-claimed tab, for the popup alone.
+ * Not a wire op: the socket protocol only ever sees the owner-scoped `status`.
+ */
+export function allTabInfos() {
+  return tabInfos(null, null);
+}
+
 async function tabInfos(session, active) {
   const targets = await chrome.debugger.getTargets().catch(() => []);
   // A protocol owner sees the tabs its ghost opened. The popup asks with no
@@ -1982,9 +1990,10 @@ const ops = {
     return {
       attached: entry?.attached === true,
       banned: entry?.banned === true,
-      // A protocol owner sees only its own ghost's tabs. The popup calls with no
-      // session — that view is the machine owner's, and it sees every ghost tab.
-      tabs: await tabInfos(args.session ?? null, tabId),
+      // Owner-scoped, fail closed: an absent session names no workspace and
+      // sees nothing. The machine owner's all-tabs view is `allTabInfos`,
+      // reachable only in-process by the popup, never over the wire.
+      tabs: await tabInfos(typeof args.session === "string" ? args.session : "", tabId),
     };
   },
 
