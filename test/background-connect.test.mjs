@@ -1322,6 +1322,37 @@ test("an unpaired worker dials with a code and stores the token the daemon hands
   assert.equal(status.pairingCode, null);
 });
 
+test("a restarted worker keeps showing the code it stored", async () => {
+  const sockets = [];
+  const sessionWrites = [];
+  globalThis.chrome = chromeMock({
+    loadSettings: async () => ({ port: 7717, token: "", enabled: true }),
+    restoreSession: async (defaults) => Object.hasOwn(defaults, "ghostPairingCode")
+      ? { ghostPairingCode: "246810" }
+      : { ghostTabId: null },
+    persistSession: async (value) => sessionWrites.push(value),
+  });
+  globalThis.WebSocket = class {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor(_url, protocols) {
+      this.protocols = protocols;
+      this.readyState = 0;
+      sockets.push(this);
+    }
+
+    close() {}
+  };
+
+  await import(`../extension/background.js?pairing-restore=${Date.now()}`);
+  await settle();
+  await settle();
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].protocols[1], `${PAIR_SUBPROTOCOL_PREFIX}246810`);
+  assert.deepEqual(sessionWrites, [], "a restored code is not rewritten");
+});
+
 test("a denied pairing stops redialing until the popup asks again", async () => {
   const sockets = [];
   const timers = [];

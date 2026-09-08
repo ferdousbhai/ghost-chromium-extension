@@ -93,6 +93,9 @@ let lastError = "";
 let pairingCode = null;
 let pairingSocket = null;
 let pairingDenied = false;
+// The code survives a worker restart (chrome.storage.session), so the number
+// on the HUD stays the number in the popup even if Chromium reaps the worker.
+const PAIRING_CODE_KEY = "ghostPairingCode";
 const PAIRING_DENIED_MESSAGE = "Ghost denied this browser. Try again to ask once more.";
 const PAIRING_WAITING_MESSAGE = "Open Ghost (Super+Ctrl+G) and choose Allow for this code.";
 /**
@@ -435,7 +438,7 @@ async function connectOnce(epoch) {
       void setBadge("off");
       return;
     }
-    dialForPairing(settings.port);
+    await dialForPairing(settings.port);
     return;
   }
 
@@ -609,8 +612,13 @@ function newPairingCode() {
  * "no" is the daemon's denied code. The code stays put across redials so what
  * the popup shows and what the HUD shows are the same number.
  */
-function dialForPairing(port) {
-  if (pairingCode === null) pairingCode = newPairingCode();
+async function dialForPairing(port) {
+  if (pairingCode === null) pairingCode = await restorePairingCode();
+  if (pairingCode === null) {
+    pairingCode = newPairingCode();
+    void chrome.storage.session.set({ [PAIRING_CODE_KEY]: pairingCode }).catch(() => {});
+  }
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   const url = `ws://127.0.0.1:${port}${RELAY_PATH}`;
   let socket;
   try {
@@ -645,17 +653,32 @@ function dialForPairing(port) {
   };
 }
 
+async function restorePairingCode() {
+  try {
+    const stored = await chrome.storage.session.get({ [PAIRING_CODE_KEY]: null });
+    const code = stored?.[PAIRING_CODE_KEY];
+    return typeof code === "string" && /^[0-9]{6}$/.test(code) ? code : null;
+  } catch {
+    return null;
+  }
+}
+
+function forgetPairingCode() {
+  pairingCode = null;
+  void chrome.storage.session.remove(PAIRING_CODE_KEY).catch(() => {});
+}
+
 function onPairingClosed(event) {
   void setBadge("off");
   if (event?.code === 4001) {
     pairingDenied = true;
-    pairingCode = null;
+    forgetPairingCode();
     lastError = PAIRING_DENIED_MESSAGE;
     return;
   }
   if (event?.code === 4002) {
     // Expired or replaced: the number on screen is stale, so pick a new one.
-    pairingCode = null;
+    forgetPairingCode();
   } else if (event?.code === 1006) {
     lastError = "ghostd is not answering on that port. Is it running?";
   }
@@ -664,7 +687,7 @@ function onPairingClosed(event) {
 
 async function acceptPairing(socket, token) {
   if (typeof token !== "string" || token.trim() === "") return;
-  pairingCode = null;
+  forgetPairingCode();
   pairingDenied = false;
   try {
     await updateRelaySettings({ token });
@@ -685,7 +708,7 @@ async function acceptPairing(socket, token) {
 /** The popup's "Try again" after a denial: forget the no and dial afresh. */
 function retryPairing() {
   pairingDenied = false;
-  pairingCode = null;
+  forgetPairingCode();
   reconnectDelay = RECONNECT_MIN_MS;
   return connect();
 }
@@ -700,6 +723,7 @@ async function handleFrame(socket, raw) {
   }
   if (pairingSocket === socket) {
     if (frame?.t === "paired") await acceptPairing(socket, frame.token);
+    // `pairing` frames are the daemon keeping this worker alive; nothing to do.
     return;
   }
   if (frame?.t === "welcome") {
