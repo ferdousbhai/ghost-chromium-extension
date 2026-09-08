@@ -18,6 +18,10 @@ export const PROTOCOL_VERSION = 4;
 // version. Renaming it would unpair every installed browser.
 export const SUBPROTOCOL = "ghost-relay.v1";
 export const TOKEN_SUBPROTOCOL_PREFIX = "ghost-token.";
+// An unpaired extension offers a six-digit code here instead of a token. The
+// owner allows that code in the HUD or with `ghost browser allow`, and the
+// daemon answers with a `paired` frame carrying the token.
+export const PAIR_SUBPROTOCOL_PREFIX = "ghost-pair.";
 export const RELAY_PATH = "/relay";
 
 /**

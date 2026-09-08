@@ -1,9 +1,23 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { PROTOCOL_VERSION } from "../extension/protocol.js";
+import { PAIR_SUBPROTOCOL_PREFIX, PROTOCOL_VERSION, SUBPROTOCOL } from "../extension/protocol.js";
 
 const originalChrome = globalThis.chrome;
-const originalWebSocket = globalThis.WebSocket;
+// Never Node's real WebSocket: an unpaired worker dials for pairing on import,
+// and a test must not reach a live daemon port. Tests that care install their
+// own fake; this inert one is the floor.
+class InertWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+
+  constructor() {
+    this.readyState = 0;
+  }
+
+  close() {}
+}
+const originalWebSocket = InertWebSocket;
+globalThis.WebSocket = InertWebSocket;
 const originalSetTimeout = globalThis.setTimeout;
 const originalClearTimeout = globalThis.clearTimeout;
 const originalSetInterval = globalThis.setInterval;
@@ -19,8 +33,7 @@ function incarnationPublication(incarnation, revision = 2) {
 afterEach(() => {
   if (originalChrome === undefined) delete globalThis.chrome;
   else globalThis.chrome = originalChrome;
-  if (originalWebSocket === undefined) delete globalThis.WebSocket;
-  else globalThis.WebSocket = originalWebSocket;
+  globalThis.WebSocket = originalWebSocket;
   globalThis.setTimeout = originalSetTimeout;
   globalThis.clearTimeout = originalClearTimeout;
   globalThis.setInterval = originalSetInterval;
@@ -343,22 +356,25 @@ test("hung cosmetic badge I/O cannot pin unpaired alarm or settings recovery", a
     static CONNECTING = 0;
     static OPEN = 1;
 
-    constructor(url) {
+    constructor(url, protocols) {
       this.readyState = FakeWebSocket.CONNECTING;
-      sockets.push(url);
+      sockets.push(protocols[1].startsWith(PAIR_SUBPROTOCOL_PREFIX) ? `pair ${url}` : url);
     }
+
+    close() {}
   };
 
   await import(`../extension/background.js?badge-hang=${Date.now()}`);
   await settle();
   chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
   await settle();
-  assert.deepEqual(sockets, []);
+  // Unpaired, the worker dials for pairing without waiting on the badge.
+  assert.deepEqual(sockets, ["pair ws://127.0.0.1:7717/relay"]);
 
   settings = { ...settings, token: "paired" };
   chrome.storage.onChanged.emit({ token: { oldValue: "", newValue: "paired" } }, "local");
-  for (let attempt = 0; attempt < 20 && sockets.length === 0; attempt += 1) await settle();
-  assert.deepEqual(sockets, ["ws://127.0.0.1:7717/relay"]);
+  for (let attempt = 0; attempt < 20 && sockets.length === 1; attempt += 1) await settle();
+  assert.deepEqual(sockets, ["pair ws://127.0.0.1:7717/relay", "ws://127.0.0.1:7717/relay"]);
   never.resolve();
   await settle();
 });
@@ -466,6 +482,21 @@ test("only this extension's popup can read live relay status", async () => {
     },
   });
 
+  // Unpaired, the worker dials for pairing; a test must never let that reach
+  // a real daemon port.
+  const dials = [];
+  globalThis.WebSocket = class {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor(url, protocols) {
+      this.readyState = 0;
+      dials.push({ url, protocols });
+    }
+
+    close() {}
+  };
+
   await import(`../extension/background.js?sender=${Date.now()}`);
   await settle();
   const startupReads = settingsReads;
@@ -500,13 +531,18 @@ test("only this extension's popup can read live relay status", async () => {
   await settle();
 
   assert.equal(settingsReads, startupReads);
+  assert.match(status.pairingCode, /^[0-9]{6}$/);
+  assert.equal(dials.length, 1);
+  assert.equal(dials[0].protocols[1], `${PAIR_SUBPROTOCOL_PREFIX}${status.pairingCode}`);
   assert.deepEqual(status, {
     connected: false,
     paired: false,
+    pairingCode: status.pairingCode,
+    pairingDenied: false,
     token: "",
     enabled: true,
     port: 7717,
-    lastError: "Not paired yet — run `ghostd relay-token` and paste the token below.",
+    lastError: "",
     tabs: [],
   });
 });
@@ -1200,4 +1236,142 @@ test("close tombstones on the response deadline and cleans up a late tab creatio
     }),
   });
   assert.equal((await responseFor(socket, 55)).ok, true);
+});
+
+test("an unpaired worker dials with a code and stores the token the daemon hands back", async () => {
+  const sockets = [];
+  const fenced = [];
+  let settings = { port: 7717, token: "", enabled: true };
+  globalThis.chrome = chromeMock({
+    loadSettings: async () => settings,
+    persistLocal: async (value) => {
+      const publication = value.ghostRelaySettingsFence;
+      if (!publication) return;
+      fenced.push(publication);
+      settings = { ...settings, ...publication.settings };
+    },
+  });
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor(url, protocols) {
+      this.url = url;
+      this.protocols = protocols;
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.closed = null;
+      sockets.push(this);
+    }
+
+    close(code, reason) {
+      this.closed = { code, reason };
+      this.onclose?.({ code: code ?? 1005, reason: reason ?? "" });
+    }
+  };
+  const popup = { id: chrome.runtime.id, url: chrome.runtime.getURL("popup.html") };
+  const statusNow = async () => {
+    let status;
+    chrome.runtime.onMessage.emit({ type: "ghost-relay-status" }, popup, (value) => { status = value; });
+    await settle();
+    return status;
+  };
+
+  await import(`../extension/background.js?pairing=${Date.now()}`);
+  await settle();
+  assert.equal(sockets.length, 1);
+  const [pairing] = sockets;
+  assert.equal(pairing.protocols[0], SUBPROTOCOL);
+  const code = pairing.protocols[1].slice(PAIR_SUBPROTOCOL_PREFIX.length);
+  assert.match(code, /^[0-9]{6}$/);
+  pairing.readyState = 1;
+  pairing.onopen();
+  let status = await statusNow();
+  assert.equal(status.paired, false);
+  assert.equal(status.pairingCode, code, "the popup shows the same code the daemon holds");
+  assert.equal(status.pairingDenied, false);
+
+  // A daemon that expires the request gets a fresh code on the redial.
+  pairing.close(4002, "nobody answered the pairing request");
+  await settle();
+  status = await statusNow();
+  assert.equal(status.pairingCode, null);
+
+  // The owner's Allow arrives as a paired frame; the token is fenced into
+  // settings and the paired redial follows.
+  const before = sockets.length;
+  chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
+  for (let attempt = 0; attempt < 20 && sockets.length === before; attempt += 1) await settle();
+  const second = sockets[sockets.length - 1];
+  assert.match(second.protocols[1], /^ghost-pair\.[0-9]{6}$/);
+  assert.notEqual(second.protocols[1], pairing.protocols[1]);
+  second.readyState = 1;
+  second.onopen();
+  second.onmessage({ data: JSON.stringify({ t: "paired", token: "f".repeat(64) }) });
+  for (let attempt = 0; attempt < 40 && fenced.length === 0; attempt += 1) await settle();
+  assert.equal(fenced[0].settings.token, "f".repeat(64));
+  assert.deepEqual(second.closed, { code: 1000, reason: "paired" });
+  chrome.storage.onChanged.emit({ token: { oldValue: "", newValue: "f".repeat(64) } }, "local");
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await settle();
+    if (sockets.some((socket) => socket.protocols[1].startsWith("ghost-token."))) break;
+  }
+  const paired = sockets[sockets.length - 1];
+  assert.equal(paired.protocols[1], `ghost-token.${"f".repeat(64)}`);
+  status = await statusNow();
+  assert.equal(status.paired, true);
+  assert.equal(status.pairingCode, null);
+});
+
+test("a denied pairing stops redialing until the popup asks again", async () => {
+  const sockets = [];
+  const timers = [];
+  globalThis.setTimeout = (callback, delay) => {
+    timers.push({ callback, delay });
+    return timers.length;
+  };
+  globalThis.clearTimeout = () => {};
+  globalThis.chrome = chromeMock({
+    loadSettings: async () => ({ port: 7717, token: "", enabled: true }),
+  });
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor(_url, protocols) {
+      this.protocols = protocols;
+      this.readyState = FakeWebSocket.CONNECTING;
+      sockets.push(this);
+    }
+
+    close(code, reason) {
+      this.onclose?.({ code: code ?? 1005, reason: reason ?? "" });
+    }
+  };
+  const popup = { id: chrome.runtime.id, url: chrome.runtime.getURL("popup.html") };
+
+  await import(`../extension/background.js?pairing-denied=${Date.now()}`);
+  await settle();
+  assert.equal(sockets.length, 1);
+  sockets[0].readyState = 1;
+  sockets[0].onopen();
+  sockets[0].close(4001, "pairing denied");
+  await settle();
+  const reconnects = timers.filter((timer) => timer.delay >= 1_000).length;
+  chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
+  await settle();
+  assert.equal(sockets.length, 1, "no redial after a denial");
+  assert.equal(timers.filter((timer) => timer.delay >= 1_000).length, reconnects, "no reconnect timer either");
+
+  let status;
+  chrome.runtime.onMessage.emit({ type: "ghost-relay-status" }, popup, (value) => { status = value; });
+  await settle();
+  assert.equal(status.pairingDenied, true);
+  assert.match(status.lastError, /denied/i);
+
+  let retried;
+  chrome.runtime.onMessage.emit({ type: "ghost-relay-pair" }, popup, (value) => { retried = value; });
+  for (let attempt = 0; attempt < 20 && sockets.length === 1; attempt += 1) await settle();
+  assert.equal(retried?.ok, true);
+  assert.equal(sockets.length, 2, "Try again dials afresh");
+  assert.notEqual(sockets[1].protocols[1], sockets[0].protocols[1], "with a new code");
 });

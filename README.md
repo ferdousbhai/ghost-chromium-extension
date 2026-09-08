@@ -51,16 +51,26 @@ for flat `chrome.debugger` sessions.
 
 ## Pair
 
+Nothing to copy. An unpaired extension asks ghostd to pair and shows a
+six-digit code in its popup (click the icon, or press `Alt+Shift+G`). Open the
+HUD (`Super+Ctrl+G`): it shows the same code with **Allow** and **Deny**. Allow
+only when the two match. ghostd then hands the extension its token over the
+socket, the badge turns `on`, and the token is kept in `chrome.storage.local`,
+so this is a once-per-browser step. From a terminal instead:
+
 ```sh
-ghostd relay-token          # prints the token, minting one on first run
-ghostd relay-token --rotate # mint a new one; the old one stops working
+ghost browser              # "pairing requested: code 482913" while one waits
+ghost browser allow 482913
+ghost browser deny 482913
 ```
 
-Click the extension, or press `Alt+Shift+G`, paste the token, **Save &
-connect**. It is kept in `chrome.storage.local`, so this is a once-per-browser
-step. The worker answers only the real toolbar popup: `popup.html` opened as a
-tab shows "not paired" and cannot save, which is what keeps a page from
-pairing on your behalf.
+A denied browser stops asking until you press **Try again** in its popup. A
+request nobody answers expires after ten minutes and the extension asks again
+with a new code. The manual path is still there under **Advanced** in the popup:
+`ghostd relay-token` prints the token (`--rotate` mints a new one and unpairs
+every browser), and pasting it pairs without the prompt. The worker answers only
+the real toolbar popup: `popup.html` opened as a tab shows "not paired" and
+cannot save or pair, which is what keeps a page from pairing on your behalf.
 
 On Omarchy the browser already reads `~/.config/chromium-flags.conf`, and its
 own extensions load from a `--load-extension=` line there; append this
@@ -91,16 +101,18 @@ HTTP API, and `--rotate` invalidates both copies immediately.
 
 The daemon's other routes have their own bearer token, read from a `0600` file
 by clients that can read files (CONTRACTS.md). The relay cannot borrow that
-secret, because the peer is a *browser*: pairing means pasting a token into an
-extension popup, which puts it somewhere you do not fully control, and a leak
-there must not also hand out the API. Any page you visit can open
-`ws://127.0.0.1:7717/relay`. So the relay gets a second token of its own:
+secret, because the peer is a *browser*: the token ends up in the extension's
+storage, somewhere you do not fully control, and a leak there must not also
+hand out the API. Any page you visit can open `ws://127.0.0.1:7717/relay`. So
+the relay gets a second token of its own, delivered over the socket once you
+have matched a pairing code by eye:
 
 | Gate | Stops |
 | --- | --- |
 | Bound to `127.0.0.1` | Anything off this machine. |
 | `Origin` must be `chrome-extension://…` or absent | A web page opening the socket from a tab you are visiting. |
 | 32-byte token, compared in constant time | Everything else, including another extension. |
+| Pairing code matched by the owner | Another extension pairing itself: a code-only socket receives nothing until the owner allows that exact code in the HUD or CLI. |
 | One connection at a time | A second browser driving the same tabs behind this one's back. |
 | Closed, validated op set | Arbitrary CDP frames and script hidden in another verb; `javascript` remains one explicit capability. |
 
@@ -226,7 +238,9 @@ rather than the semantic verbs used here.
 | Symptom | Cause |
 | --- | --- |
 | Badge stays `off` | ghostd is not running, or the port is wrong. The popup says which. |
-| "That pairing token is not this daemon's" | Token rotated, or `$XDG_STATE_HOME` differs between the shell and the daemon. Re-run `ghostd relay-token`. |
+| "That pairing token is not this daemon's" | Token rotated, or `$XDG_STATE_HOME` differs between the shell and the daemon. Clear the token under **Advanced** and pair again. |
+| Popup shows a code but the HUD shows nothing | The HUD polls only while open; open it, or run `ghost browser`. The relay may also be off (`GHOSTD_RELAY`). |
+| "Ghost denied this browser" | You pressed Deny. **Try again** asks with a new code. |
 | "A browser is already connected" | Another Chromium profile has the extension paired. Only one at a time. |
 | "Browser ownership … is indeterminate" | A storage failure interrupted tab creation. Close the named ghost-created tab; the relay retries automatically. |
 | "Chromium refused to attach its debugger" | DevTools is open on that tab, or another extension is debugging it. |

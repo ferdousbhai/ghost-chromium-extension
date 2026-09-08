@@ -53,7 +53,7 @@ class FakeElement {
 function popupDocument() {
   const ids = [
     "dot", "statusText", "detail", "tab", "token", "port", "save", "saved", "toggle",
-    "enabledLabel",
+    "enabledLabel", "pair", "pairCode", "retry",
   ];
   const elements = Object.fromEntries(ids.map((id) => [id, new FakeElement(id)]));
   elements.tab.hidden = true;
@@ -269,4 +269,63 @@ test("a ghost tab without title or URL falls back to its tab id, including zero"
   for (let attempt = 0; attempt < 20 && document.elements.tab.hidden; attempt += 1) await settle();
   assert.equal(document.elements.tab.hidden, false);
   assert.match(textOf(document.elements.tab), /Ghost's tab: Tab 0/);
+});
+
+test("an unpaired popup shows the pairing code, and Try again after a denial", async () => {
+  const document = popupDocument();
+  globalThis.document = document;
+  const sent = [];
+  let status = {
+    connected: false,
+    paired: false,
+    pairingCode: "482913",
+    pairingDenied: false,
+    token: "",
+    port: 7717,
+    enabled: true,
+    tabs: [],
+  };
+  globalThis.chrome = {
+    runtime: {
+      sendMessage: (message) => {
+        sent.push(message);
+        if (message.type === "ghost-relay-pair") {
+          status = { ...status, pairingDenied: false, pairingCode: "111222" };
+          return Promise.resolve({ ok: true });
+        }
+        return Promise.resolve(status);
+      },
+    },
+  };
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+
+  await import(`../extension/popup.js?pairing=${Date.now()}`);
+  await settle();
+  assert.equal(document.elements.statusText.textContent, "Not paired");
+  assert.equal(document.elements.pair.hidden, false);
+  assert.equal(document.elements.pairCode.textContent, "482 913");
+  assert.equal(document.elements.retry.hidden, true);
+
+  status = { ...status, pairingCode: null, pairingDenied: true, lastError: "Ghost denied this browser." };
+  document.elements.retry.hidden = true;
+  sent.length = 0;
+  // The interval is stubbed; drive a refresh through the retry path instead.
+  document.elements.retry.emit("click");
+  await settle();
+  await settle();
+  assert.deepEqual(sent.map((message) => message.type), ["ghost-relay-pair", "ghost-relay-status"]);
+  assert.equal(document.elements.pairCode.textContent, "111 222");
+  assert.equal(document.elements.retry.hidden, true);
+
+  status = { ...status, pairingCode: null, pairingDenied: true };
+  await import(`../extension/popup.js?denied=${Date.now()}`);
+  await settle();
+  assert.equal(document.elements.pairCode.textContent, "Denied");
+  assert.equal(document.elements.retry.hidden, false);
+
+  status = { ...status, paired: true, connected: true, token: "paired", pairingCode: null, pairingDenied: false };
+  await import(`../extension/popup.js?paired=${Date.now()}`);
+  await settle();
+  assert.equal(document.elements.pair.hidden, true);
 });

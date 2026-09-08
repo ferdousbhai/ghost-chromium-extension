@@ -2,13 +2,26 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
 const originalChrome = globalThis.chrome;
-const originalWebSocket = globalThis.WebSocket;
+// Never Node's real WebSocket: an unpaired worker dials for pairing on import,
+// and a test must not reach a live daemon port. Tests that care install their
+// own fake; this inert one is the floor.
+class InertWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+
+  constructor() {
+    this.readyState = 0;
+  }
+
+  close() {}
+}
+const originalWebSocket = InertWebSocket;
+globalThis.WebSocket = InertWebSocket;
 
 afterEach(() => {
   if (originalChrome === undefined) delete globalThis.chrome;
   else globalThis.chrome = originalChrome;
-  if (originalWebSocket === undefined) delete globalThis.WebSocket;
-  else globalThis.WebSocket = originalWebSocket;
+  globalThis.WebSocket = originalWebSocket;
 });
 
 function deferred() {

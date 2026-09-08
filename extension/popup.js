@@ -17,6 +17,9 @@ const saveButton = document.getElementById("save");
 const savedFlag = document.getElementById("saved");
 const toggleButton = document.getElementById("toggle");
 const enabledLabel = document.getElementById("enabledLabel");
+const pairBox = document.getElementById("pair");
+const pairCode = document.getElementById("pairCode");
+const retryButton = document.getElementById("retry");
 const POPUP_API_TIMEOUT_MS = 1_000;
 const DEFAULT_SETTINGS = { port: 7717, token: "", enabled: true };
 
@@ -58,7 +61,19 @@ function render(status) {
       : "Paused: every request from the ghost is refused until you resume.")
     : (status.lastError || (status.paired
       ? "Retrying. Is ghostd running?"
-      : "Run `ghostd relay-token` in a terminal and paste the token below."));
+      : "Waiting for ghostd. Is it running?"));
+
+  // Unpaired: the code the daemon is holding for the owner's Allow, or the
+  // owner's No and a way to ask again.
+  const pairing = !connected && !status.paired;
+  pairBox.hidden = !pairing;
+  if (pairing) {
+    const code = typeof status.pairingCode === "string" ? status.pairingCode : "";
+    pairCode.textContent = status.pairingDenied
+      ? "Denied"
+      : (code === "" ? "…" : `${code.slice(0, 3)} ${code.slice(3)}`);
+    retryButton.hidden = status.pairingDenied !== true;
+  }
 
   // One browser workspace per ghost, which may hold several tabs at once.
   const tabs = Array.isArray(status.tabs) ? status.tabs : [];
@@ -181,6 +196,13 @@ saveButton.addEventListener("click", () => void mutateSettings(async () => {
   };
   await updateSettings(next);
   showSaved();
+}));
+
+retryButton.addEventListener("click", () => void mutateSettings(async () => {
+  await withDeadline(
+    chrome.runtime.sendMessage({ type: "ghost-relay-pair" }),
+    "The relay worker did not start pairing in time.",
+  );
 }));
 
 toggleButton.addEventListener("click", () => void mutateSettings(async () => {

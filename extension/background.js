@@ -25,7 +25,14 @@
  * and sends it in the one field a browser `WebSocket` lets you set: the
  * subprotocol list.
  */
-import { PROTOCOL_VERSION, RELAY_PATH, SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX, toErrorFrame } from "./protocol.js";
+import {
+  PAIR_SUBPROTOCOL_PREFIX,
+  PROTOCOL_VERSION,
+  RELAY_PATH,
+  SUBPROTOCOL,
+  TOKEN_SUBPROTOCOL_PREFIX,
+  toErrorFrame,
+} from "./protocol.js";
 import {
   allTabInfos,
   installOpsListeners,
@@ -80,6 +87,14 @@ let pingTimer = null;
 /** The current socket only becomes connected after its compatible welcome. */
 let welcomedSocket = null;
 let lastError = "";
+// Pairing: the six-digit code this unpaired browser is showing, the socket it is
+// waiting on, and whether the owner said no (which stops redialing until the
+// popup asks again).
+let pairingCode = null;
+let pairingSocket = null;
+let pairingDenied = false;
+const PAIRING_DENIED_MESSAGE = "Ghost denied this browser. Try again to ask once more.";
+const PAIRING_WAITING_MESSAGE = "Open Ghost (Super+Ctrl+G) and choose Allow for this code.";
 /**
  * Latched when the daemon's `welcome` reports a protocol version this extension
  * cannot speak. A mismatch does not heal by dialing again — the socket opens
@@ -415,8 +430,12 @@ async function connectOnce(epoch) {
     throw new Error(`Could not read relay settings: ${settings.unavailable}`);
   }
   if (!settings.token) {
-    lastError = "Not paired yet — run `ghostd relay-token` and paste the token below.";
-    await setBadge("off");
+    if (pairingDenied) {
+      lastError = PAIRING_DENIED_MESSAGE;
+      void setBadge("off");
+      return;
+    }
+    dialForPairing(settings.port);
     return;
   }
 
@@ -464,6 +483,12 @@ async function connectOnce(epoch) {
   socket.onclose = (event) => {
     // A newer socket already took over: this close belongs to a dead one.
     if (ws !== socket) return;
+    if (pairingSocket === socket) {
+      pairingSocket = null;
+      ws = null;
+      onPairingClosed(event);
+      return;
+    }
     ws = null;
     if (welcomedSocket === socket) welcomedSocket = null;
     if (pingTimer !== null) {
@@ -572,12 +597,109 @@ function queueRequest(socket, frame) {
   return task;
 }
 
+function newPairingCode() {
+  const word = new Uint32Array(1);
+  crypto.getRandomValues(word);
+  return String(word[0] % 1_000_000).padStart(6, "0");
+}
+
+/**
+ * Ask the daemon to pair. The socket carries a code instead of a token; the
+ * only frame it will ever receive is `paired`, and the only close that means
+ * "no" is the daemon's denied code. The code stays put across redials so what
+ * the popup shows and what the HUD shows are the same number.
+ */
+function dialForPairing(port) {
+  if (pairingCode === null) pairingCode = newPairingCode();
+  const url = `ws://127.0.0.1:${port}${RELAY_PATH}`;
+  let socket;
+  try {
+    socket = new WebSocket(url, [SUBPROTOCOL, PAIR_SUBPROTOCOL_PREFIX + pairingCode]);
+  } catch (error) {
+    lastError = `Could not open ${url}: ${error?.message ?? error}`;
+    scheduleReconnect();
+    return;
+  }
+  ws = socket;
+  welcomedSocket = null;
+  pairingSocket = socket;
+  socket.onopen = () => {
+    if (ws !== socket) {
+      socket.close(1000, "superseded");
+      return;
+    }
+    lastError = PAIRING_WAITING_MESSAGE;
+    void setBadge("off");
+  };
+  socket.onmessage = (event) => {
+    if (typeof event.data === "string") void handleFrame(socket, event.data);
+  };
+  socket.onerror = () => {
+    socket.close();
+  };
+  socket.onclose = (event) => {
+    if (ws !== socket) return;
+    ws = null;
+    pairingSocket = null;
+    onPairingClosed(event);
+  };
+}
+
+function onPairingClosed(event) {
+  void setBadge("off");
+  if (event?.code === 4001) {
+    pairingDenied = true;
+    pairingCode = null;
+    lastError = PAIRING_DENIED_MESSAGE;
+    return;
+  }
+  if (event?.code === 4002) {
+    // Expired or replaced: the number on screen is stale, so pick a new one.
+    pairingCode = null;
+  } else if (event?.code === 1006) {
+    lastError = "ghostd is not answering on that port. Is it running?";
+  }
+  scheduleReconnect();
+}
+
+async function acceptPairing(socket, token) {
+  if (typeof token !== "string" || token.trim() === "") return;
+  pairingCode = null;
+  pairingDenied = false;
+  try {
+    await updateRelaySettings({ token });
+  } catch (error) {
+    lastError = `Ghost allowed this browser but the token could not be saved: ${error?.message ?? error}`;
+    return;
+  }
+  // The settings change re-dials as a paired client; this socket is done.
+  if (ws === socket) ws = null;
+  pairingSocket = null;
+  try {
+    socket.close(1000, "paired");
+  } catch {}
+  reconnectDelay = RECONNECT_MIN_MS;
+  void connect();
+}
+
+/** The popup's "Try again" after a denial: forget the no and dial afresh. */
+function retryPairing() {
+  pairingDenied = false;
+  pairingCode = null;
+  reconnectDelay = RECONNECT_MIN_MS;
+  return connect();
+}
+
 async function handleFrame(socket, raw) {
   if (ws !== socket) return;
   let frame;
   try {
     frame = JSON.parse(raw);
   } catch {
+    return;
+  }
+  if (pairingSocket === socket) {
+    if (frame?.t === "paired") await acceptPairing(socket, frame.token);
     return;
   }
   if (frame?.t === "welcome") {
@@ -694,6 +816,10 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     );
     return true;
   }
+  if (message?.type === "ghost-relay-pair") {
+    void retryPairing().then(() => respond({ ok: true }), () => respond({ ok: false }));
+    return true;
+  }
   if (message?.type !== "ghost-relay-status") return undefined;
   void (async () => {
     const settings = await loadSettings();
@@ -708,6 +834,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     respond({
       connected: ws !== null && welcomedSocket === ws && ws.readyState === WebSocket.OPEN,
       paired: settings.token !== "",
+      pairingCode: settings.token === "" ? pairingCode : null,
+      pairingDenied: settings.token === "" && pairingDenied,
       token: settings.token,
       enabled: settings.enabled,
       port: settings.port,
