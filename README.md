@@ -56,8 +56,16 @@ ghostd relay-token          # prints the token, minting one on first run
 ghostd relay-token --rotate # mint a new one; the old one stops working
 ```
 
-Click the extension, paste the token, **Save & connect**. It is kept in
-`chrome.storage.local`, so this is a once-per-browser step. The badge reads `on`
+Click the extension, or press `Alt+Shift+G`, paste the token, **Save &
+connect**. It is kept in `chrome.storage.local`, so this is a once-per-browser
+step. The worker answers only the real toolbar popup: `popup.html` opened as a
+tab shows "not paired" and cannot save, which is what keeps a page from
+pairing on your behalf.
+
+On Omarchy the browser already reads `~/.config/chromium-flags.conf`, and its
+own extensions load from a `--load-extension=` line there; append this
+directory to that line and the relay loads on the next Chromium start with no
+`chrome://extensions` visit. The badge reads `on`
 only after a compatible ghostd has answered the protocol handshake, `||` when
 that authenticated connection is paused, and `off` otherwise.
 
