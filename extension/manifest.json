@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ghost browser relay",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Lets a ghost running in ghostd drive the tabs of this browser \u2014 the one you are already signed into.",
   "minimum_chrome_version": "125",
   "icons": {
