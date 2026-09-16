@@ -153,19 +153,11 @@ proxied — was removed on purpose. Restoring them belongs here, in the extensio
 which already has `chrome.debugger` and could pause requests with `Fetch.enable`;
 that is a deliberate not-yet, not an oversight.
 
-## Files
+## Behaviour worth knowing
 
-| File | What it is |
-| --- | --- |
-| `extension/manifest.json` | MV3. Permissions: `debugger`, `storage`, `alarms`. That is all. |
-| `extension/icons/` | Chrome's required icon sizes, derived from the same Lucide ghost mascot and amber token as the shell. |
-| `extension/background.js` | The outbound socket, reconnect loop, MV3 keepalive, frame dispatch. |
-| `extension/ops.js` | The 20 protocol operations against ghost-owned tabs; the per-tab `chrome.debugger` attach state machine. |
-| `extension/page-scripts.js` | The snippets that run inside the page (read, find, resolve, focus-and-clear). |
-| `extension/protocol.js` | Frame shapes and the failure vocabulary; mirrors the TypeScript side. |
-| `extension/popup.{html,js}` | Status, pairing, pause. |
-
-No build step. It is plain ES modules; edit and hit reload in `chrome://extensions`.
+No build step: plain ES modules under `extension/`, requesting `debugger`,
+`storage`, and `alarms` and nothing else. Edit and hit reload in
+`chrome://extensions`.
 
 Each relay request carries a deadline. The extension applies it around the whole
 operation and drops a late result if the socket that requested it has gone away.
