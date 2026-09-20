@@ -24,7 +24,7 @@ test("manifest uses only the required standing grants and ships every icon size"
 
 test("the reused Lucide icon stays accessible and carries its license notice", async () => {
   const svg = await readFile(new URL("icons/ghost.svg", extensionUrl), "utf8");
-  const notices = await readFile(new URL("../../../THIRD_PARTY_NOTICES.md", extensionUrl), "utf8");
+  const notices = await readFile(new URL("../THIRD_PARTY_NOTICES.md", extensionUrl), "utf8");
   assert.match(svg, /<title>Ghost<\/title>/);
   assert.match(notices, /## Lucide[\s\S]*Copyright \(c\) 2026 Lucide Icons and Contributors/);
   assert.match(

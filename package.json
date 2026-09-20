@@ -9,7 +9,8 @@
     "contrib",
     "README.md",
     "PROTOCOL.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
     "build": "true",
