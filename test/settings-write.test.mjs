@@ -92,7 +92,7 @@ async function settle() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-test("the worker repairs a timed-out popup write after that popup context is gone", async () => {
+test("the worker repairs a timed-out panel write after that panel context is gone", async () => {
   const firstRawWrite = deferred();
   const stored = {
     port: 7717,
@@ -119,7 +119,7 @@ test("the worker repairs a timed-out popup write after that popup context is gon
   await settle();
   const popup = {
     id: chrome.runtime.id,
-    url: chrome.runtime.getURL("popup.html"),
+    url: chrome.runtime.getURL("sidepanel.html"),
   };
 
   let firstResponse;
@@ -189,7 +189,7 @@ test("a late settings-fence write cannot regress a newer worker choice", async (
   await settle();
   const popup = {
     id: chrome.runtime.id,
-    url: chrome.runtime.getURL("popup.html"),
+    url: chrome.runtime.getURL("sidepanel.html"),
   };
 
   let firstResponse;

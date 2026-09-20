@@ -9,11 +9,8 @@
  * attaches, whether dispatched input lands, or whether screenshots contain
  * pixels. This does.
  *
- *     bun contrib/smoke.mjs
- *
- * It runs from a ghost checkout: the hub and session code come from the
- * daemon and extensions builds (`packages/daemon/dist`, plus a built
- * `packages/extensions`), so build those first.
+ *     GHOST_REPO=~/src/ghost bun contrib/smoke.mjs    # ghost mode, needs a built ghost
+ *     bun contrib/smoke.mjs --local                    # the ghostless product
  *
  * It launches its **own** Chromium against a throwaway `--user-data-dir`, never
  * the owner's profile, and forces captures into a throwaway screenshot directory
@@ -22,6 +19,14 @@
  * Pass `--headless` to skip the window (note that `chrome.debugger` and real
  * input work fine in Chrome's headless mode, but the screenshot compositor is
  * happier headed).
+ *
+ * Pass `--local` for the ghostless product instead: no relay hub at all, the
+ * side panel opened for real, and the panel's own message path driving tabs
+ * through the worker. It proves what no unit test can — that a side-panel
+ * document is accepted by the worker's sender check, and that the chat's tabs
+ * survive Chrome reaping the worker — and, when `OPENROUTER_API_KEY` is set,
+ * runs one real model turn on the free router and reads the usage line back.
+ * The side panel is browser chrome, so `--local` needs a headed run.
  */
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeSync } from "node:fs";
@@ -31,20 +36,31 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(here, "..", "..", "..");
 const extensionDir = join(here, "..", "extension");
+// The ghost-mode smoke drives a real ghost relay hub, so it needs a built
+// checkout of github.com/ferdousbhai/ghost. `--local` needs none.
+const ghostRepo = process.env.GHOST_REPO ?? null;
 const headless = process.argv.includes("--headless");
 const waitForCleanupSignal = process.argv.includes("--wait-for-cleanup-signal");
 const callerScreenshotDir = process.env.OMARCHY_SCREENSHOT_DIR;
 const CLEANUP_STEP_TIMEOUT_MS = 2_000;
 
-const { RelayHub, attachRelay } = await import(join(repoRoot, "packages/daemon/dist/relay.js"));
+const local = process.argv.includes("--local");
+if (!local && ghostRepo === null) {
+  process.stderr.write(
+    "smoke: the ghost-mode smoke needs GHOST_REPO=<path to a built ghost checkout>; "
+    + "pass --local for the ghostless product.\n",
+  );
+  process.exit(2);
+}
+const ghostModule = (path) => import(join(ghostRepo ?? "", path));
+const { RelayHub, attachRelay } = local ? {} : await ghostModule("packages/daemon/dist/relay.js");
 const {
   browserSessionFor,
-  closeAllBrowserSessions,
+  closeAllBrowserSessions = async () => {},
   closeBrowserSession,
   relayBackend,
-} = await import(join(repoRoot, "packages/extensions/dist/index.js"));
+} = local ? {} : await ghostModule("packages/extensions/dist/index.js");
 const { createServer } = await import("node:http");
 
 const TOKEN = "0123456789abcdef".repeat(4);
@@ -294,38 +310,15 @@ function requestSignalCleanup(signal, exitCode) {
   );
 }
 
-process.on("SIGINT", () => requestSignalCleanup("SIGINT", 130));
-process.on("SIGTERM", () => requestSignalCleanup("SIGTERM", 143));
-
-try {
-  const binary = await findChromium();
-  throwIfSignalRequested();
-  if (!binary) {
-    process.stderr.write("No chromium on PATH. sudo pacman -S chromium\n");
-    process.exit(2);
-  }
-
-  // 1. An in-process relay harness on an ephemeral loopback port.
-  throwIfSignalRequested();
-  hub = new RelayHub({ token: TOKEN, pingIntervalMs: 20_000 });
-  server = createServer((_request, response) => response.writeHead(404).end());
-  attachRelay(server, hub);
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  throwIfSignalRequested();
-  const port = server.address().port;
-  record("relay listening", true, `ws://127.0.0.1:${port}/relay`);
-
-  // 2. Pre-seed the extension's settings so no human has to click the popup:
-  //    chrome.storage.local is a LevelDB the browser owns, so instead pass the
-  //    pairing through the profile's Local Extension Settings via the extension's
-  //    own first run — simplest reliable path is a preferences-free approach:
-  //    write a tiny bootstrap file the extension reads. We do it the honest way
-  //    instead: launch, then drive chrome.storage through the extension page.
+/**
+ * A throwaway Chromium with the unpacked extension and a debugging port. The
+ * port exists only so this script can reach `chrome.storage` and the panel
+ * document; the shipped extension uses none of it.
+ */
+async function launchChromium(binary) {
   // Resource acquisition stays synchronous so a signal handler can never clean
   // an uncaptured path while a late filesystem operation is still creating it.
   profileDir = mkdtempSync(join(tmpdir(), "ghost-relay-smoke-profile-"));
-  throwIfSignalRequested();
-  ghostHome = mkdtempSync(join(tmpdir(), "ghost-relay-smoke-home-"));
   throwIfSignalRequested();
   screenshotDir = resolve(mkdtempSync(join(tmpdir(), "ghost-relay-smoke-screenshots-")));
   throwIfSignalRequested();
@@ -341,8 +334,6 @@ try {
     "--password-store=basic",
     "--use-mock-keychain",
     "--disable-background-timer-throttling",
-    // Only so this script can type the pairing token into chrome.storage for
-    // the owner; the shipped relay uses none of this.
     "--remote-debugging-port=0",
     ...(headless ? ["--headless=new"] : []),
     "about:blank",
@@ -356,10 +347,36 @@ try {
   });
   await waitFor(() => devtoolsUrl !== "", 20_000, "chromium to start");
   record("chromium launched", true, `throwaway profile ${profileDir}`);
+  return { base: `http://127.0.0.1:${new URL(devtoolsUrl).port}`, devtoolsUrl };
+}
+
+/** The ghost-driven product: a relay hub in-process, the extension paired to it. */
+async function ghostSmoke(binary) {
+  // 1. An in-process relay harness on an ephemeral loopback port.
+  throwIfSignalRequested();
+  hub = new RelayHub({ token: TOKEN, pingIntervalMs: 20_000 });
+  server = createServer((_request, response) => response.writeHead(404).end());
+  attachRelay(server, hub);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  throwIfSignalRequested();
+  const port = server.address().port;
+  record("relay listening", true, `ws://127.0.0.1:${port}/relay`);
+
+  // 2. Pre-seed the extension's settings so no human has to click the panel:
+  //    chrome.storage.local is a LevelDB the browser owns, so instead pass the
+  //    pairing through the profile's Local Extension Settings via the extension's
+  //    own first run — simplest reliable path is a preferences-free approach:
+  //    write a tiny bootstrap file the extension reads. We do it the honest way
+  //    instead: launch, then drive chrome.storage through the extension page.
+  // Resource acquisition stays synchronous so a signal handler can never clean
+  // an uncaptured path while a late filesystem operation is still creating it.
+  ghostHome = mkdtempSync(join(tmpdir(), "ghost-relay-smoke-home-"));
+  throwIfSignalRequested();
+
+  const { base } = await launchChromium(binary);
 
   // 3. Pair the extension by writing its settings through the browser's own CDP:
   //    find the extension's service worker target and evaluate `chrome.storage`.
-  const base = `http://127.0.0.1:${new URL(devtoolsUrl).port}`;
   const paired = await pairViaCdp(base, port);
   throwIfSignalRequested();
   record("extension paired", paired.ok, paired.detail);
@@ -517,12 +534,235 @@ try {
   await closeBrowserSession(ghostHome);
   record("close the ghost-wide workspace", true, "the browser itself stayed open");
 
-  // 6. Opening popup.html as an ordinary extension tab is not the browser-action
-  //    popup: sender.tab is present, so production correctly withholds settings
+  // 6. Opening the panel document as an ordinary extension tab is not the side
+  //    panel: sender.tab is present, so production correctly withholds settings
   //    and live status. It can still prove the page and script render their
   //    unauthorized fallback without weakening that boundary.
-  const popup = await checkPopup(base, extensionId);
-  record("ordinary popup page renders without exposing relay settings", popup.ok, popup.detail);
+  const asTab = await checkTabDocument(base, extensionId);
+  record("the panel document opened as a tab is refused relay state", asTab.ok, asTab.detail);
+}
+/**
+ * The ghostless product. No relay hub exists; the extension's port is pointed
+ * at a loopback listener that speaks no relay, so its pairing dial goes nowhere
+ * — never to a live ghostd on 7717, whose HUD would otherwise show this
+ * throwaway browser's code to the owner.
+ */
+async function localSmoke(binary) {
+  throwIfSignalRequested();
+  server = createServer((_request, response) => response.writeHead(404).end());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const deadPort = server.address().port;
+  const key = process.env.OPENROUTER_API_KEY ?? "";
+
+  const { base, devtoolsUrl } = await launchChromium(binary);
+  // The worker target is listed before its `chrome` globals exist; keep asking
+  // until the write lands, as the pairing seed does.
+  const seeded = await untilValue(
+    () => workerTarget(base, 5_000).then((worker) => evaluateIn(worker, `(async () => {
+      if (typeof globalThis.chrome?.storage?.local?.set !== "function") return "not-ready";
+      await chrome.storage.local.set({
+        port: ${deadPort},
+        enabled: true,
+        ...(${JSON.stringify(key)} === "" ? {} : { openRouterKey: ${JSON.stringify(key)} }),
+      });
+      return "stored";
+    })()`, "seed the extension's settings")),
+    (value) => value === "stored",
+    20_000,
+    "the extension's settings to be seeded",
+  );
+  record("extension pointed at a dead port, no token", seeded === "stored", `port ${deadPort}`);
+
+  // The toolbar click, without a toolbar. `sidePanel.open()` wants a user
+  // gesture, and CDP can only grant one to a page frame, not to the worker — so
+  // an extension page opened as a tab does the clicking. That page is the panel
+  // document itself under a query string (so it is not mistaken for the real
+  // panel below), which the worker rightly ignores; it is borrowed for its origin.
+  await untilValue(
+    () => workerTarget(base, 5_000).then((worker) => evaluateIn(worker, `(async () => {
+      if (typeof globalThis.chrome?.tabs?.create !== "function") return "not-ready";
+      await chrome.tabs.create({ url: chrome.runtime.getURL("sidepanel.html?gesture") });
+      return "opened";
+    })()`, "open an extension page")),
+    (value) => value === "opened",
+    20_000,
+    "an extension page to open",
+  );
+  const page = await pageTarget(base, "/sidepanel.html?gesture", 20_000);
+  const windowId = await untilValue(
+    () => evaluateIn(page, `(async () => {
+      const window_ = await chrome.windows.getCurrent();
+      await chrome.sidePanel.open({ windowId: window_.id });
+      return window_.id;
+    })()`, "open the side panel", { userGesture: true }),
+    (value) => Number.isInteger(value),
+    20_000,
+    "the side panel to open",
+  );
+  record("side panel opened", Number.isInteger(windowId), `window ${windowId}`);
+
+  const panel = await pageTarget(base, "/sidepanel.html", 20_000);
+  throwIfSignalRequested();
+  record("side panel document found", true, panel.url);
+
+  const conversation = crypto.randomUUID();
+  const op = (name, args) => evaluateIn(panel, `chrome.runtime.sendMessage(${JSON.stringify({
+    type: "ghost-relay-local-op", conversation, op: name, args, timeoutMs: 30_000,
+  })})`, `local ${name}`, { timeoutMs: 35_000 });
+
+  // 1. A side-panel document is an accepted sender: this answers at all only if
+  //    the worker saw no `sender.tab`.
+  const opened = await op("open", { url: "https://example.com/" });
+  record("panel may drive tabs (sender.tab is absent)", opened?.ok === true, opened?.error ?? opened?.result?.page?.url);
+  if (opened?.ok !== true) throw new Error(opened?.error ?? "open failed");
+  const tab = opened.result.id;
+
+  const read = await op("read", { tab });
+  record("read", read?.ok === true && /Example Domain/.test(read.result.text), read?.error ?? `${read?.result?.text?.length ?? 0} chars`);
+  const found = await op("find", { tab, query: "a" });
+  const ref = found?.result?.matches?.[0]?.ref;
+  record("find", typeof ref === "string", found?.error ?? `${found?.result?.matches?.length ?? 0} matches`);
+  const clicked = await op("click", { tab, ref });
+  record("click", clicked?.ok === true, clicked?.error ?? clicked?.result?.page?.url);
+  const shot = await op("screenshot", { tab });
+  record("screenshot", shot?.ok === true && shot.result.png?.length > 1_000, shot?.error ?? `${shot?.result?.png?.length ?? 0} base64 chars`);
+
+  // 2. Chrome reaps the worker; the next op must find the same tab. This is the
+  //    ghostless install's thirty-seconds-idle case, forced instead of waited
+  //    for. The proof that a reap happened is a *different* worker target id
+  //    answering afterwards; a close that quietly did nothing would leave the
+  //    old id in place and this step says so.
+  const before = await workerTarget(base, 5_000);
+  const browser = await openCdpSocket(devtoolsUrl, "attach to the browser", 5_000);
+  let closed;
+  try {
+    closed = await cdpRequest(browser, 1, "Target.closeTarget", { targetId: before.id }, "stop the worker", 5_000);
+  } finally {
+    browser.close();
+  }
+  await untilValue(
+    () => fetch(`${base}/json/list`).then((r) => r.json()),
+    (targets) => !targets.some((target) => target.id === before.id),
+    10_000,
+    "the old worker target to disappear",
+  );
+  const current = await op("current", { tab });
+  const after = await workerTarget(base, 5_000);
+  record(
+    "tabs survive a worker reap without a ghost",
+    closed?.result?.success === true && after.id !== before.id
+      && current?.ok === true && current.result.page?.url?.startsWith("https://"),
+    current?.error ?? `${current?.result?.page?.url} (worker ${before.id.slice(0, 8)} → ${after.id.slice(0, 8)})`,
+  );
+
+  // 3. One real turn, when there is a key to run it on.
+  if (key === "") {
+    record("model turn on the free router", true, "skipped: OPENROUTER_API_KEY is not set");
+    return;
+  }
+  await evaluateIn(panel, "location.reload()", "reload the panel with the key");
+  const fresh = await pageTarget(base, "/sidepanel.html", 20_000);
+  await evaluateIn(fresh, `(async () => {
+    for (let i = 0; i < 100 && document.getElementById("composerBar").hidden; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    document.getElementById("input").value = "Open https://example.com/ and tell me its heading in five words or fewer.";
+    document.getElementById("send").click();
+    return "sent";
+  })()`, "send a message", { timeoutMs: 15_000 });
+  const outcome = await evaluateIn(fresh, `(async () => {
+    const deadline = Date.now() + 120_000;
+    while (Date.now() < deadline) {
+      const usage = [...document.querySelectorAll("#log .usage")].at(-1)?.textContent ?? "";
+      const error = [...document.querySelectorAll("#log .error")].map((n) => n.textContent).join(" | ");
+      if (usage !== "" || error !== "") return { usage, error };
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return { usage: "", error: "timed out waiting for the turn" };
+  })()`, "wait for the turn", { timeoutMs: 125_000 });
+  record("model turn on the free router", outcome.error === "" && outcome.usage !== "", outcome.error || outcome.usage);
+  record("usage line reports a cost", /free|\$/.test(outcome.usage), outcome.usage);
+}
+
+/** Re-run `attempt` until `accept` likes its value; a throw is a retry too. */
+async function untilValue(attempt, accept, timeoutMs, what) {
+  const deadline = Date.now() + timeoutMs;
+  let last;
+  while (Date.now() <= deadline) {
+    throwIfSignalRequested();
+    try {
+      const value = await attempt();
+      if (accept(value)) return value;
+      last = `got ${JSON.stringify(value)}`;
+    } catch (error) {
+      last = error?.message ?? String(error);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`timed out waiting for ${what}: ${last}`);
+}
+
+async function workerTarget(base, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    throwIfSignalRequested();
+    const targets = await fetch(`${base}/json/list`, {
+      signal: AbortSignal.timeout(remainingCdpBudget(deadline)),
+    }).then((r) => r.json()).catch(() => []);
+    const worker = targets.find(
+      (target) => target.type === "service_worker" && target.url.includes("background.js"),
+    );
+    if (worker) return worker;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("the extension's service worker did not appear");
+}
+
+async function pageTarget(base, suffix, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    throwIfSignalRequested();
+    const targets = await fetch(`${base}/json/list`, {
+      signal: AbortSignal.timeout(remainingCdpBudget(deadline)),
+    }).then((r) => r.json()).catch(() => []);
+    const page = targets.find((target) => target.url.endsWith(suffix));
+    if (page) return page;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`the ${suffix} document did not appear`);
+}
+
+/** Evaluate in a target and hand back the value, over a socket opened for the call. */
+async function evaluateIn(target, expression, what, { userGesture = false, timeoutMs = 10_000 } = {}) {
+  const socket = await openCdpSocket(target.webSocketDebuggerUrl, `attach to ${what}`, 5_000);
+  try {
+    const answer = await cdpRequest(socket, 1, "Runtime.evaluate", {
+      expression, awaitPromise: true, returnByValue: true, userGesture,
+    }, what, timeoutMs);
+    if (answer?.result?.exceptionDetails) {
+      const detail = answer.result.exceptionDetails.exception?.description
+        ?? answer.result.exceptionDetails.text;
+      throw new Error(`${what}: ${detail}`);
+    }
+    return answer?.result?.result?.value;
+  } finally {
+    socket.close();
+  }
+}
+
+process.on("SIGINT", () => requestSignalCleanup("SIGINT", 130));
+process.on("SIGTERM", () => requestSignalCleanup("SIGTERM", 143));
+
+try {
+  const binary = await findChromium();
+  throwIfSignalRequested();
+  if (!binary) {
+    process.stderr.write("No chromium on PATH. sudo pacman -S chromium\n");
+    process.exit(2);
+  }
+
+  if (local) await localSmoke(binary);
+  else await ghostSmoke(binary);
 } catch (error) {
   record("smoke run", false, error?.message ?? String(error));
 } finally {
@@ -542,7 +782,7 @@ process.exit(failed.length === 0 ? 0 : 1);
 /**
  * Type the token into the extension for the owner, over the browser's own
  * debugging port. This is the smoke test standing in for four clicks in the
- * popup; nothing in the shipped path uses it.
+ * panel; nothing in the shipped path uses it.
  */
 async function pairViaCdp(base, relayPort) {
   let lastDetail = "the extension's service worker has not appeared";
@@ -597,116 +837,37 @@ async function pairViaCdp(base, relayPort) {
 }
 
 /**
- * Open popup.html as an ordinary extension tab and read its unauthorized
- * fallback. This deliberately cannot exercise live action-popup state: the
- * background rejects any status/settings sender with `sender.tab` present.
+ * Open the panel's document as an ordinary extension tab and ask it for live
+ * relay state. It must get nothing: the worker answers only the real side
+ * panel, where `sender.tab` is absent, which is what keeps a page from pairing
+ * or pausing on the owner's behalf.
  */
-async function checkPopup(base, extensionId) {
+async function checkTabDocument(base, extensionId) {
   throwIfSignalRequested();
   if (!extensionId) return { ok: false, detail: "no extension id" };
-  const url = `chrome-extension://${extensionId}/popup.html`;
-  const deadline = Date.now() + 10_000;
-  const created = await fetch(`${base}/json/new?${encodeURIComponent("about:blank")}`, {
+  const url = `chrome-extension://${extensionId}/sidepanel.html?as-a-tab`;
+  const created = await fetch(`${base}/json/new?${encodeURIComponent(url)}`, {
     method: "PUT",
-    signal: AbortSignal.timeout(remainingCdpBudget(deadline)),
-  })
-    .then((response) => response.json())
-    .catch((error) => ({ error: error.message }));
+    signal: AbortSignal.timeout(5_000),
+  }).then((response) => response.json()).catch((error) => ({ error: error.message }));
   if (!created?.webSocketDebuggerUrl) {
-    return { ok: false, detail: `could not open the popup: ${JSON.stringify(created)}` };
+    return { ok: false, detail: `could not open the tab: ${JSON.stringify(created)}` };
   }
-  let socket;
   try {
-    socket = await openCdpSocket(
-      created.webSocketDebuggerUrl,
-      "attach to the popup",
-      remainingCdpBudget(deadline),
+    const answer = await untilValue(
+      () => evaluateIn(created, `chrome.runtime.sendMessage({ type: "ghost-relay-status" })
+        .then((value) => ({ answered: value !== undefined && value !== null }), () => ({ answered: false, refused: true }))`,
+        "ask for relay status from a tab"),
+      (value) => value && typeof value.answered === "boolean",
+      10_000,
+      "the tab document to answer",
     );
-    const diagnostics = { exceptions: [], observationErrors: [] };
-    socket.addEventListener("message", (event) => {
-      const message = JSON.parse(event.data);
-      if (message.method !== "Runtime.exceptionThrown") return;
-      const exception = message.params?.exceptionDetails;
-      if (diagnostics.exceptions.length < 20) {
-        diagnostics.exceptions.push(
-          exception?.exception?.description ?? exception?.text ?? "popup exception",
-        );
-      }
-    });
-    await cdpRequest(
-      socket,
-      1,
-      "Runtime.enable",
-      {},
-      "enable popup diagnostics",
-      remainingCdpBudget(deadline),
-    );
-    const navigation = await cdpRequest(
-      socket,
-      2,
-      "Page.navigate",
-      { url },
-      "navigate to the popup",
-      remainingCdpBudget(deadline),
-    );
-    const navigationError = navigation?.result?.errorText;
-    if (navigationError) throw new Error(`popup navigation failed: ${navigationError}`);
-
-    let rendered = null;
-    let lastObservation = null;
-    for (let id = 3; Date.now() <= deadline; id += 1) {
-      throwIfSignalRequested();
-      try {
-        const answer = await cdpRequest(socket, id, "Runtime.evaluate", {
-          returnByValue: true,
-          expression: `JSON.stringify({
-            url: location.href,
-            ready: document.readyState,
-            status: document.getElementById("statusText")?.textContent ?? null,
-            detail: document.getElementById("detail")?.textContent ?? null,
-            token: document.getElementById("token")?.value.length ?? null,
-            toggle: document.getElementById("toggle")?.textContent ?? null,
-          })`,
-        }, "read popup state", remainingCdpBudget(deadline));
-        const raw = answer?.result?.result?.value;
-        lastObservation = typeof raw === "string" ? JSON.parse(raw) : answer?.result;
-        if (lastObservation?.url === url
-            && lastObservation.ready === "complete"
-            && lastObservation.status !== null
-            && lastObservation.status !== "Checking…") {
-          rendered = lastObservation;
-          break;
-        }
-      } catch (error) {
-        if (diagnostics.observationErrors.length < 20) {
-          diagnostics.observationErrors.push(error?.message ?? String(error));
-        }
-      }
-      const pause = Math.min(100, deadline - Date.now());
-      if (pause > 0) await new Promise((resolve) => setTimeout(resolve, pause));
-    }
-    if (rendered === null) {
-      return {
-        ok: false,
-        detail: `popup did not settle: ${JSON.stringify({ lastObservation, diagnostics })}`,
-      };
-    }
-    const ok = diagnostics.exceptions.length === 0
-      && rendered.status === "Not paired"
-      && typeof rendered.detail === "string" && rendered.detail !== ""
-      && rendered.token === 0
-      && rendered.toggle === "Pause";
     return {
-      ok,
-      detail:
-        `unauthorized fallback ${JSON.stringify(rendered.status)}, token ${rendered.token} chars; `
-        + `diagnostics ${JSON.stringify(diagnostics)}`,
+      ok: answer.answered === false,
+      detail: answer.answered ? "a tab document was handed relay status" : "refused, as a tab must be",
     };
-  } finally {
-    socket?.close();
-    await fetch(`${base}/json/close/${created.id}`, {
-      signal: AbortSignal.timeout(2_000),
-    }).catch(() => {});
+  } catch (error) {
+    return { ok: false, detail: error?.message ?? String(error) };
   }
 }
 

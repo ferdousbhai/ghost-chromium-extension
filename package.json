@@ -1,24 +1,15 @@
 {
-  "name": "@ghost/chromium-extension",
-  "version": "0.4.0",
+  "name": "ghost-chromium-extension",
+  "version": "0.5.0",
+  "private": true,
   "license": "Apache-2.0",
   "type": "module",
-  "description": "MV3 extension that lets a ghost drive its tabs in the owner's signed-in Chromium over a token-paired localhost WebSocket to ghostd.",
-  "files": [
-    "extension",
-    "contrib",
-    "README.md",
-    "PROTOCOL.md",
-    "PRIVACY.md",
-    "STORE.md",
-    "LICENSE",
-    "THIRD_PARTY_NOTICES.md"
-  ],
+  "description": "Ghost for Chromium: an agent works the tabs of the browser you are signed into \u2014 chat in the side panel on your own OpenRouter account, or lend the tabs to a ghost running in ghostd.",
   "scripts": {
-    "build": "true",
-    "typecheck": "true",
     "test": "node --test test/*.test.mjs",
+    "package": "bash contrib/package.sh",
     "install-extension": "bash contrib/install.sh",
-    "smoke": "bun contrib/smoke.mjs"
+    "smoke": "bun contrib/smoke.mjs",
+    "smoke:local": "bun contrib/smoke.mjs --local"
   }
 }

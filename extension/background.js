@@ -20,8 +20,9 @@
  * would stay dead. Both are ported from oh-my-pi's `browser-relay` extension, which
  * is where these were learned the expensive way.
  *
- * **Pairing is a token, typed once.** The popup asks for the string
- * `ghostd relay-token` prints; this worker keeps it in `chrome.storage.local`
+ * **Pairing is a token, delivered once.** The daemon hands it over the socket
+ * when the owner allows this browser's code (or the owner pastes it under
+ * Advanced in the side panel); this worker keeps it in `chrome.storage.local`
  * and sends it in the one field a browser `WebSocket` lets you set: the
  * subprotocol list.
  */
@@ -33,6 +34,7 @@ import {
   TOKEN_SUBPROTOCOL_PREFIX,
   toErrorFrame,
 } from "./protocol.js";
+import { isLocalSession, newLocalSession } from "./local-session.js";
 import {
   allTabInfos,
   installOpsListeners,
@@ -40,6 +42,7 @@ import {
   reconcileDaemonIncarnation,
   releaseAllTabs,
   restoreTabsFromSession,
+  runOp,
   startOp,
   sweepRetiredTabs,
 } from "./ops.js";
@@ -89,12 +92,12 @@ let welcomedSocket = null;
 let lastError = "";
 // Pairing: the six-digit code this unpaired browser is showing, the socket it is
 // waiting on, and whether the owner said no (which stops redialing until the
-// popup asks again).
+// panel asks again).
 let pairingCode = null;
 let pairingSocket = null;
 let pairingDenied = false;
 // The code survives a worker restart (chrome.storage.session), so the number
-// on the HUD stays the number in the popup even if Chromium reaps the worker.
+// on the HUD stays the number in the panel even if Chromium reaps the worker.
 const PAIRING_CODE_KEY = "ghostPairingCode";
 const PAIRING_DENIED_MESSAGE = "Ghost denied this browser. Try again to ask once more.";
 const PAIRING_WAITING_MESSAGE = "Open Ghost (Super+Ctrl+G) and choose Allow for this code.";
@@ -424,6 +427,28 @@ function scheduleReconnect() {
   }, delay);
 }
 
+/**
+ * Restore tab ownership from the last worker, once per worker lifetime. Both
+ * the dial path and the side panel's ops wait on the same attempt, so a local
+ * op that lands while a fresh worker is still reading storage sees its tabs
+ * rather than an empty map; a failed attempt clears the latch so the next
+ * caller retries.
+ */
+let ownershipRestore = null;
+
+function ensureOwnershipRestored() {
+  if (ownershipRestore !== null) return ownershipRestore;
+  const attempt = (async () => {
+    await repairBrowserPersistence();
+    await restoreTabsFromSession();
+  })();
+  ownershipRestore = attempt;
+  attempt.catch(() => {
+    if (ownershipRestore === attempt) ownershipRestore = null;
+  });
+  return attempt;
+}
+
 async function connectOnce(epoch) {
   if (protocolIncompatible) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
@@ -432,6 +457,10 @@ async function connectOnce(epoch) {
   if (settings.unavailable !== null) {
     throw new Error(`Could not read relay settings: ${settings.unavailable}`);
   }
+  // Ownership comes back before anything else, paired or not: the side panel's
+  // tabs are this worker's to find again whether or not a ghost ever pairs.
+  await ensureOwnershipRestored();
+  if (epoch !== connectEpoch) return;
   if (!settings.token) {
     if (pairingDenied) {
       lastError = PAIRING_DENIED_MESSAGE;
@@ -442,8 +471,6 @@ async function connectOnce(epoch) {
     return;
   }
 
-  await repairBrowserPersistence();
-  await restoreTabsFromSession();
   await sweepRetiredTabs().catch(() => undefined);
   await repairBrowserPersistence();
   if (epoch !== connectEpoch) return;
@@ -563,7 +590,7 @@ async function answerRequest(socket, frame) {
         failure: "browser_unavailable",
         message:
           "The Ghost relay is paused. The owner can resume it from the "
-          + "extension's popup in Chromium.",
+          + "Ghost side panel's menu in Chromium.",
       },
     });
     return false;
@@ -610,7 +637,7 @@ function newPairingCode() {
  * Ask the daemon to pair. The socket carries a code instead of a token; the
  * only frame it will ever receive is `paired`, and the only close that means
  * "no" is the daemon's denied code. The code stays put across redials so what
- * the popup shows and what the HUD shows are the same number.
+ * the panel shows and what the HUD shows are the same number.
  */
 async function dialForPairing(port) {
   if (pairingCode === null) pairingCode = await restorePairingCode();
@@ -705,7 +732,7 @@ async function acceptPairing(socket, token) {
   void connect();
 }
 
-/** The popup's "Try again" after a denial: forget the no and dial afresh. */
+/** The panel's "Try again" after a denial: forget the no and dial afresh. */
 function retryPairing() {
   pairingDenied = false;
   forgetPairingCode();
@@ -821,15 +848,140 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 chrome.runtime.onStartup.addListener(() => void connect());
 
-// Restrict live relay state to this extension's installed popup.
-function isPopupSender(sender) {
+// Restrict live relay state to this extension's one chrome-owned surface, the
+// side panel. A `sender.tab` means the document is a page in a tab — including
+// the panel's own document opened as a tab — and a page must not pair, pause,
+// or drive tabs on the owner's behalf.
+function isPanelSender(sender) {
   return sender?.id === chrome.runtime.id
-    && sender?.url === chrome.runtime.getURL("popup.html")
+    && sender?.url === chrome.runtime.getURL("sidepanel.html")
     && sender.tab === undefined;
 }
 
+/**
+ * The side panel's workspaces: one per conversation.
+ *
+ * The panel names a conversation (an id it minted for its own history list);
+ * the worker mints the workspace behind it. That split is the same reason the
+ * socket's owner id comes off the wire and not out of a tool argument: a caller
+ * that could name its own workspace could name somebody else's. A conversation
+ * id can only ever resolve to a `local:` workspace, so the panel cannot reach a
+ * ghost's tabs however it labels its conversations. The map survives a worker
+ * restart in `chrome.storage.local`, so each conversation's tabs come back with
+ * it; deleting a conversation retires its workspace, as ghostd does after a
+ * protocol close.
+ */
+const LOCAL_SESSIONS_KEY = "ghostLocalSessions";
+const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+let localSessions = null;
+let localSessionsInFlight = null;
+let localSessionsTail = Promise.resolve();
+
+function loadLocalSessions() {
+  if (localSessions !== null) return Promise.resolve(localSessions);
+  if (localSessionsInFlight !== null) return localSessionsInFlight;
+  const attempt = (async () => {
+    let stored = null;
+    try {
+      stored = (await settingsStorage.get({ [LOCAL_SESSIONS_KEY]: null }))?.[LOCAL_SESSIONS_KEY];
+    } catch {
+      // A storage failure means fresh workspaces, not a failed chat.
+    }
+    const map = new Map();
+    if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+      for (const [conversation, session] of Object.entries(stored)) {
+        if (CONVERSATION_ID.test(conversation) && isLocalSession(session)) map.set(conversation, session);
+      }
+    }
+    localSessions = map;
+    return map;
+  })();
+  localSessionsInFlight = attempt;
+  const clear = () => {
+    if (localSessionsInFlight === attempt) localSessionsInFlight = null;
+  };
+  void attempt.then(clear, clear);
+  return attempt;
+}
+
+function persistLocalSessions(map) {
+  const write = () => settingsStorage.set({ [LOCAL_SESSIONS_KEY]: Object.fromEntries(map) }).catch(() => {});
+  localSessionsTail = localSessionsTail.then(write, write);
+  return localSessionsTail;
+}
+
+function requireConversation(conversation) {
+  if (typeof conversation !== "string" || !CONVERSATION_ID.test(conversation)) {
+    throw new Error("The side panel named no conversation. Reopen the panel.");
+  }
+  return conversation;
+}
+
+async function localSessionFor(conversation) {
+  const map = await loadLocalSessions();
+  let session = map.get(requireConversation(conversation));
+  if (session === undefined) {
+    session = newLocalSession();
+    map.set(conversation, session);
+    await persistLocalSessions(map);
+  }
+  return session;
+}
+
+/** Retire a conversation's workspace — closing its tabs — and forget it. */
+async function closeLocalConversation(conversation) {
+  const map = await loadLocalSessions();
+  const session = map.get(requireConversation(conversation));
+  if (session === undefined) return;
+  await ensureOwnershipRestored();
+  await runOp("close", { session }, 30_000);
+  map.delete(conversation);
+  await persistLocalSessions(map);
+}
+
+/**
+ * Run one op for the side panel. The same `startOp` the socket reaches, with
+ * the same pause: pausing the relay stops the local agent too, which is the
+ * only reading of one switch labelled "pause" that is not a lie. This refusal
+ * is the pause check — the panel does not probe first, it just gets told.
+ */
+async function runLocalOp(conversation, op, args, timeoutMs) {
+  const settings = await loadSettings();
+  if (settings.unavailable !== null) {
+    throw new Error(`Chromium could not verify the relay settings: ${settings.unavailable}`);
+  }
+  if (!settings.enabled && op !== "status") {
+    throw new Error("Ghost is paused. Resume it from the menu to let this chat act again.");
+  }
+  await ensureOwnershipRestored();
+  const session = await localSessionFor(conversation);
+  return runOp(op, { ...args, session }, timeoutMs);
+}
+
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
-  if (!isPopupSender(sender)) return undefined;
+  if (isPanelSender(sender)) {
+    if (message?.type === "ghost-relay-local-op") {
+      void runLocalOp(
+        message.conversation,
+        message.op,
+        message.args ?? {},
+        Number.isSafeInteger(message.timeoutMs) ? message.timeoutMs : 30_000,
+      ).then(
+        (result) => respond({ ok: true, result }),
+        (error) => respond({ ok: false, error: error?.message ?? String(error) }),
+      );
+      return true;
+    }
+    if (message?.type === "ghost-relay-local-close") {
+      void closeLocalConversation(message.conversation).then(
+        () => respond({ ok: true }),
+        (error) => respond({ ok: false, error: error?.message ?? String(error) }),
+      );
+      return true;
+    }
+  } else {
+    return undefined;
+  }
   if (message?.type === "ghost-relay-settings-update") {
     void updateRelaySettings(message.settings).then(
       (settings) => respond({ ok: true, settings }),
@@ -849,7 +1001,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     const settings = await loadSettings();
     let tabs = [];
     try {
-      // The popup is the machine owner's surface, so it lists every ghost's
+      // The panel is the machine owner's surface, so it lists every ghost's
       // tabs — through the in-process view, never the owner-scoped wire op.
       tabs = await allTabInfos();
     } catch {
@@ -867,7 +1019,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       tabs,
     });
   })().catch(() => {
-    // respond itself can throw once the popup's channel is gone; the popup's
+    // respond itself can throw once the panel's channel is gone; the panel's
     // own deadline already covers a missing reply.
     try {
       respond(null);
@@ -875,5 +1027,9 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   });
   return true;
 });
+
+// The toolbar icon opens the side panel; there is no popup. Absent in the test
+// harness, hence the guard.
+void chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true })?.catch?.(() => {});
 
 void connect();

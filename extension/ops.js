@@ -31,6 +31,7 @@
  * failure, ban cleared by navigation) is ported from the MIT-licensed
  * `browser-relay` bridge in https://github.com/can1357/oh-my-pi.
  */
+import { isLocalSession, sideName } from "./local-session.js";
 import { failed, FAILURES } from "./protocol.js";
 import {
   callScript,
@@ -140,6 +141,32 @@ function sessionTabs(session) {
 /** Whether this ghost-wide protocol owner is the one that opened this tab. */
 function owns(session, tabId) {
   return typeof session === "string" && state.sessions.get(session)?.has(tabId) === true;
+}
+
+/** The workspace holding this tab, or null when nothing holds it. */
+function ownerOf(tabId) {
+  for (const [session, owned] of state.sessions) if (owned.has(tabId)) return session;
+  return null;
+}
+
+/**
+ * Refuse a tab that belongs to the *other* side by name.
+ *
+ * Only across the local/ghost line: one ghost naming another ghost's tab stays
+ * the unknown-tab-id it has always been, because the daemon's failure messages
+ * are a compatibility surface. Across the line it is worth explaining, because
+ * the owner can see both workspaces at once and will otherwise read "no page"
+ * as "the tab closed".
+ */
+function refuseCrossMode(session, tabId) {
+  const owner = ownerOf(tabId);
+  if (owner === null || typeof session !== "string" || session === "") return;
+  if (isLocalSession(owner) === isLocalSession(session)) return;
+  throw failed(
+    FAILURES.invalidInput,
+    `Tab ${tabId} belongs to ${sideName(owner)}, not ${sideName(session)}. `
+      + `Ask ${sideName(owner)} to act on it, or open a tab of your own.`,
+  );
 }
 
 function requireOwningSession(args) {
@@ -886,7 +913,11 @@ async function reconcileIncarnation(incarnation) {
     const previous = restored?.incarnation ?? null;
     if (previous === incarnation) return false;
 
-    const priorOwners = new Set([...state.sessions.keys(), ...creatingSessions.keys()]);
+    // Only ghostd's own claims: the side panel's workspace outlives a daemon
+    // restart because no daemon ever owned it.
+    const priorOwners = new Set(
+      [...state.sessions.keys(), ...creatingSessions.keys()].filter((id) => !isLocalSession(id)),
+    );
     for (const session of priorOwners) {
       if (state.retired.has(session)) continue;
       state.retired.add(session);
@@ -911,10 +942,11 @@ async function reconcileIncarnation(incarnation) {
   if (!changed) return;
 
   await sweepRetiredTabs();
-  if (state.sessions.size > 0) {
+  const stranded = [...state.sessions.keys()].filter((id) => !isLocalSession(id)).length;
+  if (stranded > 0) {
     throw failed(
       FAILURES.browserUnavailable,
-      `The previous ghostd process left ${state.sessions.size} browser ownership `
+      `The previous ghostd process left ${stranded} browser ownership `
         + "claim(s) that Chromium has not retired yet. The relay will retry automatically.",
     );
   }
@@ -1519,7 +1551,9 @@ function claimedTab(args) {
   if (typeof raw !== "number" && typeof raw !== "string") return null;
   const tabId = Number(raw);
   if (!Number.isInteger(tabId) || !state.tabs.has(tabId)) return null;
-  return owns(args?.session, tabId) ? tabId : null;
+  if (owns(args?.session, tabId)) return tabId;
+  refuseCrossMode(args?.session, tabId);
+  return null;
 }
 
 /** {@link claimedTab}, for the ops that cannot proceed without a page. */
@@ -1604,6 +1638,9 @@ async function tabInfos(session, active) {
       url: snapshot.url ?? "",
       title: snapshot.title ?? "",
       active: id === active,
+      // Which side opened it, for the popup's list alone. The wire shape the
+      // daemon parses is the owner-scoped one above and does not carry it.
+      ...(session === null ? { local: isLocalSession(ownerOf(id)) } : {}),
     });
   }
   return out;
@@ -2499,13 +2536,17 @@ const ops = {
 };
 
 /**
- * Drop every debugger session without closing a tab. The socket going away means
- * every ghost workspace behind it is offline, but the tabs are the owner's to
- * keep; a reconnecting backend still names the same tab and re-attaches next op.
+ * Drop every ghost debugger session without closing a tab. The socket going
+ * away means every ghost workspace behind it is offline, but the tabs are the
+ * owner's to keep; a reconnecting backend still names the same tab and
+ * re-attaches next op. The side panel's tabs are not behind that socket, so a
+ * daemon that is down — and redialing every few seconds — must not keep
+ * dropping their worlds and refs from under a local turn.
  */
 export async function releaseAllTabs() {
   const attached = [];
   for (const [tabId, tab] of state.tabs) {
+    if (isLocalSession(ownerOf(tabId))) continue;
     if (tab.attached) attached.push(tabId);
     else resetAttachment(tab);
   }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the Ghost browser relay extension for Chromium on Omarchy/Arch.
+# Install the Ghost extension for Chromium on Omarchy/Arch.
 #
 # There is nothing to build: the extension is plain ES modules and a manifest.
 # "Installing" means putting the directory somewhere stable that survives a
@@ -66,10 +66,17 @@ Next, in the browser you actually use:
   1. Open  chrome://extensions
   2. Turn on "Developer mode" (top right)
   3. "Load unpacked" -> $TARGET_DIR
-  4. Pin "Ghost browser relay" and click it
-  5. Run  ghostd relay-token  in a terminal, paste the token, "Save & connect"
+  4. Pin "Ghost" and click it: the side panel opens
 
-The badge reads "on" once it is paired and ghostd is running.
+Then either:
+
+  * "Connect OpenRouter", and chat; or
+  * menu -> "Ghost on this machine..." to pair with ghostd: it shows a
+    six-digit code, and "ghost browser allow <code>" (or Allow in the HUD)
+    hands it the token.
+
+The badge reads "on" once it is paired and ghostd is running; the side panel
+works whether or not it ever pairs.
 
 EOF
 

@@ -1,9 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Ghost browser relay",
-  "version": "0.4.0",
-  "description": "Lets a ghost running in ghostd drive the tabs of this browser \u2014 the one you are already signed into.",
-  "homepage_url": "https://github.com/ferdousbhai/ghost-chromium-extension",
+  "name": "Ghost",
+  "version": "0.5.0",
+  "description": "An agent works your tabs: chat with it in the side panel on your own OpenRouter account, or lend the tabs to a ghost running in ghostd.",
   "minimum_chrome_version": "125",
   "icons": {
     "16": "icons/ghost-16.png",
@@ -14,26 +13,30 @@
   "permissions": [
     "debugger",
     "storage",
-    "alarms"
+    "alarms",
+    "sidePanel",
+    "identity"
   ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "action": {
-    "default_title": "Ghost browser relay",
+    "default_title": "Ghost",
     "default_icon": {
       "16": "icons/ghost-16.png",
       "32": "icons/ghost-32.png"
-    },
-    "default_popup": "popup.html"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
   },
   "commands": {
     "_execute_action": {
       "suggested_key": {
         "default": "Alt+Shift+G"
       },
-      "description": "Open the Ghost relay popup"
+      "description": "Open Ghost"
     }
   }
 }

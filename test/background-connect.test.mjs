@@ -211,7 +211,7 @@ test("an indeterminate ownership restore fails closed before dialing", async () 
   let status;
   chrome.runtime.onMessage.emit(
     { type: "ghost-relay-status" },
-    { id: chrome.runtime.id, url: chrome.runtime.getURL("popup.html") },
+    { id: chrome.runtime.id, url: chrome.runtime.getURL("sidepanel.html") },
     (value) => { status = value; },
   );
   await settle();
@@ -259,7 +259,7 @@ test("a timed-out ownership read releases connect for the alarm retry", async ()
   firstRead.resolve({ ghostTabs: null });
 });
 
-test("a timed-out settings read releases connect and the popup for an alarm retry", async () => {
+test("a timed-out settings read releases connect and the panel for an alarm retry", async () => {
   const firstRead = deferred();
   const reconnects = [];
   const sockets = [];
@@ -290,7 +290,7 @@ test("a timed-out settings read releases connect and the popup for an alarm retr
   let status;
   chrome.runtime.onMessage.emit(
     { type: "ghost-relay-status" },
-    { id: chrome.runtime.id, url: chrome.runtime.getURL("popup.html") },
+    { id: chrome.runtime.id, url: chrome.runtime.getURL("sidepanel.html") },
     (value) => { status = value; },
   );
   await new Promise((resolve) => originalSetTimeout(resolve, 1_100));
@@ -473,7 +473,7 @@ test("a settings change invalidates an awaiting attempt before it can dial", asy
   assert.deepEqual(sockets, ["ws://127.0.0.1:8828/relay"]);
 });
 
-test("only this extension's popup can read live relay status", async () => {
+test("only this extension's side panel can read live relay status", async () => {
   let settingsReads = 0;
   globalThis.chrome = chromeMock({
     loadSettings: async () => {
@@ -501,7 +501,7 @@ test("only this extension's popup can read live relay status", async () => {
   await settle();
   const startupReads = settingsReads;
   const leaked = [];
-  const popupUrl = chrome.runtime.getURL("popup.html");
+  const popupUrl = chrome.runtime.getURL("sidepanel.html");
 
   for (const sender of [
     { id: "another-extension", url: popupUrl },
@@ -547,7 +547,7 @@ test("only this extension's popup can read live relay status", async () => {
   });
 });
 
-test("the popup reports a nonempty list of tabs owned by the relay", async () => {
+test("the panel reports a nonempty list of tabs owned by the relay", async () => {
   const sockets = [];
   let live = false;
   const tab = {
@@ -620,15 +620,18 @@ test("the popup reports a nonempty list of tabs owned by the relay", async () =>
   let status;
   chrome.runtime.onMessage.emit(
     { type: "ghost-relay-status" },
-    { id: chrome.runtime.id, url: chrome.runtime.getURL("popup.html") },
+    { id: chrome.runtime.id, url: chrome.runtime.getURL("sidepanel.html") },
     (value) => { status = value; },
   );
   for (let attempt = 0; attempt < 20 && status === undefined; attempt += 1) await settle();
+  // The popup's list is the machine owner's, so it also says which side opened
+  // each tab; this one is a ghost's.
   assert.deepEqual(status.tabs, [{
     id: "73",
     active: false,
     url: tab.url,
     title: tab.title,
+    local: false,
   }]);
 
   socket.onmessage({
@@ -658,7 +661,7 @@ test("a transient storage read failure is not cached as an unpaired configuratio
   assert.equal(settingsReads, 1);
 
   const statuses = [];
-  const popupUrl = chrome.runtime.getURL("popup.html");
+  const popupUrl = chrome.runtime.getURL("sidepanel.html");
   chrome.runtime.onMessage.emit(
     { type: "ghost-relay-status" },
     { id: chrome.runtime.id, url: popupUrl },
@@ -1268,7 +1271,7 @@ test("an unpaired worker dials with a code and stores the token the daemon hands
       this.onclose?.({ code: code ?? 1005, reason: reason ?? "" });
     }
   };
-  const popup = { id: chrome.runtime.id, url: chrome.runtime.getURL("popup.html") };
+  const popup = { id: chrome.runtime.id, url: chrome.runtime.getURL("sidepanel.html") };
   const statusNow = async () => {
     let status;
     chrome.runtime.onMessage.emit({ type: "ghost-relay-status" }, popup, (value) => { status = value; });
@@ -1350,10 +1353,17 @@ test("a restarted worker keeps showing the code it stored", async () => {
   await settle();
   assert.equal(sockets.length, 1);
   assert.equal(sockets[0].protocols[1], `${PAIR_SUBPROTOCOL_PREFIX}246810`);
-  assert.deepEqual(sessionWrites, [], "a restored code is not rewritten");
+  // Ownership is restored (and its snapshot republished) before the dial even
+  // for an unpaired worker — the side panel's tabs depend on that — so only the
+  // pairing code itself must stay unwritten.
+  assert.deepEqual(
+    sessionWrites.filter((write) => Object.hasOwn(write, "ghostPairingCode")),
+    [],
+    "a restored code is not rewritten",
+  );
 });
 
-test("a denied pairing stops redialing until the popup asks again", async () => {
+test("a denied pairing stops redialing until the panel asks again", async () => {
   const sockets = [];
   const timers = [];
   globalThis.setTimeout = (callback, delay) => {
@@ -1378,7 +1388,7 @@ test("a denied pairing stops redialing until the popup asks again", async () => 
       this.onclose?.({ code: code ?? 1005, reason: reason ?? "" });
     }
   };
-  const popup = { id: chrome.runtime.id, url: chrome.runtime.getURL("popup.html") };
+  const popup = { id: chrome.runtime.id, url: chrome.runtime.getURL("sidepanel.html") };
 
   await import(`../extension/background.js?pairing-denied=${Date.now()}`);
   await settle();

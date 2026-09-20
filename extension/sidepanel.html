@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Ghost</title>
+    <style>
+      /* Chrome draws the panel's own title bar (name, pin, close) above this
+         document, so the page starts at the toolbar. */
+      :root {
+        color-scheme: light dark;
+        --fg: #1c1c1e;
+        --muted: #7a7a80;
+        --faint: #b5b5bb;
+        --bg: #ffffff;
+        --card: #f6f6f8;
+        --line: #e4e4e8;
+        --warn: #9a6700;
+        --bad: #b42318;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #ececee;
+          --muted: #8e8e94;
+          --faint: #4a4a50;
+          --bg: #121212;
+          --card: #1c1c1e;
+          --line: #2a2a2e;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        color: var(--fg);
+        background: var(--bg);
+      }
+      button {
+        font: inherit;
+        color: var(--fg);
+        background: transparent;
+        border: 0;
+        border-radius: 8px;
+        padding: 6px;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+      button:hover { background: var(--card); }
+      button:disabled { opacity: 0.45; cursor: default; }
+      button svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+      .primary {
+        background: var(--fg);
+        color: var(--bg);
+        padding: 9px 16px;
+        border-radius: 10px;
+        font-weight: 500;
+      }
+      .primary:hover { background: var(--fg); opacity: 0.9; }
+
+      /* -- toolbar -- */
+      .toolbar:not([hidden]) {
+        display: flex;
+        justify-content: flex-end;
+        gap: 2px;
+        padding: 8px 10px;
+      }
+      .menu:not([hidden]) {
+        position: absolute;
+        right: 12px;
+        top: 44px;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 4px;
+        min-width: 200px;
+        display: flex;
+        flex-direction: column;
+        z-index: 2;
+      }
+      .menu button { justify-content: flex-start; padding: 8px 10px; font-size: 13px; }
+      .menu button.bad { color: var(--bad); }
+
+      /* -- body -- */
+      main { flex: 1; overflow-y: auto; position: relative; }
+      .empty:not([hidden]) {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .empty img { width: 84px; height: 84px; opacity: 0.35; }
+      .connect:not([hidden]) {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        padding: 24px;
+        text-align: center;
+      }
+      .connect img { width: 64px; height: 64px; opacity: 0.6; }
+      .connect p { margin: 0; color: var(--muted); font-size: 13px; max-width: 280px; }
+      .connect .alt { background: none; color: var(--muted); font-size: 12px; text-decoration: underline; padding: 2px 4px; }
+      .connect .code:not([hidden]) { display: flex; flex-direction: column; gap: 8px; width: 100%; max-width: 300px; }
+      .connect input {
+        font: inherit;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 13px;
+        color: var(--fg);
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 8px 10px;
+      }
+      .error { color: var(--bad); font-size: 12px; }
+
+      #log:not([hidden]) { padding: 8px 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+      .turn { display: flex; flex-direction: column; gap: 3px; }
+      .body { white-space: pre-wrap; word-break: break-word; }
+      .turn.user { align-items: flex-end; }
+      .turn.user .body {
+        background: var(--card);
+        border-radius: 14px 14px 4px 14px;
+        padding: 8px 12px;
+        max-width: 88%;
+      }
+      .tool {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11.5px;
+        color: var(--muted);
+        border-left: 2px solid var(--line);
+        padding-left: 8px;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .tool.bad { color: var(--bad); border-left-color: var(--bad); }
+      .usage { font-size: 11px; color: var(--muted); }
+      .confirm {
+        border: 1px solid var(--warn);
+        border-radius: 10px;
+        padding: 10px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .confirm .who { font-size: 12px; color: var(--muted); }
+      .confirm pre {
+        margin: 0;
+        max-height: 140px;
+        overflow: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11.5px;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .confirm .row { display: flex; gap: 8px; }
+      .confirm .row button { padding: 6px 12px; border: 1px solid var(--line); }
+
+      /* -- Ghost on this machine -- */
+      .ghost:not([hidden]) { padding: 4px 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+      .ghost h2 { margin: 0; font-size: 15px; font-weight: 600; }
+      .ghost p, .ghost .note { margin: 0; color: var(--muted); font-size: 12.5px; }
+      .ghost a { color: inherit; }
+      .ghost .back { align-self: flex-start; color: var(--muted); font-size: 12px; padding: 4px 6px; }
+      .ghost .status { display: flex; align-items: center; gap: 7px; font-weight: 600; }
+      .ghost .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; }
+      .ghost .dot.on { background: #1a7f37; }
+      .ghost .dot.paused { background: var(--warn); }
+      .ghost .pair { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; }
+      .ghost .code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 26px;
+        letter-spacing: 0.12em;
+        text-align: center;
+        margin: 4px 0 8px;
+      }
+      .ghost .pair button { border: 1px solid var(--line); padding: 6px 12px; margin-top: 8px; }
+      .ghost details summary { font-size: 12px; color: var(--muted); cursor: pointer; }
+      .ghost label { display: block; margin: 10px 0 4px; font-size: 12px; color: var(--muted); }
+      .ghost code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+      .ghost input {
+        width: 100%;
+        font: inherit;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        color: var(--fg);
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 7px 9px;
+      }
+      .ghost .row { display: flex; gap: 8px; align-items: center; }
+      .ghost .row input { width: 110px; }
+      .ghost .row .primary { padding: 7px 12px; font-size: 13px; }
+
+      #historyList:not([hidden]) { padding: 6px 10px; display: flex; flex-direction: column; gap: 2px; }
+      #historyList h2 { margin: 6px 4px 8px; font-size: 12px; font-weight: 500; color: var(--muted); }
+      #historyList button { justify-content: space-between; padding: 9px 10px; text-align: left; gap: 10px; }
+      #historyList button.active { background: var(--card); }
+      #historyList .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #historyList .when { font-size: 11px; color: var(--muted); flex: none; }
+
+      .banner {
+        margin: 0 12px 6px;
+        padding: 8px 12px;
+        font-size: 12px;
+        border-radius: 10px;
+        background: var(--card);
+        color: var(--muted);
+      }
+      .banner.warn { color: var(--warn); }
+
+      /* -- composer -- */
+      footer { padding: 6px 12px 12px; }
+      .composer {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 12px 12px 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      textarea {
+        width: 100%;
+        resize: none;
+        border: 0;
+        outline: none;
+        font: inherit;
+        font-size: 15px;
+        color: var(--fg);
+        background: transparent;
+        min-height: 26px;
+        max-height: 160px;
+      }
+      textarea::placeholder { color: var(--muted); }
+      .composer .row { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+      #model {
+        font: inherit;
+        font-size: 13px;
+        color: var(--muted);
+        background: transparent;
+        border: 0;
+        max-width: 60%;
+        text-overflow: ellipsis;
+        cursor: pointer;
+        padding: 4px;
+      }
+      #send { background: var(--fg); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; padding: 0; }
+      #send:hover { background: var(--fg); }
+      #send:disabled { background: var(--faint); }
+      #stop { color: var(--fg); border: 1px solid var(--line); padding: 0 10px; height: 32px; font-size: 12px; border-radius: 16px; }
+      /* Every element rule above that sets `display` is a type selector; this
+         attribute selector outranks them all, so `hidden` means hidden. */
+      [hidden] { display: none; }
+    </style>
+  </head>
+  <body>
+    <div class="toolbar" id="toolbar" hidden>
+      <button id="history" type="button" title="Past conversations">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><title>Past conversations</title><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>
+      </button>
+      <button id="newChat" type="button" title="New conversation">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><title>New conversation</title><path d="M21 12a8 8 0 0 1-11.6 7.2L3 21l1.8-6.4A8 8 0 1 1 21 12z"/><path d="M12 9v6M9 12h6"/></svg>
+      </button>
+      <button id="more" type="button" title="More">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><title>More</title><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>
+      </button>
+    </div>
+    <div class="menu" id="menu" hidden>
+      <button id="pauseToggle" type="button">Pause Ghost</button>
+      <button id="ghostMachine" type="button">Ghost on this machine…</button>
+      <button id="deleteChat" type="button" class="bad">Delete this conversation</button>
+      <button id="disconnect" type="button">Disconnect OpenRouter</button>
+    </div>
+
+    <div class="banner warn" id="paused" hidden>
+      Browsing is paused in the relay popup. Resume it to let Ghost act.
+    </div>
+    <div class="banner" id="notice" hidden></div>
+
+    <main>
+      <section class="connect" id="connect" hidden>
+        <img src="icons/ghost.svg" alt="" />
+        <p>Ghost works in tabs it opens here, on your own OpenRouter account. The default model is free.</p>
+        <button class="primary" id="oauth" type="button">Connect OpenRouter</button>
+        <button class="alt" id="showCode" type="button">Connect with a code instead</button>
+        <div class="code" id="codePath" hidden>
+          <p>Open the authorization page, then paste the code it shows.</p>
+          <button class="primary" id="openAuth" type="button">Open authorization page</button>
+          <input type="text" id="manual" spellcheck="false" autocomplete="off" placeholder="Paste the code" />
+          <button class="primary" id="manualSave" type="button">Use code</button>
+        </div>
+        <p class="error" id="connectError" hidden></p>
+      </section>
+
+      <section class="ghost" id="ghostView" hidden>
+        <button class="back" id="ghostBack" type="button">← Back</button>
+        <h2>Ghost on this machine</h2>
+        <p>
+          If <a href="https://github.com/ferdousbhai/ghost">Ghost</a> runs on this computer, its
+          ghosts can drive tabs here too. Nothing to install in the browser: pair once.
+        </p>
+        <div class="status"><span class="dot" id="dot"></span><span id="statusText">Checking…</span></div>
+        <p class="note" id="detail"></p>
+        <p class="note" id="ghostTabs" hidden></p>
+        <div class="pair" id="pair" hidden>
+          <div class="code" id="pairCode">…</div>
+          <p class="note" id="pairNote">Open Ghost (Super+Ctrl+G) and choose <strong>Allow</strong> when it shows this code.</p>
+          <button id="retry" type="button" hidden>Try again</button>
+        </div>
+        <details>
+          <summary>Advanced: port, or paste a token</summary>
+          <label for="token">Pairing token — <code>ghostd relay-token</code></label>
+          <input type="text" id="token" spellcheck="false" autocomplete="off" placeholder="64 hex characters" />
+          <label for="port">Port</label>
+          <div class="row">
+            <input type="number" id="port" min="1" max="65535" />
+            <button class="primary" id="save" type="button">Save &amp; connect</button>
+          </div>
+          <p class="note" id="saved" hidden>Saved</p>
+        </details>
+      </section>
+
+      <div class="empty" id="empty" hidden><img src="icons/ghost.svg" alt="" /></div>
+      <div id="log" hidden></div>
+      <div id="historyList" hidden></div>
+    </main>
+
+    <footer id="composerBar" hidden>
+      <div class="composer">
+        <textarea id="input" rows="1" placeholder="Ask Ghost to do something in a tab…"></textarea>
+        <div class="row">
+          <select id="model" title="Model"></select>
+          <button id="send" type="button" title="Send">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><title>Send</title><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          </button>
+          <button id="stop" type="button" hidden>Stop</button>
+        </div>
+      </div>
+    </footer>
+
+    <script src="sidepanel.js" type="module"></script>
+  </body>
+</html>
