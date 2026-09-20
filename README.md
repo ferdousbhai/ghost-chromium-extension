@@ -46,15 +46,10 @@ disconnected.
 
 ## Install
 
-From the Chrome Web Store once it is listed, or unpacked from this repo:
-
-```sh
-contrib/install.sh        # copy to ~/.local/share/ghost/
-contrib/install.sh --link # symlink, for hacking on it
-```
-
-Then, in the browser you actually use: `chrome://extensions` → Developer mode →
-**Load unpacked** → the printed directory.
+From the Chrome Web Store once it is listed, or unpacked from this repo: the
+repository root *is* the extension. In the browser you actually use,
+`chrome://extensions` → Developer mode → **Load unpacked** → this directory.
+Edit a file and press reload there; there is nothing to build or copy.
 
 There is deliberately no attempt to install into your running browser
 automatically. `--load-extension` only applies to a process started with it, and
@@ -134,7 +129,7 @@ sentence) are a by-hand check with a real account and are not automated.
 contrib/package.sh          # dist/ghost-browser-relay-<version>.zip
 ```
 
-The zip is `extension/` and nothing else, with no build step, so the bytes a
+The zip is the runtime files at the root and nothing else, with no build step, so the bytes a
 store reviewer reads are the bytes that run. Listing copy, permission
 justifications, and the data disclosure are in [`STORE.md`](STORE.md); the
 privacy policy is [`PRIVACY.md`](PRIVACY.md).
@@ -264,7 +259,7 @@ that is a deliberate not-yet, not an oversight.
 
 ## Behaviour worth knowing
 
-No build step: plain ES modules under `extension/`, requesting `debugger`,
+No build step: plain ES modules at the repository root, requesting `debugger`,
 `storage`, and `alarms` and nothing else. Edit and hit reload in
 `chrome://extensions`.
 

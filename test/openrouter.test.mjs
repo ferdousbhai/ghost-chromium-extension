@@ -20,7 +20,7 @@ import {
   OpenRouterError,
   OPENROUTER_ORIGIN,
   streamChat,
-} from "../extension/openrouter.js";
+} from "../openrouter.js";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });

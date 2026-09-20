@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
-import { RelayOpError } from "../extension/protocol.js";
+import { RelayOpError } from "../protocol.js";
 
 const originalChrome = globalThis.chrome;
 const INCARNATION_A = "11111111-1111-4111-8111-111111111111";
@@ -149,7 +149,7 @@ test("every concurrent attach waiter receives browser_unavailable", async () => 
       return attaching.promise;
     },
   });
-  const { runOp } = await import(`../extension/ops.js?attach-failure=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?attach-failure=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
 
   const first = runOp("read", { session: "s1", tab: "17" }, 1_000);
@@ -196,7 +196,7 @@ test("release invalidates an in-flight attach and the stale success detaches its
     },
   });
   const { installOpsListeners, isAttached, releaseAllTabs, runOp } = await import(
-    `../extension/ops.js?release-attach=${Date.now()}`
+    `../ops.js?release-attach=${Date.now()}`
   );
   installOpsListeners();
   await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
@@ -266,7 +266,7 @@ test("a timed-out stale detach blocks a newer attachment until its outcome is kn
     },
   });
   const { releaseAllTabs, runOp } = await import(
-    `../extension/ops.js?stale-detach-timeout=${Date.now()}`
+    `../ops.js?stale-detach-timeout=${Date.now()}`
   );
   await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
 
@@ -313,7 +313,7 @@ test("release attempts every attached tab and retains an indeterminate detach fo
     },
   });
   const { isAttached, releaseAllTabs, runOp } = await import(
-    `../extension/ops.js?release-detach-timeout=${Date.now()}`
+    `../ops.js?release-detach-timeout=${Date.now()}`
   );
   await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
   await runOp("tabs", { session: "s1", op: "create", url: "https://second.example/" }, 1_000);
@@ -355,7 +355,7 @@ test("close retries an indeterminate debugger detach instead of marking it relea
       if (removeAttempts === 1) throw new Error("Chromium refused the close");
     },
   });
-  const { isAttached, runOp } = await import(`../extension/ops.js?close-detach-timeout=${Date.now()}`);
+  const { isAttached, runOp } = await import(`../ops.js?close-detach-timeout=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
   await runOp("read", { session: "s1", tab: "17" }, 1_000);
 
@@ -394,7 +394,7 @@ test("two tabs keep their own attachment and isolated world", async () => {
     },
   });
   const { installOpsListeners, isAttached, runOp } = await import(
-    `../extension/ops.js?two-tabs=${Date.now()}`
+    `../ops.js?two-tabs=${Date.now()}`
   );
   installOpsListeners();
   await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
@@ -424,7 +424,7 @@ test("two tabs keep their own attachment and isolated world", async () => {
 
 test("status is owner-scoped on the wire; only the popup view sees every tab", async () => {
   globalThis.chrome = chromeMock({ attach: async () => {} });
-  const { runOp, allTabInfos } = await import(`../extension/ops.js?status-tabs=${Date.now()}`);
+  const { runOp, allTabInfos } = await import(`../ops.js?status-tabs=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
   await runOp("open", { session: "s2", url: "https://second.example/" }, 1_000);
 
@@ -450,7 +450,7 @@ test("one ghost workspace cannot see or drive another ghost's tabs", async () =>
     attach: async () => {},
     tabRemove: async (id) => removed.push(id),
   });
-  const { runOp } = await import(`../extension/ops.js?ownership=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?ownership=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
   await runOp("open", { session: "s2", url: "https://second.example/" }, 1_000);
 
@@ -504,7 +504,7 @@ test("open closes the load-event gap with the tab's current status", async () =>
       return stale;
     },
   });
-  const { runOp } = await import(`../extension/ops.js?load-event-gap=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?load-event-gap=${Date.now()}`);
 
   const opened = await runOp(
     "open",
@@ -519,7 +519,7 @@ test("open closes the load-event gap with the tab's current status", async () =>
 
 test("protocol-4 tab creation refuses a missing workspace owner with recovery", async () => {
   globalThis.chrome = chromeMock({ attach: async () => {} });
-  const { runOp } = await import(`../extension/ops.js?missing-owner=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?missing-owner=${Date.now()}`);
 
   for (const [op, args] of [
     ["open", { url: "https://example.com/" }],
@@ -541,7 +541,7 @@ test("releasing a ghost workspace sweeps every tab it opened, not just the last 
     attach: async () => {},
     tabRemove: async (id) => removed.push(id),
   });
-  const { runOp } = await import(`../extension/ops.js?sweep=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?sweep=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
   // `tabs create` re-points the caller; the tab it moved off must not be orphaned.
   await runOp("tabs", { session: "s1", op: "create", url: "https://second.example/" }, 1_000);
@@ -562,7 +562,7 @@ test("workspace release sweeps older tabs after the current tab is gone", async 
     attach: async () => {},
     tabRemove: async (id) => removed.push(id),
   });
-  const { runOp } = await import(`../extension/ops.js?current-gone=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?current-gone=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
   await runOp("tabs", {
     session: "s1",
@@ -588,7 +588,7 @@ test("a burst of owner-closed tabs coalesces slow ownership publication", async 
       if (burstWrites === 1) await firstBurstWrite.promise;
     },
   });
-  const ops = await import(`../extension/ops.js?tab-close-coalescing=${Date.now()}`);
+  const ops = await import(`../ops.js?tab-close-coalescing=${Date.now()}`);
   ops.installOpsListeners();
   await ops.runOp("open", { session: "burst", url: "https://first.example/" }, 1_000);
   await ops.runOp("tabs", {
@@ -624,7 +624,7 @@ test("a worker restart restores a durably published session claim", async () => 
     restoreSession: async () => structuredClone(stored),
     tabRemove: async (id) => { removed.push(id); },
   });
-  const first = await import(`../extension/ops.js?persist-owner=${Date.now()}`);
+  const first = await import(`../ops.js?persist-owner=${Date.now()}`);
   await first.runOp("open", { session: "durable", url: "https://example.com/" }, 1_000);
   assert.deepEqual(stored.ghostTabs, {
     version: 2,
@@ -633,7 +633,7 @@ test("a worker restart restores a durably published session claim", async () => 
     retired: [],
   });
 
-  const restarted = await import(`../extension/ops.js?restore-owner=${Date.now()}`);
+  const restarted = await import(`../ops.js?restore-owner=${Date.now()}`);
   await restarted.restoreTabsFromSession();
   const closed = await restarted.runOp("close", { session: "durable" }, 1_000);
   assert.equal(closed.closed, true);
@@ -673,7 +673,7 @@ test("a Chromium restart never adopts a reused tab id from the prior browser ses
       return { id: 17, windowId: 8, status: "complete", active: true };
     },
   });
-  const restarted = await import(`../extension/ops.js?browser-session-restart=${Date.now()}`);
+  const restarted = await import(`../ops.js?browser-session-restart=${Date.now()}`);
 
   await restarted.restoreTabsFromSession();
   assert.equal(tabReads, 0, "the unrelated reused id is never queried or admitted");
@@ -711,7 +711,7 @@ test("a partial fresh-browser poison reset is completed before ownership is publ
       return { id: 17, windowId: 8, status: "complete", active: true };
     },
   });
-  const restarted = await import(`../extension/ops.js?partial-browser-reset=${Date.now()}`);
+  const restarted = await import(`../ops.js?partial-browser-reset=${Date.now()}`);
 
   await restarted.restoreTabsFromSession();
   assert.equal(tabReads, 0);
@@ -744,7 +744,7 @@ test("fresh Chromium withholds its browser identity until both poison slots clea
       ghostBrowserSession: null,
     }),
   });
-  const resetting = await import(`../extension/ops.js?browser-reset-barrier=${Date.now()}`);
+  const resetting = await import(`../ops.js?browser-reset-barrier=${Date.now()}`);
 
   await assert.rejects(
     resetting.restoreTabsFromSession(),
@@ -777,7 +777,7 @@ test("a new daemon tombstones a pending old-daemon create before admitting work"
     },
     tabRemove: async (id) => { removed.push(id); },
   });
-  const ops = await import(`../extension/ops.js?incarnation-create-lease=${Date.now()}`);
+  const ops = await import(`../ops.js?incarnation-create-lease=${Date.now()}`);
 
   const opening = ops.runOp(
     "open",
@@ -843,7 +843,7 @@ test("incarnation retry republishes an in-memory create tombstone before worker 
     },
     tabRemove: async (id) => { removed.push(id); },
   });
-  const first = await import(`../extension/ops.js?incarnation-republish=${Date.now()}`);
+  const first = await import(`../ops.js?incarnation-republish=${Date.now()}`);
   const opening = first.runOp(
     "open",
     { session: "crashed-owner", url: "https://late.example/" },
@@ -863,7 +863,7 @@ test("incarnation retry republishes an in-memory create tombstone before worker 
   assert.deepEqual(storedSession.ghostTabs.retired, ["crashed-owner"]);
   assert.equal(storedLocal.ghostDaemonIncarnation.incarnation, INCARNATION_B);
 
-  const restarted = await import(`../extension/ops.js?incarnation-republish-restart=${Date.now()}`);
+  const restarted = await import(`../ops.js?incarnation-republish-restart=${Date.now()}`);
   await restarted.restoreTabsFromSession();
   await assert.rejects(
     restarted.runOp("open", { session: "crashed-owner", url: "https://other.example/" }, 1_000),
@@ -903,7 +903,7 @@ test("a fresh worker ignores an older incarnation slot that settled late", async
       }
       : { ghostOwnershipPoison: storedLocal.ghostOwnershipPoison },
   });
-  const ops = await import(`../extension/ops.js?incarnation-write-order=${Date.now()}`);
+  const ops = await import(`../ops.js?incarnation-write-order=${Date.now()}`);
 
   await ops.reconcileDaemonIncarnation(INCARNATION_B);
   assert.equal(writes, 0, "the higher acknowledged slot remains authoritative after restart");
@@ -918,7 +918,7 @@ test("a claim is not acknowledged until storage accepts it", async () => {
     attach: async () => {},
     persistSession: () => stored.promise,
   });
-  const { runOp } = await import(`../extension/ops.js?claim-barrier=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?claim-barrier=${Date.now()}`);
   const opening = runOp("open", { session: "s1", url: "https://example.com/" }, 5_000)
     .then((result) => {
       acknowledged = true;
@@ -954,7 +954,7 @@ test("a timed-out ownership write cannot block close and repairs a late stale wr
       if (removals === 1) throw new Error("Chromium refused the rollback");
     },
   });
-  const writer = await import(`../extension/ops.js?write-timeout=${Date.now()}`);
+  const writer = await import(`../ops.js?write-timeout=${Date.now()}`);
 
   await assert.rejects(
     writer.runOp("open", { session: "timed-write", url: "https://example.com/" }, 2_000),
@@ -979,7 +979,7 @@ test("a timed-out ownership write cannot block close and repairs a late stale wr
     (error) => error instanceof RelayOpError
       && /workspace has been released.*retry.*fresh workspace/i.test(error.message),
   );
-  const restarted = await import(`../extension/ops.js?write-timeout-restart=${Date.now()}`);
+  const restarted = await import(`../ops.js?write-timeout-restart=${Date.now()}`);
   await restarted.restoreTabsFromSession();
 });
 
@@ -1003,7 +1003,7 @@ test("a failed late ownership repair stays fenced across a fresh worker module",
     restoreLocal: async () => structuredClone(storedLocal),
     restoreSession: async () => structuredClone(storedSession),
   });
-  const ops = await import(`../extension/ops.js?ownership-repair-retry=${Date.now()}`);
+  const ops = await import(`../ops.js?ownership-repair-retry=${Date.now()}`);
   await ops.runOp("open", { session: "stale-owner", url: "https://example.com/" }, 1_000);
 
   await assert.rejects(
@@ -1034,7 +1034,7 @@ test("a failed late ownership repair stays fenced across a fresh worker module",
       && /ownership recovery is not durable yet.*automatic repair/i.test(error.message),
   );
 
-  const restarted = await import(`../extension/ops.js?ownership-fence-restart=${Date.now()}`);
+  const restarted = await import(`../ops.js?ownership-fence-restart=${Date.now()}`);
   await restarted.restoreTabsFromSession();
   assert.equal(storedSession.ghostBrowserSession, activeBrowserSession);
   assert.equal(writes, 5, "a fresh worker republishes the newer durable fence");
@@ -1063,7 +1063,7 @@ test("a fresh worker keeps newer poison when an older empty slot settled late", 
     restoreSession: async () => structuredClone(storedSession),
     tabGet: async () => { throw new Error("tab status indeterminate"); },
   });
-  const restarted = await import(`../extension/ops.js?poison-late-empty=${Date.now()}`);
+  const restarted = await import(`../ops.js?poison-late-empty=${Date.now()}`);
 
   await assert.rejects(
     restarted.restoreTabsFromSession(),
@@ -1101,7 +1101,7 @@ test("poison-only live ownership is reverified and promoted on a repeated restor
       return { id: 17, windowId: 4, status: "complete", active: false };
     },
   });
-  const ops = await import(`../extension/ops.js?poison-repeat=${Date.now()}`);
+  const ops = await import(`../ops.js?poison-repeat=${Date.now()}`);
 
   await assert.rejects(
     ops.restoreTabsFromSession(),
@@ -1129,7 +1129,7 @@ test("a rejected claim publication closes the unowned new tab", async () => {
     persistSession: async () => { throw new Error("session storage unavailable"); },
     tabRemove: async (id) => { removed.push(id); },
   });
-  const { runOp } = await import(`../extension/ops.js?claim-rollback=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?claim-rollback=${Date.now()}`);
 
   await assert.rejects(
     runOp("open", { session: "s1", url: "https://example.com/" }, 1_000),
@@ -1161,7 +1161,7 @@ test("double claim persistence failure stays poisoned across a worker restart", 
       if (failRemoval) throw new Error("Chromium refused the rollback");
     },
   });
-  const first = await import(`../extension/ops.js?poison-writer=${Date.now()}`);
+  const first = await import(`../ops.js?poison-writer=${Date.now()}`);
   await first.restoreTabsFromSession();
 
   await assert.rejects(
@@ -1174,7 +1174,7 @@ test("double claim persistence failure stays poisoned across a worker restart", 
   assert.deepEqual(storedLocal.ghostOwnershipPoison.claims, [["poisoned", 17]]);
   assert.deepEqual(storedLocal.ghostOwnershipPoisonBackup.claims, [["poisoned", 17]]);
 
-  const restarted = await import(`../extension/ops.js?poison-reader=${Date.now()}`);
+  const restarted = await import(`../ops.js?poison-reader=${Date.now()}`);
   await assert.rejects(
     restarted.restoreTabsFromSession(),
     (error) => error instanceof RelayOpError
@@ -1208,7 +1208,7 @@ test("double claim persistence failure stays poisoned across a worker restart", 
     }),
     restoreSession: async () => ({ ghostBrowserSession: BROWSER_SESSION }),
   });
-  const absent = await import(`../extension/ops.js?poison-absent=${Date.now()}`);
+  const absent = await import(`../ops.js?poison-absent=${Date.now()}`);
   await absent.restoreTabsFromSession();
   assert.equal(cleared, true, "an authoritative no-such-tab result clears the restart poison");
 });
@@ -1231,7 +1231,7 @@ test("an onRemoved storage rejection stays pending for automatic recovery", asyn
     restoreSession: async () => structuredClone(storedSession),
     tabRemove: async () => { throw new Error("Chromium refused the rollback"); },
   });
-  const ops = await import(`../extension/ops.js?removed-repair=${Date.now()}`);
+  const ops = await import(`../ops.js?removed-repair=${Date.now()}`);
   ops.installOpsListeners();
 
   await assert.rejects(
@@ -1285,7 +1285,7 @@ test("concurrent failed claims publish every uncertain tab to the poison ledger"
     },
     tabRemove: async () => { throw new Error("Chromium refused the rollback"); },
   });
-  const concurrent = await import(`../extension/ops.js?poison-concurrent=${Date.now()}`);
+  const concurrent = await import(`../ops.js?poison-concurrent=${Date.now()}`);
 
   const failures = await Promise.allSettled([
     concurrent.runOp("open", { session: "one", url: "https://one.example/" }, 1_000),
@@ -1305,7 +1305,7 @@ test("restore fails closed when storage or tab existence is indeterminate", asyn
     attach: async () => {},
     restoreSession: async () => { throw new Error("session storage unavailable"); },
   });
-  const storageFailure = await import(`../extension/ops.js?restore-storage-failure=${Date.now()}`);
+  const storageFailure = await import(`../ops.js?restore-storage-failure=${Date.now()}`);
   await assert.rejects(
     storageFailure.restoreTabsFromSession(),
     (error) => error instanceof RelayOpError
@@ -1324,10 +1324,10 @@ test("restore fails closed when storage or tab existence is indeterminate", asyn
       return tab;
     },
   });
-  const writer = await import(`../extension/ops.js?restore-tab-writer=${Date.now()}`);
+  const writer = await import(`../ops.js?restore-tab-writer=${Date.now()}`);
   await writer.runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
   failLookup = true;
-  const tabFailure = await import(`../extension/ops.js?restore-tab-failure=${Date.now()}`);
+  const tabFailure = await import(`../ops.js?restore-tab-failure=${Date.now()}`);
   await assert.rejects(
     tabFailure.restoreTabsFromSession(),
     (error) => error instanceof RelayOpError
@@ -1365,7 +1365,7 @@ test("restore rejects equal ownership revisions with different snapshots", async
       ghostBrowserSession: BROWSER_SESSION,
     }),
   });
-  const restoring = await import(`../extension/ops.js?restore-fence-conflict=${Date.now()}`);
+  const restoring = await import(`../ops.js?restore-fence-conflict=${Date.now()}`);
 
   await assert.rejects(
     restoring.restoreTabsFromSession(),
@@ -1403,7 +1403,7 @@ test("ownership recovery accepts the exact tab cap with bounded lookup concurren
       throw new Error(`No tab with id: ${id}.`);
     },
   });
-  const restoring = await import(`../extension/ops.js?restore-exact-cap=${Date.now()}`);
+  const restoring = await import(`../ops.js?restore-exact-cap=${Date.now()}`);
 
   await restoring.restoreTabsFromSession();
   assert.equal(reads, 1_024);
@@ -1434,7 +1434,7 @@ test("ownership and poison ledgers share their tab and owner caps", async () => 
       throw new Error(`No tab with id: ${id}.`);
     },
   });
-  const exact = await import(`../extension/ops.js?restore-combined-exact-cap=${Date.now()}`);
+  const exact = await import(`../ops.js?restore-combined-exact-cap=${Date.now()}`);
   await exact.restoreTabsFromSession();
   assert.equal(tabReads, 1_024, "the exact combined cap remains admissible");
 
@@ -1457,7 +1457,7 @@ test("ownership and poison ledgers share their tab and owner caps", async () => 
     }),
     tabGet: async () => { tabReads += 1; },
   });
-  const overTabs = await import(`../extension/ops.js?restore-combined-tab-over-cap=${Date.now()}`);
+  const overTabs = await import(`../ops.js?restore-combined-tab-over-cap=${Date.now()}`);
   await assert.rejects(
     overTabs.restoreTabsFromSession(),
     (error) => error instanceof RelayOpError && /combined limits/i.test(error.message),
@@ -1482,7 +1482,7 @@ test("ownership and poison ledgers share their tab and owner caps", async () => 
     tabGet: async () => { tabReads += 1; },
   });
   const overOwners = await import(
-    `../extension/ops.js?restore-combined-owner-over-cap=${Date.now()}`
+    `../ops.js?restore-combined-owner-over-cap=${Date.now()}`
   );
   await assert.rejects(
     overOwners.restoreTabsFromSession(),
@@ -1510,7 +1510,7 @@ test("a quota-sized hung restore stops after one bounded lookup batch", async ()
       return never.promise;
     },
   });
-  const restoring = await import(`../extension/ops.js?restore-hung-cap=${Date.now()}`);
+  const restoring = await import(`../ops.js?restore-hung-cap=${Date.now()}`);
   const started = Date.now();
 
   await assert.rejects(
@@ -1537,7 +1537,7 @@ test("ownership and poison recovery reject over-cap rows and owner strings befor
     }),
     tabGet: async () => { tabReads += 1; },
   });
-  const overRows = await import(`../extension/ops.js?restore-over-cap=${Date.now()}`);
+  const overRows = await import(`../ops.js?restore-over-cap=${Date.now()}`);
   await assert.rejects(
     overRows.restoreTabsFromSession(),
     (error) => error instanceof RelayOpError && /ownership.*invalid/i.test(error.message),
@@ -1553,7 +1553,7 @@ test("ownership and poison recovery reject over-cap rows and owner strings befor
     restoreSession: async () => ({ ghostBrowserSession: BROWSER_SESSION }),
     tabGet: async () => { tabReads += 1; },
   });
-  const overPoison = await import(`../extension/ops.js?poison-over-cap=${Date.now()}`);
+  const overPoison = await import(`../ops.js?poison-over-cap=${Date.now()}`);
   await assert.rejects(
     overPoison.restoreTabsFromSession(),
     (error) => error instanceof RelayOpError && /ownership recovery is invalid/i.test(error.message),
@@ -1573,7 +1573,7 @@ test("ownership and poison recovery reject over-cap rows and owner strings befor
     }),
     tabGet: async () => { tabReads += 1; },
   });
-  const overString = await import(`../extension/ops.js?owner-over-cap=${Date.now()}`);
+  const overString = await import(`../ops.js?owner-over-cap=${Date.now()}`);
   await assert.rejects(
     overString.restoreTabsFromSession(),
     (error) => error instanceof RelayOpError && /ownership.*invalid/i.test(error.message),
@@ -1601,7 +1601,7 @@ test("a timed-out restored tab lookup releases ownership for a later retry", asy
       return { id: 17, windowId: 4, status: "complete" };
     },
   });
-  const restoring = await import(`../extension/ops.js?restore-tab-timeout=${Date.now()}`);
+  const restoring = await import(`../ops.js?restore-tab-timeout=${Date.now()}`);
 
   await assert.rejects(
     restoring.restoreTabsFromSession(),
@@ -1627,7 +1627,7 @@ test("a partial workspace release keeps the refused live tab for retry", async (
       removed.push(id);
     },
   });
-  const { runOp } = await import(`../extension/ops.js?close-retry=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?close-retry=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://first.example/" }, 1_000);
   await runOp("tabs", {
     session: "s1",
@@ -1700,7 +1700,7 @@ test("quota-sized incarnation retirement coalesces ownership publication", async
       globalThis.chrome.tabs.onRemoved.emit(id);
     },
   });
-  const ops = await import(`../extension/ops.js?incarnation-quota-retirement=${Date.now()}`);
+  const ops = await import(`../ops.js?incarnation-quota-retirement=${Date.now()}`);
   ops.installOpsListeners();
   await ops.restoreTabsFromSession();
   sessionWrites = 0;
@@ -1730,7 +1730,7 @@ test("retirement advances past never-settling create, update, and remove calls",
     attach: async () => {},
     tabCreate: () => creating.promise,
   });
-  const createOps = await import(`../extension/ops.js?never-create=${Date.now()}`);
+  const createOps = await import(`../ops.js?never-create=${Date.now()}`);
   await assert.rejects(
     createOps.runOp("open", { session: "never-create", url: "https://example.com/" }, 1_000),
     (error) => error instanceof RelayOpError && error.failure === "timeout",
@@ -1747,7 +1747,7 @@ test("retirement advances past never-settling create, update, and remove calls",
     tabRemove: async (id) => { removedAfterUpdate.push(id); },
     tabUpdate: () => updating.promise,
   });
-  const updateOps = await import(`../extension/ops.js?never-update=${Date.now()}`);
+  const updateOps = await import(`../ops.js?never-update=${Date.now()}`);
   await updateOps.runOp("open", { session: "never-update", url: "https://first.example/" }, 1_000);
   await assert.rejects(
     updateOps.runOp("open", {
@@ -1769,7 +1769,7 @@ test("retirement advances past never-settling create, update, and remove calls",
       if (removeAttempts === 1) await removing.promise;
     },
   });
-  const removeOps = await import(`../extension/ops.js?never-remove=${Date.now()}`);
+  const removeOps = await import(`../ops.js?never-remove=${Date.now()}`);
   await removeOps.runOp("open", { session: "never-remove", url: "https://example.com/" }, 1_000);
   await assert.rejects(
     removeOps.runOp("close", { session: "never-remove" }, 1_000),
@@ -1799,7 +1799,7 @@ test("a failed late-create removal is swept after the daemon has rotated session
       if (removeAttempts === 1) throw new Error("Chromium refused the autonomous close");
     },
   });
-  const late = await import(`../extension/ops.js?late-sweeper=${Date.now()}`);
+  const late = await import(`../ops.js?late-sweeper=${Date.now()}`);
   const opening = late.startOp(
     "open",
     { session: "rotated-away", url: "https://example.com/" },
@@ -1859,7 +1859,7 @@ test("restore merge-gates an older snapshot behind a newer uncertain live claim"
       if (!allowRemoval) throw new Error("Chromium refused the rollback");
     },
   });
-  const merging = await import(`../extension/ops.js?restore-merge=${Date.now()}`);
+  const merging = await import(`../ops.js?restore-merge=${Date.now()}`);
   await assert.rejects(
     merging.runOp("open", { session: "newer", url: "https://example.com/" }, 1_000),
     (error) => error instanceof RelayOpError && /across a worker restart/.test(error.message),
@@ -1893,7 +1893,7 @@ test("retired UUID persistence is garbage-collected after all create leases sett
       ghostTabs: { version: 2, tabs: [], sessions: [], retired },
     }),
   });
-  const gc = await import(`../extension/ops.js?retired-gc=${Date.now()}`);
+  const gc = await import(`../ops.js?retired-gc=${Date.now()}`);
   await gc.restoreTabsFromSession();
   await gc.sweepRetiredTabs();
   assert.deepEqual(storedSession.ghostTabs, {
@@ -1934,7 +1934,7 @@ test("claimless close bursts cannot overflow the retired-owner ledger across res
     },
     restoreSession: async () => structuredClone(storedSession),
   });
-  const first = await import(`../extension/ops.js?claimless-close-cap=${Date.now()}`);
+  const first = await import(`../ops.js?claimless-close-cap=${Date.now()}`);
   await first.restoreTabsFromSession();
   const restoreWrites = writes;
 
@@ -1952,7 +1952,7 @@ test("claimless close bursts cannot overflow the retired-owner ledger across res
       && /workspace has been released.*retry.*fresh workspace/i.test(error.message),
   );
 
-  const restarted = await import(`../extension/ops.js?claimless-close-restart=${Date.now()}`);
+  const restarted = await import(`../ops.js?claimless-close-restart=${Date.now()}`);
   await restarted.restoreTabsFromSession();
   assert.equal(storedSession.ghostTabs.retired.length, 2_048);
   assert.equal(largestPublication, 2_048, "a fresh worker never receives an oversized ledger");
@@ -1980,7 +1980,7 @@ test("an indeterminate remove failure retains the tab for close retry", async ()
       removed.push(id);
     },
   });
-  const { runOp } = await import(`../extension/ops.js?indeterminate-close=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?indeterminate-close=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
 
   await assert.rejects(
@@ -2011,7 +2011,7 @@ test("the exact no-such-tab result authoritatively completes a failed close", as
       throw new Error("remove response was lost");
     },
   });
-  const { runOp } = await import(`../extension/ops.js?authoritative-close=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?authoritative-close=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
 
   const closed = await runOp("close", { session: "s1" }, 1_000);
@@ -2039,7 +2039,7 @@ test("find clamps relay-provided limits before evaluating page code", async () =
       return {};
     },
   });
-  const { runOp } = await import(`../extension/ops.js?find-limit=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?find-limit=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
 
   for (const query of [
@@ -2070,7 +2070,7 @@ test("find clamps relay-provided limits before evaluating page code", async () =
 
 test("owned tab metadata comes from debugger targets without the tabs permission", async () => {
   globalThis.chrome = chromeMock({ attach: async () => {} });
-  const { runOp } = await import(`../extension/ops.js?target-metadata=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?target-metadata=${Date.now()}`);
 
   const opened = await runOp("open", { session: "s1", url: "https://example.com/path" }, 1_000);
   assert.deepEqual(opened.page, {
@@ -2090,7 +2090,7 @@ test("owned tab metadata comes from debugger targets without the tabs permission
 test("the relay operation deadline bounds CDP work without claiming to cancel it", async () => {
   const attaching = deferred();
   globalThis.chrome = chromeMock({ attach: () => attaching.promise });
-  const { runOp } = await import(`../extension/ops.js?operation-deadline=${Date.now()}`);
+  const { runOp } = await import(`../ops.js?operation-deadline=${Date.now()}`);
   await runOp("open", { session: "s1", url: "https://example.com/" }, 1_000);
 
   const started = Date.now();

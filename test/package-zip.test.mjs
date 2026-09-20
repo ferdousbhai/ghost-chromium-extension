@@ -1,5 +1,6 @@
 /**
- * The store upload is the directory, and nothing else.
+ * The store upload is the runtime files at the repository root, and nothing
+ * else: no tests, no docs, no packaging script.
  *
  * "No remote code" is easiest to hold when the bytes reviewed and the bytes that
  * run are the same, so packaging must never gain a build step that could quietly
@@ -17,29 +18,34 @@ import { after, test } from "node:test";
 
 const run = promisify(execFile);
 const packageDir = fileURLToPath(new URL("..", import.meta.url));
-const extensionDir = join(packageDir, "extension");
+const extensionDir = packageDir;
 
 let outDir = null;
 after(async () => {
   if (outDir !== null) await rm(outDir, { recursive: true, force: true });
 });
 
-async function treeFiles(dir) {
+/** What Chrome runs: the manifest, every script and page at the root, the icons. */
+async function runtimeFiles(dir) {
   const entries = await readdir(dir, { recursive: true, withFileTypes: true });
   return entries
     .filter((entry) => entry.isFile())
     .map((entry) => relative(extensionDir, join(entry.parentPath, entry.name)))
+    .filter((path) => path === "manifest.json" || path.startsWith("icons/")
+      || (!path.includes("/") && /\.(js|html)$/.test(path)))
     .sort();
 }
 
-test("package.sh zips exactly extension/, rooted at the manifest", async () => {
+test("package.sh zips exactly the runtime files, rooted at the manifest", async () => {
   outDir = await mkdtemp(join(tmpdir(), "ghost-relay-package-"));
   const { stdout } = await run("bash", [join(packageDir, "contrib", "package.sh"), outDir]);
   const [zipPath, ...listed] = stdout.trim().split("\n");
 
   assert.match(zipPath, /ghost-browser-relay-\d+\.\d+\.\d+\.zip$/);
-  assert.deepEqual(listed.sort(), await treeFiles(extensionDir));
+  assert.deepEqual(listed.sort(), await runtimeFiles(extensionDir));
   assert.ok(listed.includes("manifest.json"), "the manifest is at the archive root");
-  assert.ok(!listed.some((entry) => entry.startsWith("extension/")),
-    "no wrapper directory: the store rejects one");
+  for (const entry of listed) {
+    assert.ok(!/^(test|contrib)\//.test(entry) && !entry.endsWith(".md"),
+      `${entry} is not a runtime file`);
+  }
 });

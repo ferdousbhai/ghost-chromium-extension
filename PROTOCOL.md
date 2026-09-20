@@ -1,7 +1,7 @@
 # The relay protocol
 
 The seam between this extension and Ghost's daemon. Neither side imports the
-other's source; this file and `extension/protocol.js` are the contract, and
+other's source; this file and `protocol.js` are the contract, and
 `PROTOCOL_VERSION` is the only thing that ties an extension release to a Ghost
 release.
 
@@ -47,7 +47,7 @@ code expired or was replaced, and a fresh one is minted.
 ← { t: "res", id, ok: false, error: { failure, message, details? } }
 ```
 
-`op` is one of the closed set in `extension/protocol.js`; anything else is
+`op` is one of the closed set in `protocol.js`; anything else is
 refused as `invalid_input`. `failure` is one of the eight names in that same
 file — a name the daemon does not recognise is downgraded to
 `navigation_failed`, so getting one wrong loses a detail rather than breaking a
@@ -61,7 +61,7 @@ isolated per workspace, and a workspace never sees another's tabs.
 ## What is not on the wire
 
 The side panel's own agent uses the same ops through the same `ops.js`, in a
-workspace whose id starts with `local:` (see `extension/local-session.js`). It
+workspace whose id starts with `local:` (see `local-session.js`). It
 never opens a socket, its workspace is stamped by the service worker rather than
 chosen by the caller, and a request from either side naming the other side's tab
 is refused by name. A daemon restart retires the claims of the daemon process

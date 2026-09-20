@@ -8,7 +8,6 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "package": "bash contrib/package.sh",
-    "install-extension": "bash contrib/install.sh",
     "smoke": "bun contrib/smoke.mjs",
     "smoke:local": "bun contrib/smoke.mjs --local"
   }

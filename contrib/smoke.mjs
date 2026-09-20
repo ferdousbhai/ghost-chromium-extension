@@ -36,7 +36,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const extensionDir = join(here, "..", "extension");
+const extensionDir = join(here, "..");
 // The ghost-mode smoke drives a real ghost relay hub, so it needs a built
 // checkout of github.com/ferdousbhai/ghost. `--local` needs none.
 const ghostRepo = process.env.GHOST_REPO ?? null;

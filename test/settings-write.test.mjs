@@ -115,7 +115,7 @@ test("the worker repairs a timed-out panel write after that panel context is gon
       Object.assign(stored, structuredClone(value));
     },
   });
-  await import(`../extension/background.js?settings-fence=${Date.now()}`);
+  await import(`../background.js?settings-fence=${Date.now()}`);
   await settle();
   const popup = {
     id: chrome.runtime.id,
@@ -185,7 +185,7 @@ test("a late settings-fence write cannot regress a newer worker choice", async (
       Object.assign(stored, structuredClone(value));
     },
   });
-  await import(`../extension/background.js?settings-fence-race=${Date.now()}`);
+  await import(`../background.js?settings-fence-race=${Date.now()}`);
   await settle();
   const popup = {
     id: chrome.runtime.id,
@@ -259,7 +259,7 @@ test("a fresh worker repairs raw settings from the durable fence", async () => {
     persistLocal: async (value) => { Object.assign(stored, structuredClone(value)); },
   });
 
-  await import(`../extension/background.js?settings-fence-restart=${Date.now()}`);
+  await import(`../background.js?settings-fence-restart=${Date.now()}`);
   for (let attempt = 0; attempt < 20 && stored.port !== 8222; attempt += 1) await settle();
   assert.deepEqual(
     { port: stored.port, token: stored.token, enabled: stored.enabled },

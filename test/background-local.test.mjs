@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
-import { LOCAL_SESSION_PREFIX } from "../extension/local-session.js";
+import { LOCAL_SESSION_PREFIX } from "../local-session.js";
 
 const originalChrome = globalThis.chrome;
 const originalWebSocket = globalThis.WebSocket;
@@ -150,7 +150,7 @@ function askWorker(message, sender = panelSender()) {
 
 async function loadWorker(label) {
   globalThis.WebSocket = InertWebSocket;
-  await import(`../extension/background.js?${label}=${Date.now()}-${Math.random()}`);
+  await import(`../background.js?${label}=${Date.now()}-${Math.random()}`);
   await new Promise((resolve) => setImmediate(resolve));
 }
 

@@ -18,9 +18,9 @@ import {
   renderToolResult,
   runTurn,
   TurnStopped,
-} from "../extension/agent.js";
-import { CONFIRM_OPS, TOOL_OPS, toolDefinitions } from "../extension/tools.js";
-import { OPS } from "../extension/protocol.js";
+} from "../agent.js";
+import { CONFIRM_OPS, TOOL_OPS, toolDefinitions } from "../tools.js";
+import { OPS } from "../protocol.js";
 
 /** A chat stub that plays a fixed script of assistant answers. */
 function scriptedChat(answers) {

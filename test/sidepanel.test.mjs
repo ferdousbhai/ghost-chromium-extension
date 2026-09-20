@@ -172,7 +172,7 @@ function setUp({ key = "sk-or-test", ops = async () => ({ ok: true, result: {} }
   return { document, local, sent, storageListeners };
 }
 
-const load = (label) => import(`../extension/sidepanel.js?${label}=${Date.now()}-${Math.random()}`);
+const load = (label) => import(`../sidepanel.js?${label}=${Date.now()}-${Math.random()}`);
 
 async function settle(times = 6) {
   for (let turn = 0; turn < times; turn += 1) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { PAIR_SUBPROTOCOL_PREFIX, PROTOCOL_VERSION, SUBPROTOCOL } from "../extension/protocol.js";
+import { PAIR_SUBPROTOCOL_PREFIX, PROTOCOL_VERSION, SUBPROTOCOL } from "../protocol.js";
 
 const originalChrome = globalThis.chrome;
 // Never Node's real WebSocket: an unpaired worker dials for pairing on import,
@@ -171,7 +171,7 @@ test("connect is single-flight while settings and session restoration await", as
     }
   };
 
-  await import(`../extension/background.js?single-flight=${Date.now()}`);
+  await import(`../background.js?single-flight=${Date.now()}`);
   chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
   chrome.runtime.onStartup.emit();
   assert.equal(settingsReads, 1);
@@ -203,7 +203,7 @@ test("an indeterminate ownership restore fails closed before dialing", async () 
     }
   };
 
-  await import(`../extension/background.js?restore-failure=${Date.now()}`);
+  await import(`../background.js?restore-failure=${Date.now()}`);
   await settle();
   assert.deepEqual(sockets, []);
   assert.equal(reconnects.length, 1);
@@ -245,7 +245,7 @@ test("a timed-out ownership read releases connect for the alarm retry", async ()
     }
   };
 
-  await import(`../extension/background.js?restore-timeout=${Date.now()}`);
+  await import(`../background.js?restore-timeout=${Date.now()}`);
   await new Promise((resolve) => originalSetTimeout(resolve, 1_100));
   await settle();
   assert.equal(reads, 1);
@@ -286,7 +286,7 @@ test("a timed-out settings read releases connect and the panel for an alarm retr
     }
   };
 
-  await import(`../extension/background.js?settings-timeout=${Date.now()}`);
+  await import(`../background.js?settings-timeout=${Date.now()}`);
   let status;
   chrome.runtime.onMessage.emit(
     { type: "ghost-relay-status" },
@@ -331,7 +331,7 @@ test("a failed dial releases the latch and reconnects once", async () => {
     }
   };
 
-  await import(`../extension/background.js?retry=${Date.now()}`);
+  await import(`../background.js?retry=${Date.now()}`);
   chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
   chrome.runtime.onStartup.emit();
   await settle();
@@ -364,7 +364,7 @@ test("hung cosmetic badge I/O cannot pin unpaired alarm or settings recovery", a
     close() {}
   };
 
-  await import(`../extension/background.js?badge-hang=${Date.now()}`);
+  await import(`../background.js?badge-hang=${Date.now()}`);
   await settle();
   chrome.alarms.onAlarm.emit({ name: "ghost-relay-keepalive" });
   await settle();
@@ -416,7 +416,7 @@ test("reconnect attempts share one cancelable timer and recover through an alarm
     }
   };
 
-  await import(`../extension/background.js?timer-coalesce=${Date.now()}`);
+  await import(`../background.js?timer-coalesce=${Date.now()}`);
   await settle();
   assert.equal(timers.size, 1);
   assert.deepEqual([...timers.values()].map(({ delay }) => delay), [1_000]);
@@ -463,7 +463,7 @@ test("a settings change invalidates an awaiting attempt before it can dial", asy
     }
   };
 
-  await import(`../extension/background.js?settings=${Date.now()}`);
+  await import(`../background.js?settings=${Date.now()}`);
   chrome.storage.onChanged.emit({ token: { newValue: "new-token" } }, "local");
   oldSettings.resolve({ port: 7717, token: "old-token", enabled: true });
   await settle();
@@ -497,7 +497,7 @@ test("only this extension's side panel can read live relay status", async () => 
     close() {}
   };
 
-  await import(`../extension/background.js?sender=${Date.now()}`);
+  await import(`../background.js?sender=${Date.now()}`);
   await settle();
   const startupReads = settingsReads;
   const leaked = [];
@@ -592,7 +592,7 @@ test("the panel reports a nonempty list of tabs owned by the relay", async () =>
     }
   };
 
-  await import(`../extension/background.js?popup-tabs=${Date.now()}`);
+  await import(`../background.js?popup-tabs=${Date.now()}`);
   await settle();
   const socket = sockets[0];
   socket.readyState = WebSocket.OPEN;
@@ -656,7 +656,7 @@ test("a transient storage read failure is not cached as an unpaired configuratio
     },
   });
 
-  await import(`../extension/background.js?storage-retry=${Date.now()}`);
+  await import(`../background.js?storage-retry=${Date.now()}`);
   await settle();
   assert.equal(settingsReads, 1);
 
@@ -717,7 +717,7 @@ test("settings are cached and an open socket stays off until a compatible welcom
     }
   };
 
-  await import(`../extension/background.js?welcome=${Date.now()}`);
+  await import(`../background.js?welcome=${Date.now()}`);
   await settle();
   assert.equal(settingsReads, 1);
   const socket = sockets[0];
@@ -846,7 +846,7 @@ test("a new daemon incarnation retires crash-orphaned claims before hello", asyn
     }
   };
 
-  await import(`../extension/background.js?daemon-incarnation=${Date.now()}`);
+  await import(`../background.js?daemon-incarnation=${Date.now()}`);
   await settle();
   const first = sockets[0];
   first.readyState = WebSocket.OPEN;
@@ -943,7 +943,7 @@ test("an old protocol-3 daemon is refused with update guidance", async () => {
     }
   };
 
-  await import(`../extension/background.js?old-protocol=${Date.now()}`);
+  await import(`../background.js?old-protocol=${Date.now()}`);
   await settle();
   const socket = sockets[0];
   socket.readyState = WebSocket.OPEN;
@@ -1045,7 +1045,7 @@ test("a late operation result cannot cross into a replacement socket", async () 
     }
   };
 
-  await import(`../extension/background.js?socket-generation=${Date.now()}`);
+  await import(`../background.js?socket-generation=${Date.now()}`);
   await settle();
   const first = sockets[0];
   first.readyState = WebSocket.OPEN;
@@ -1156,7 +1156,7 @@ test("close tombstones on the response deadline and cleans up a late tab creatio
     }
   };
 
-  await import(`../extension/background.js?session-order=${Date.now()}`);
+  await import(`../background.js?session-order=${Date.now()}`);
   await settle();
   const socket = sockets[0];
   socket.readyState = WebSocket.OPEN;
@@ -1279,7 +1279,7 @@ test("an unpaired worker dials with a code and stores the token the daemon hands
     return status;
   };
 
-  await import(`../extension/background.js?pairing=${Date.now()}`);
+  await import(`../background.js?pairing=${Date.now()}`);
   await settle();
   assert.equal(sockets.length, 1);
   const [pairing] = sockets;
@@ -1348,7 +1348,7 @@ test("a restarted worker keeps showing the code it stored", async () => {
     close() {}
   };
 
-  await import(`../extension/background.js?pairing-restore=${Date.now()}`);
+  await import(`../background.js?pairing-restore=${Date.now()}`);
   await settle();
   await settle();
   assert.equal(sockets.length, 1);
@@ -1390,7 +1390,7 @@ test("a denied pairing stops redialing until the panel asks again", async () => 
   };
   const popup = { id: chrome.runtime.id, url: chrome.runtime.getURL("sidepanel.html") };
 
-  await import(`../extension/background.js?pairing-denied=${Date.now()}`);
+  await import(`../background.js?pairing-denied=${Date.now()}`);
   await settle();
   assert.equal(sockets.length, 1);
   sockets[0].readyState = 1;

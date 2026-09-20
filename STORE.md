@@ -5,8 +5,9 @@ that story. A reviewer who comes away thinking there are two products here —
 a chat app and a remote-control bridge — has been told it badly; the ghost is
 one of the two things that can drive the agent, not a second product.
 
-Build the upload with `contrib/package.sh`. It zips `extension/` and nothing
-else, with no build step, so the bytes reviewed are the bytes that run.
+Build the upload with `contrib/package.sh`. It zips the runtime files at the
+repository root — manifest, scripts, pages, icons — and nothing else, with no
+build step, so the bytes reviewed are the bytes that run.
 
 ## Name
 
@@ -110,8 +111,8 @@ Copy these into the store's "Why do you need this permission?" fields verbatim.
 - [ ] `node --test test/*.test.mjs` is green.
 - [ ] `bun contrib/smoke.mjs --local` is green with `OPENROUTER_API_KEY` set,
       and the paid/unfunded checks in the README were done by hand.
-- [ ] `contrib/package.sh` lists exactly the files in `extension/`.
-- [ ] `extension/manifest.json` version bumped.
+- [ ] `contrib/package.sh` lists exactly the runtime files (no tests, docs, or scripts).
+- [ ] `manifest.json` version bumped.
 - [ ] `PRIVACY.md` is published at a URL and linked in the listing.
 - [ ] Screenshots: the side panel mid-turn, the script confirmation, the menu
       with Pause, all at 1280×800.

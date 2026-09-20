@@ -8,7 +8,7 @@ import {
   MAX_FIND_RESULTS,
   MAX_FIND_SCAN_ELEMENTS,
   unsupportedFindSyntax,
-} from "../extension/page-scripts.js";
+} from "../page-scripts.js";
 
 class FakeElement {
   constructor(tag, text, { attributes = {}, children = [], selectors = [], value } = {}) {

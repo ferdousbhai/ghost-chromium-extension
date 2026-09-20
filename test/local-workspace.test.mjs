@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
-import { RelayOpError } from "../extension/protocol.js";
+import { RelayOpError } from "../protocol.js";
 
 const originalChrome = globalThis.chrome;
 const INCARNATION_A = "11111111-1111-4111-8111-111111111111";
@@ -111,7 +111,7 @@ function chromeMock({ incarnation = null, removed = [] } = {}) {
 }
 
 async function freshOps(label) {
-  return import(`../extension/ops.js?${label}=${Date.now()}-${Math.random()}`);
+  return import(`../ops.js?${label}=${Date.now()}-${Math.random()}`);
 }
 
 test("a local turn pointed at a ghost's tab is refused, and told whose it is", async () => {
