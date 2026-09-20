@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
       - run: sudo apt-get install -y zip
       - run: node --test test/*.test.mjs
       - run: bash contrib/package.sh dist
