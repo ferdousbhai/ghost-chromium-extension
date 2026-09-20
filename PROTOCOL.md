@@ -32,3 +32,23 @@ frozen across bumps: renaming it would unpair every installed browser.
 Package versions (`package.json`, `extension/manifest.json`) move
 independently of Ghost releases. Only `PROTOCOL_VERSION` ties the two
 products together.
+
+## Hub contract
+
+Any hub can drive this extension — Ghost's daemon is the reference one, not
+the only possible one. A compatible hub is a loopback WebSocket server that:
+
+- serves the relay path and offers the handshake subprotocol, then trades
+  `hello`/`welcome` to negotiate `PROTOCOL_VERSION`, refusing older peers
+  before any browser work;
+- pairs by eye: accepts a six-digit code over a tokenless socket, waits for
+  an out-of-band owner Allow of that exact code, and only then delivers the
+  token over the same socket;
+- sends one op per frame from the closed `OPS` set, each with the caller's
+  deadline, and consumes `res`/`error` frames plus the periodic pairing
+  keepalive; holds at most one browser connection at a time.
+
+Normative, in order: `extension/protocol.js` (constants and failure
+vocabulary), `extension/ops.js` plus `background.js` (what each op does and
+which side enforces what), and the daemon's `relay.ts` as the worked
+example. Prose here names the seam; code is the spec.

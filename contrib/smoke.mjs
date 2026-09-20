@@ -9,7 +9,11 @@
  * attaches, whether dispatched input lands, or whether screenshots contain
  * pixels. This does.
  *
- *     bun packages/chromium-extension/contrib/smoke.mjs
+ *     bun contrib/smoke.mjs
+ *
+ * It runs from a ghost checkout: the hub and session code come from the
+ * daemon and extensions builds (`packages/daemon/dist`, plus a built
+ * `packages/extensions`), so build those first.
  *
  * It launches its **own** Chromium against a throwaway `--user-data-dir`, never
  * the owner's profile, and forces captures into a throwaway screenshot directory

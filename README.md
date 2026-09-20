@@ -217,8 +217,8 @@ still work. Use an ordinary selector or visible text for the rejected forms.
 
 The icon assets are raster sizes of Lucide's ISC-licensed `ghost` glyph, already
 used as the shell mascot, in the shell's fixed `ghostAmber` brand colour. The
-required copyright and permission text is in the root
-[`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md#lucide).
+required copyright and permission text is in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md#lucide).
 
 The relay shape — MV3 extension dialing out over WebSocket, the reconnect and
 service-worker-keepalive loop, the `attached`/`banned`/`attaching` attach state
@@ -240,3 +240,14 @@ rather than the semantic verbs used here.
 | "Browser ownership … is indeterminate" | A storage failure interrupted tab creation. Close the named ghost-created tab; the relay retries automatically. |
 | "Chromium refused to attach its debugger" | DevTools is open on that tab, or another extension is debugging it. |
 | Worked, then stopped after a while | You dismissed the debugger banner. It recovers when the tab navigates. |
+
+## Distributing
+
+Two channels, same files. Unpacked (`contrib/install.sh`, then Load
+unpacked) is for development; the Chrome Web Store listing is the install
+path. The store zip is built, never hand-assembled:
+`contrib/package.sh` refuses a `package.json`/`manifest.json` version
+mismatch, and `test/manifest.test.mjs` pins the store fields. Listing copy,
+permission justifications, and reviewer notes live in [`STORE.md`](STORE.md);
+the store's privacy-policy URL is [`PRIVACY.md`](PRIVACY.md). Every release
+bumps both versions together.

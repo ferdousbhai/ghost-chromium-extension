@@ -3,6 +3,7 @@
   "name": "Ghost browser relay",
   "version": "0.4.0",
   "description": "Lets a ghost running in ghostd drive the tabs of this browser \u2014 the one you are already signed into.",
+  "homepage_url": "https://github.com/ferdousbhai/ghost-chromium-extension",
   "minimum_chrome_version": "125",
   "icons": {
     "16": "icons/ghost-16.png",

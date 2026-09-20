@@ -22,6 +22,27 @@ test("manifest uses only the required standing grants and ships every icon size"
   }
 });
 
+test("the manifest is store-submittable and versioned with the package", async () => {
+  const manifest = JSON.parse(await readFile(new URL("manifest.json", extensionUrl), "utf8"));
+  const pkg = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  );
+  assert.equal(manifest.manifest_version, 3);
+  assert.match(manifest.name, /\S/);
+  assert.match(manifest.description, /\S/);
+  assert.equal(
+    manifest.homepage_url,
+    "https://github.com/ferdousbhai/ghost-chromium-extension",
+  );
+  // The store rejects a forgotten bump; the two versions move as one.
+  assert.equal(manifest.version, pkg.version);
+  assert.match(manifest.version, /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/);
+  // The store listing needs the 128px icon; the permission set is the whole
+  // ask, so it stays exactly this closed list.
+  assert.match(manifest.icons["128"], /\.png$/);
+  assert.deepEqual(manifest.permissions, ["debugger", "storage", "alarms"]);
+});
+
 test("the reused Lucide icon stays accessible and carries its license notice", async () => {
   const svg = await readFile(new URL("icons/ghost.svg", extensionUrl), "utf8");
   const notices = await readFile(new URL("../THIRD_PARTY_NOTICES.md", extensionUrl), "utf8");
