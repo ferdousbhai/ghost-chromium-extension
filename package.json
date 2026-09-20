@@ -1,13 +1,15 @@
 {
   "name": "@ghost/chromium-extension",
   "version": "0.4.0",
-  "private": true,
   "license": "Apache-2.0",
   "type": "module",
   "description": "MV3 extension that lets a ghost drive its tabs in the owner's signed-in Chromium over a token-paired localhost WebSocket to ghostd.",
   "files": [
     "extension",
-    "contrib"
+    "contrib",
+    "README.md",
+    "PROTOCOL.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "true",

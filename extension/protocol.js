@@ -1,13 +1,13 @@
 /**
  * The relay wire protocol, extension side.
  *
- * This is the mirror of `packages/daemon/src/relay-protocol.ts` and
- * `packages/extensions/src/extensions/browser-relay-backend.ts`. It is duplicated
- * rather than imported because an MV3 service worker cannot reach into a pnpm
- * workspace and this extension deliberately has no build step — you load the
- * directory and it runs. The duplication is held honest by a test
- * (`packages/daemon/test/relay-extension.test.ts`) that reads this file and
- * asserts the constants still agree with the TypeScript ones.
+ * This is the mirror of the Ghost daemon's `relay-protocol.ts` and its
+ * `browser-relay-backend.ts`. It is duplicated rather than imported because
+ * the extension is a separate product: an MV3 service worker cannot reach
+ * into a package manager workspace, and this extension deliberately has no
+ * build step — you load the directory and it runs. The duplication is held
+ * honest by the daemon's conformance test, which reads this file and asserts
+ * the constants still agree with the TypeScript ones (see `PROTOCOL.md`).
  */
 
 /** Bumped when a frame shape changes incompatibly. */

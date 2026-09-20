@@ -18,11 +18,14 @@ check the dashboard you never log out of.
 ```
 ghost tool call
   → GhostBrowserSession        url policy, ref bookkeeping, read budget, idle timer
-    → RelayBrowserBackend      packages/extensions/.../browser-relay-backend.ts
-      → RelayHub               packages/daemon/src/relay.ts, ws://127.0.0.1:7717/relay
+    → RelayBrowserBackend      ghost checkout: packages/extensions/.../browser-relay-backend.ts
+      → RelayHub               ghost checkout: packages/daemon/src/relay.ts, ws://127.0.0.1:7717/relay
         → this extension       background.js dials OUT, ops.js drives the named tab
           → chrome.debugger    real CDP input into a ghost-owned tab
 ```
+
+The ghost side and this extension are separate products meeting only at the
+relay protocol (`PROTOCOL.md`); neither imports the other's source.
 
 The extension **dials out**. A service worker cannot listen on a socket, so
 ghostd is the server. Nothing has to start in a particular order: ghostd restarts
@@ -32,8 +35,8 @@ disconnected.
 ## Install
 
 ```sh
-packages/chromium-extension/contrib/install.sh        # copy to ~/.local/share/ghost/
-packages/chromium-extension/contrib/install.sh --link # symlink, for hacking on it
+contrib/install.sh        # copy to ~/.local/share/ghost/
+contrib/install.sh --link # symlink, for hacking on it
 ```
 
 Then, in the browser you actually use: `chrome://extensions` → Developer mode →
@@ -84,8 +87,8 @@ and stores a revisioned recovery copy before acknowledging them. A timed-out old
 Chromium write therefore cannot overwrite a newer choice after the popup closes.
 Badge updates are cosmetic and never block connection or alarm retries.
 
-The current relay protocol is 4. An older daemon or extension is refused
-before either side accepts browser work; update the older Ghost package. The
+The relay protocol is versioned (`PROTOCOL.md`). An older daemon or extension is refused
+before either side accepts browser work; update the older package. The
 extension probes again after a one-minute cool-down, or reload it from
 `chrome://extensions` to retry immediately after updating either side.
 
