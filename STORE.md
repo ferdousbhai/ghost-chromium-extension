@@ -16,7 +16,7 @@ Ghost
 ## Short description (132 characters max)
 
 > An agent across your tabs, on any OpenRouter model — free ones included. It
-> reads the page you're on, then clicks, types, and fills forms.
+> reads the page, then clicks, types, and fills forms.
 
 ## Detailed description
 
