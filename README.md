@@ -46,8 +46,11 @@ disconnected.
 
 ## Install
 
-From the Chrome Web Store once it is listed, or unpacked from this repo: the
-repository root *is* the extension. In the browser you actually use,
+**Chrome Web Store: submitted for review on 2026-09-21 (item id
+`hiikecmfleghkggknndabdkmlmnohpbm`, version 0.5.2); not yet listed.** Until it
+is, load it unpacked from this repo — the repository root *is* the extension
+— or from the zip attached to the
+[latest release](https://github.com/ferdousbhai/ghost-chromium-extension/releases/latest). In the browser you actually use,
 `chrome://extensions` → Developer mode → **Load unpacked** → this directory.
 Edit a file and press reload there; there is nothing to build or copy.
 

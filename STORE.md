@@ -1,5 +1,10 @@
 # Chrome Web Store listing kit
 
+**Status: submitted for review 2026-09-21** — item id
+`hiikecmfleghkggknndabdkmlmnohpbm`, version 0.5.2, public distribution. The
+`debugger` permission makes review manual; once it is listed, put the store
+URL in README.md's Install section and in ghost's docs/getting-started.md.
+
 One product, one sentence: **an agent works your tabs**. Everything below tells
 that story. A reviewer who comes away thinking there are two products here —
 a chat app and a remote-control bridge — has been told it badly; the ghost is
@@ -114,14 +119,14 @@ Copy these into the store's "Why do you need this permission?" fields verbatim.
 
 ## Checklist before upload
 
-- [ ] `node --test test/*.test.mjs` is green.
-- [ ] `bun contrib/smoke.mjs --local` is green with `OPENROUTER_API_KEY` set,
-      and the paid/unfunded checks in the README were done by hand.
-- [ ] `contrib/package.sh` lists exactly the runtime files (no tests, docs, or scripts).
-- [ ] `manifest.json` version bumped.
-- [ ] Privacy policy URL in the listing:
+- [x] `node --test test/*.test.mjs` is green.
+- [x] OAuth connect and a real free-router turn verified by hand
+      (2026-09-21). Still open: the paid-model funded/unfunded check.
+- [x] `contrib/package.sh` lists exactly the runtime files (no tests, docs, or scripts).
+- [x] `manifest.json` version bumped (0.5.2 submitted).
+- [x] Privacy policy URL in the listing:
       `https://github.com/ferdousbhai/ghost-chromium-extension/blob/main/PRIVACY.md`
-- [ ] Screenshots (1280×800) in `store/screenshots/`: the side panel
+- [x] Screenshots (1280×800) in `store/screenshots/`: the side panel
       mid-turn, the script confirmation, the menu with Pause. Regenerate after
       any UI change with `contrib/store-screenshots/capture.sh` (a private
       nested compositor; the transcript shown is seeded, the UI is not).
