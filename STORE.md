@@ -122,6 +122,6 @@ Copy these into the store's "Why do you need this permission?" fields verbatim.
 - [ ] Privacy policy URL in the listing:
       `https://github.com/ferdousbhai/ghost-chromium-extension/blob/main/PRIVACY.md`
 - [ ] Screenshots (1280×800) in `store/screenshots/`: the side panel
-      mid-turn, the script confirmation, the menu with Pause. Captured from a
-      real Chromium side panel in a private nested compositor; the transcript
-      shown is seeded, the UI is not.
+      mid-turn, the script confirmation, the menu with Pause. Regenerate after
+      any UI change with `contrib/store-screenshots/capture.sh` (a private
+      nested compositor; the transcript shown is seeded, the UI is not).
