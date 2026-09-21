@@ -61,7 +61,7 @@ Copy these into the store's "Why do you need this permission?" fields verbatim.
 | `storage` | Stores, in the user's own profile: the OpenRouter key they connected, the model they picked, the side-panel conversation, the relay token for a paired local Ghost daemon, and (in session storage) which tabs the extension opened so it can find and close them after the extension restarts. |
 | `alarms` | A Manifest V3 service worker is terminated after about thirty seconds idle. A periodic alarm wakes it to re-establish the loopback connection to a local Ghost daemon and to finish cleaning up tabs it opened. |
 | `sidePanel` | The chat surface is a side panel, so the conversation stays visible beside the page the agent is working in. |
-| `identity` | Sign-in to the user's own OpenRouter account with OAuth PKCE (`launchWebAuthFlow`). This is the only way to connect; used for nothing else. OpenRouter's headless OAuth mode (paste the code it shows) is the fallback if the redirect cannot complete. |
+| `identity` | Sign-in to the user's own OpenRouter account with OAuth PKCE (`launchWebAuthFlow`), the only way to connect; used for nothing else. OpenRouter's headless OAuth mode (paste the code it shows) remains as a fallback. |
 | Remote code | None. The extension is plain ES modules loaded from the package. It fetches no script, evaluates no downloaded code, and has no `web_accessible_resources`. The one operation that runs JavaScript in a page runs code the user has read and approved in that moment. |
 | Host permissions | None requested. The extension has no host permissions and no content scripts. It reaches `openrouter.ai` under ordinary CORS from its own extension pages, and a local Ghost daemon over a loopback WebSocket. |
 
@@ -113,6 +113,7 @@ Copy these into the store's "Why do you need this permission?" fields verbatim.
       and the paid/unfunded checks in the README were done by hand.
 - [ ] `contrib/package.sh` lists exactly the runtime files (no tests, docs, or scripts).
 - [ ] `manifest.json` version bumped.
-- [ ] `PRIVACY.md` is published at a URL and linked in the listing.
+- [ ] Privacy policy URL in the listing:
+      `https://github.com/ferdousbhai/ghost-chromium-extension/blob/main/PRIVACY.md`
 - [ ] Screenshots: the side panel mid-turn, the script confirmation, the menu
       with Pause, all at 1280×800.

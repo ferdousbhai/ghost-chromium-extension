@@ -75,9 +75,9 @@ owners will never open.
 **Connect OpenRouter** is OAuth and only OAuth: PKCE through `chrome.identity`,
 one click, and OpenRouter ends the flow by minting a key for this browser. That
 key is what gets stored, in `chrome.storage.local`, sent to `openrouter.ai` and
-nowhere else; the owner never sees or types it. If the redirect cannot complete
-— a callback URL an authorization server will not accept is a real possibility,
-and this one is not ours to fix — **Connect with a code instead** is the same
+nowhere else; the owner never sees or types it. OpenRouter accepts the
+extension's `chromiumapp.org` callback (verified 2026-09-21 in a real profile).
+If a redirect ever cannot complete, **Connect with a code instead** is the same
 OAuth in OpenRouter's headless mode: their page shows the code, you paste it
 here. There is no box for a raw API key.
 
@@ -119,9 +119,11 @@ message path driving `open`/`read`/`find`/`click`/`screenshot`, and a forced
 worker reap followed by an op that must still find the tab. With a key it also
 sends one message and reads the usage line back. The extension is pointed at a
 dead loopback port first, so its pairing dial never reaches a live ghostd.
-Verified 2026-09-20 on Chromium 153 without a key. The two paid-model criteria
-(funded key: usage shown; unfunded key: OpenRouter's insufficient-credit
-sentence) are a by-hand check with a real account and are not automated.
+Verified 2026-09-20 on Chromium 153 without a key; the OAuth connect and a
+real free-router turn were verified by hand in a signed-in profile on
+2026-09-21. The two paid-model criteria (funded key: usage shown; unfunded
+key: OpenRouter's insufficient-credit sentence) are a by-hand check with a real
+account and are not automated.
 
 ### Packaging
 
