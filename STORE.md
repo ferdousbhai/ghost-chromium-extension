@@ -121,5 +121,7 @@ Copy these into the store's "Why do you need this permission?" fields verbatim.
 - [ ] `manifest.json` version bumped.
 - [ ] Privacy policy URL in the listing:
       `https://github.com/ferdousbhai/ghost-chromium-extension/blob/main/PRIVACY.md`
-- [ ] Screenshots: the side panel mid-turn, the script confirmation, the menu
-      with Pause, all at 1280×800.
+- [ ] Screenshots (1280×800) in `store/screenshots/`: the side panel
+      mid-turn, the script confirmation, the menu with Pause. Captured from a
+      real Chromium side panel in a private nested compositor; the transcript
+      shown is seeded, the UI is not.
