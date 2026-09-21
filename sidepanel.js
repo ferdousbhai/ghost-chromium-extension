@@ -1,6 +1,7 @@
 /**
  * The side panel: conversations with Ghost, and the only place the owner's
- * OpenRouter credential is ever read.
+ * OpenRouter credential is ever read. The service worker asks whether the key
+ * exists, to light the toolbar badge; its value is read here and nowhere else.
  *
  * The turn loop runs *here*, not in the service worker, because a panel document
  * lives as long as the owner keeps it open while an MV3 worker is reaped after
@@ -21,12 +22,12 @@ import {
   codeFromCallback,
   DEFAULT_MODEL,
   exchangeCode,
+  KEY_STORE,
   listModels,
   streamChat,
 } from "./openrouter.js";
 import { toolDefinitions } from "./tools.js";
 
-const KEY_STORE = "openRouterKey";
 const MODEL_STORE = "openRouterModel";
 const CHATS_STORE = "localChats";
 /** The PKCE verifier outlives this document while the owner fetches a code. */

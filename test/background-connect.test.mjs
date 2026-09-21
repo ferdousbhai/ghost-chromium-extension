@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
+import { KEY_STORE } from "../openrouter.js";
 import { PAIR_SUBPROTOCOL_PREFIX, PROTOCOL_VERSION, SUBPROTOCOL } from "../protocol.js";
 
 const originalChrome = globalThis.chrome;
@@ -63,9 +64,12 @@ function eventHook() {
 function chromeMock({
   badges = [],
   debuggerTargets = async () => [],
+  loadChatKey = async () => ({ [KEY_STORE]: null }),
   loadSettings,
   setBadgeColor = async () => {},
   setBadgeText = async ({ text }) => badges.push(text),
+  titles = [],
+  setTitle = async ({ title }) => titles.push(title),
   persistFence = async () => {},
   persistLocal = async () => {},
   removeLocal = async () => {},
@@ -79,6 +83,7 @@ function chromeMock({
     action: {
       setBadgeText,
       setBadgeBackgroundColor: setBadgeColor,
+      setTitle,
     },
     alarms: {
       create() {},
@@ -101,7 +106,11 @@ function chromeMock({
       local: {
         get: async (defaults) => {
           let restored;
-          if (Object.hasOwn(defaults, "ghostOwnershipPoison")) {
+          if (Object.hasOwn(defaults, KEY_STORE)) {
+            // The badge's readiness read, not a settings read: tests that count
+            // settings reads must not see it.
+            restored = await loadChatKey(defaults);
+          } else if (Object.hasOwn(defaults, "ghostOwnershipPoison")) {
             restored = await restorePoison(defaults);
           } else if (Object.hasOwn(defaults, "ghostDaemonIncarnation")) {
             restored = await restoreIncarnation(defaults);
@@ -684,12 +693,14 @@ test("a transient storage read failure is not cached as an unpaired configuratio
 
 test("settings are cached and an open socket stays off until a compatible welcome", async () => {
   const badges = [];
+  const titles = [];
   const sockets = [];
   let settingsReads = 0;
   let settingsError = null;
   let stored = { port: 7717, token: "paired", enabled: true };
   globalThis.chrome = chromeMock({
     badges,
+    titles,
     loadSettings: async () => {
       settingsReads += 1;
       if (settingsError !== null) throw settingsError;
@@ -726,6 +737,9 @@ test("settings are cached and an open socket stays off until a compatible welcom
   await settle();
   assert.deepEqual(socket.sent, []);
   assert.equal(badges.at(-1), "off");
+  // A ghost this browser paired with, that is not answering, is the one failure
+  // the badge still shows grey for.
+  assert.equal(titles.at(-1), "Ghost — ghostd not answering");
 
   // Requests are not accepted merely because TCP/WebSocket setup completed.
   socket.onmessage({ data: JSON.stringify({ t: "req", id: 1, op: "status", args: {} }) });
@@ -742,6 +756,7 @@ test("settings are cached and an open socket stays off until a compatible welcom
   });
   await settle();
   assert.equal(badges.at(-1), "on");
+  assert.equal(titles.at(-1), "Ghost — ghost attached");
   assert.equal(socket.sent.at(-1).t, "hello");
 
   socket.onmessage({ data: JSON.stringify({ t: "req", id: 2, op: "status", args: {} }) });
@@ -755,6 +770,7 @@ test("settings are cached and an open socket stays off until a compatible welcom
   await settle();
   assert.equal(settingsReads, 2, "a storage change invalidates the cached snapshot");
   assert.equal(badges.at(-1), "||");
+  assert.equal(titles.at(-1), "Ghost — paused");
 
   socket.onmessage({ data: JSON.stringify({ t: "req", id: 3, op: "read", args: {} }) });
   await settle();
@@ -777,6 +793,58 @@ test("settings are cached and an open socket stays off until a compatible welcom
   await settle();
   assert.equal(socket.sent.at(-1).id, 5);
   assert.equal(socket.sent.at(-1).ok, true, "status remains available for recovery visibility");
+});
+
+test("the badge is a readiness light: an OpenRouter key lights it with no daemon", async () => {
+  const badges = [];
+  const titles = [];
+  let stored = { port: 7717, token: "", enabled: true };
+  let chatKey = "sk-or-v1-test";
+  globalThis.chrome = chromeMock({
+    badges,
+    titles,
+    loadSettings: async () => stored,
+    loadChatKey: async () => ({ [KEY_STORE]: chatKey }),
+  });
+  globalThis.WebSocket = class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING;
+    }
+
+    close() {}
+  };
+
+  await import(`../background.js?badge-readiness=${Date.now()}`);
+  await settle();
+  // No ghostd anywhere, nothing paired: the panel alone is a working product,
+  // and the badge used to call it "off" forever.
+  assert.equal(badges.at(-1), "on");
+  assert.equal(titles.at(-1), "Ghost — chat ready · no ghost paired");
+
+  stored = { ...stored, enabled: false };
+  chrome.storage.onChanged.emit({ enabled: { oldValue: true, newValue: false } }, "local");
+  await settle();
+  // Pause stops the panel's agent too, so pause is worth showing to an owner
+  // who has never paired anything.
+  assert.equal(badges.at(-1), "||");
+  assert.equal(titles.at(-1), "Ghost — paused");
+
+  stored = { ...stored, enabled: true };
+  chrome.storage.onChanged.emit({ enabled: { oldValue: false, newValue: true } }, "local");
+  await settle();
+  assert.equal(badges.at(-1), "on");
+
+  chatKey = null;
+  chrome.storage.onChanged.emit(
+    { [KEY_STORE]: { oldValue: "sk-or-v1-test", newValue: undefined } },
+    "local",
+  );
+  await settle();
+  assert.equal(badges.at(-1), "off");
+  assert.equal(titles.at(-1), "Ghost — not set up yet");
 });
 
 test("a new daemon incarnation retires crash-orphaned claims before hello", async () => {

@@ -35,6 +35,7 @@ import {
   toErrorFrame,
 } from "./protocol.js";
 import { isLocalSession, newLocalSession } from "./local-session.js";
+import { KEY_STORE } from "./openrouter.js";
 import {
   allTabInfos,
   installOpsListeners,
@@ -364,20 +365,81 @@ function invalidateSettings() {
   settingsInFlight = null;
 }
 
-function setBadge(status) {
-  const look = {
-    on: { text: "on", color: "#1a7f37" },
-    paused: { text: "||", color: "#9a6700" },
-    off: { text: "off", color: "#8b8b8b" },
-  }[status];
-  // Cosmetic calls never own connection progress: Chrome may leave either
-  // Promise pending while the action UI is rebuilding.
+/** Panel readiness, once read: `true`, `false`, or `null` for "ask again". */
+let chatReadyCache = null;
+/** Only the newest refresh may paint: two in flight can settle out of order. */
+let badgeGeneration = 0;
+
+/**
+ * Whether this browser holds an OpenRouter key, which is the side panel's whole
+ * readiness condition. One bit, for the badge: the worker never keeps the key
+ * itself, and the panel is still the only document that reads its value or
+ * sends it anywhere.
+ */
+async function loadChatReady() {
+  if (chatReadyCache !== null) return chatReadyCache;
+  try {
+    const stored = await withPreparationTimeout(
+      settingsStorage.get({ [KEY_STORE]: null }),
+      SETTINGS_TIMEOUT_MS,
+      "Chromium did not return the panel's credential state in time.",
+    );
+    chatReadyCache = typeof stored?.[KEY_STORE] === "string" && stored[KEY_STORE] !== "";
+    return chatReadyCache;
+  } catch {
+    // Cosmetic like the rest of the badge: an unreadable store reads as no chat
+    // for this refresh, and the next one asks again.
+    return false;
+  }
+}
+
+const BADGE_LOOKS = {
+  on: { text: "on", color: "#1a7f37" },
+  paused: { text: "||", color: "#9a6700" },
+  off: { text: "off", color: "#8b8b8b" },
+};
+
+function setBadge(status, title) {
+  const look = BADGE_LOOKS[status];
+  // Cosmetic calls never own connection progress: Chrome may leave any of these
+  // Promises pending while the action UI is rebuilding.
   void Promise.resolve()
     .then(() => actionApi.setBadgeText({ text: look.text }))
     .catch(() => {});
   void Promise.resolve()
     .then(() => actionApi.setBadgeBackgroundColor({ color: look.color }))
     .catch(() => {});
+  // The badge has room for two characters; the tooltip is where the sentence
+  // goes. `setTitle` is absent in the test harness, hence the optional call.
+  void Promise.resolve()
+    .then(() => actionApi.setTitle?.({ title }))
+    .catch(() => {});
+}
+
+/**
+ * What the badge means, in one place.
+ *
+ * It is a readiness light for the extension, not a connection lamp for ghostd.
+ * A browser holding an OpenRouter key chats and drives its own tabs from the
+ * side panel with no daemon anywhere, and reading `off` forever told that owner
+ * their working extension was dead. `off` now means this browser cannot act:
+ * nothing set up yet, or a ghost link the owner did set up that is down — which
+ * is worth showing, and is the one case where a working panel still reads grey.
+ */
+function badgeFor({ connected, enabled, paired, chatReady, incompatible }) {
+  if (!connected && !paired && !chatReady) {
+    return { status: "off", title: "Ghost — not set up yet" };
+  }
+  if (!enabled) return { status: "paused", title: "Ghost — paused" };
+  const chat = chatReady ? "chat ready · " : "";
+  if (connected) return { status: "on", title: `Ghost — ${chat}ghost attached` };
+  if (paired || incompatible) {
+    const trouble = incompatible
+      ? "ghostd speaks a different relay protocol"
+      : "ghostd not answering";
+    return { status: "off", title: `Ghost — ${chat}${trouble}` };
+  }
+  return { status: "on", title: "Ghost — chat ready · no ghost paired" };
 }
 
 function sendTo(socket, frame) {
@@ -393,10 +455,24 @@ function notice(event, data) {
 }
 
 async function refreshBadge() {
-  const { enabled, unavailable } = await loadSettings();
+  const generation = (badgeGeneration += 1);
+  const [{ enabled, token, unavailable }, chatReady] = await Promise.all([
+    loadSettings(),
+    loadChatReady(),
+  ]);
+  // A close and a storage change can race; the one that started last is the
+  // one that knows the current state.
+  if (generation !== badgeGeneration) return;
   const connected = unavailable === null
     && ws !== null && welcomedSocket === ws && ws.readyState === WebSocket.OPEN;
-  await setBadge(connected ? (enabled ? "on" : "paused") : "off");
+  const { status, title } = badgeFor({
+    connected,
+    enabled,
+    paired: token !== "",
+    chatReady,
+    incompatible: protocolIncompatible,
+  });
+  setBadge(status, title);
 }
 
 
@@ -414,7 +490,7 @@ function scheduleReconnect() {
     cancelReconnect();
   }
   const delay = incompatible ? PROTOCOL_RETRY_MS : reconnectDelay;
-  if (incompatible) void setBadge("off");
+  if (incompatible) void refreshBadge();
   else reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
   reconnectTimerIncompatible = incompatible;
   reconnectTimer = setTimeout(() => {
@@ -464,7 +540,7 @@ async function connectOnce(epoch) {
   if (!settings.token) {
     if (pairingDenied) {
       lastError = PAIRING_DENIED_MESSAGE;
-      void setBadge("off");
+      void refreshBadge();
       return;
     }
     await dialForPairing(settings.port);
@@ -498,7 +574,7 @@ async function connectOnce(epoch) {
     // A socket is not admitted yet. Protocol 4 waits for the daemon's
     // incarnation-bearing welcome and retires claims from an earlier daemon
     // process before sending hello.
-    void setBadge("off");
+    void refreshBadge();
   };
 
   socket.onmessage = (event) => {
@@ -530,7 +606,7 @@ async function connectOnce(epoch) {
     } else if (event?.code === 1006) {
       lastError = "ghostd is not answering on that port. Is it running?";
     }
-    void setBadge("off");
+    void refreshBadge();
     // Let go of the debugger so the owner's tab is not left with a banner over
     // a relay that is no longer there.
     void releaseAllTabs();
@@ -550,7 +626,9 @@ function connect() {
     // step must not leave the single-flight latch permanently rejected.
     if (epoch !== connectEpoch) return;
     lastError = `Could not prepare the relay connection: ${error?.message ?? error}`;
-    void setBadge("off");
+    // No badge refresh here: a preparation that failed has not changed what the
+    // badge says, and re-reading storage that just failed is how a broken read
+    // turns into a read storm. The keepalive alarm re-lights it.
     scheduleReconnect();
   });
   connectInFlight = attempt;
@@ -664,7 +742,7 @@ async function dialForPairing(port) {
       return;
     }
     lastError = PAIRING_WAITING_MESSAGE;
-    void setBadge("off");
+    void refreshBadge();
   };
   socket.onmessage = (event) => {
     if (typeof event.data === "string") void handleFrame(socket, event.data);
@@ -696,7 +774,7 @@ function forgetPairingCode() {
 }
 
 function onPairingClosed(event) {
-  void setBadge("off");
+  void refreshBadge();
   if (event?.code === 4001) {
     pairingDenied = true;
     forgetPairingCode();
@@ -807,12 +885,18 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     if (settingsRepairPending) scheduleSettingsRepair();
     void repairBrowserPersistence().catch(() => {});
     void sweepRetiredTabs().catch(() => {});
+    void refreshBadge();
     void connect();
   }
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
+  if (changes[KEY_STORE]) {
+    // Connecting or disconnecting OpenRouter is the panel going ready or not.
+    chatReadyCache = null;
+    void refreshBadge();
+  }
   if (changes.port || changes.token || changes.enabled) invalidateSettings();
   if (changes.port || changes.token) {
     // Re-dial with the new settings rather than waiting for the next alarm. New
@@ -1032,4 +1116,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 // harness, hence the guard.
 void chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true })?.catch?.(() => {});
 
+// A fresh worker says what this browser is before any socket resolves: a panel
+// with a key is ready whether or not a ghost ever answers.
+void refreshBadge();
 void connect();

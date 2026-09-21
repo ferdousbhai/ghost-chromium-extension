@@ -14,6 +14,12 @@
  */
 
 export const OPENROUTER_ORIGIN = "https://openrouter.ai";
+/**
+ * Where the key lives in `chrome.storage.local`. The side panel writes and
+ * reads it; the service worker only asks whether the name is set, to light the
+ * toolbar badge, and never reads the value.
+ */
+export const KEY_STORE = "openRouterKey";
 const AUTH_URL = `${OPENROUTER_ORIGIN}/auth`;
 const KEYS_URL = `${OPENROUTER_ORIGIN}/api/v1/auth/keys`;
 const MODELS_URL = `${OPENROUTER_ORIGIN}/api/v1/models`;

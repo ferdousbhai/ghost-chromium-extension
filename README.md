@@ -165,9 +165,24 @@ and cannot save or pair, which is what keeps a page from pairing on your behalf.
 On Omarchy the browser already reads `~/.config/chromium-flags.conf`, and its
 own extensions load from a `--load-extension=` line there; append this
 directory to that line and the relay loads on the next Chromium start with no
-`chrome://extensions` visit. The badge reads `on`
-only after a compatible ghostd has answered the protocol handshake, `||` when
-that authenticated connection is paused, and `off` otherwise.
+`chrome://extensions` visit.
+
+The toolbar badge is a readiness light for the extension, not a connection lamp
+for ghostd — a browser with an OpenRouter key is a working product with no
+daemon anywhere, and telling that owner `off` forever was a lie:
+
+| this browser | badge | tooltip |
+| --- | --- | --- |
+| a compatible ghostd has answered the handshake | `on` green | Ghost — chat ready · ghost attached |
+| an OpenRouter key, nothing paired | `on` green | Ghost — chat ready · no ghost paired |
+| paused, either surface | `\|\|` amber | Ghost — paused |
+| paired, and ghostd is not answering | `off` grey | Ghost — chat ready · ghostd not answering |
+| nothing set up yet | `off` grey | Ghost — not set up yet |
+
+`off` means this browser cannot act, with one deliberate exception: a ghost link
+the owner did set up and that is down stays grey even while the panel still
+chats, because a broken link they asked for is worth seeing. The worker reads
+only whether the OpenRouter key exists, never its value.
 
 The panel is disposable UI: the background worker serializes settings changes
 and stores a revisioned recovery copy before acknowledging them. A timed-out old
