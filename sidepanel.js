@@ -503,8 +503,9 @@ async function saveKey(value) {
   ui.connectError.hidden = true;
   ui.notice.hidden = true;
   if (activeChat() === null) newChat();
-  await loadModels();
   render();
+  // The catalog fills the picker when it arrives; the panel does not wait for it.
+  void loadModels();
 }
 
 function connectFailed(error) {
@@ -587,7 +588,7 @@ async function loadModels() {
   const fallback = [{ id: DEFAULT_MODEL, name: "Free router", free: true }];
   let models = fallback;
   try {
-    const listed = await listModels();
+    const listed = await listModels({ signal: AbortSignal.timeout(10_000) });
     if (listed.length > 0) models = listed;
   } catch {
     ui.notice.textContent = "Could not load the model list; the free router is still available.";
@@ -700,9 +701,9 @@ window.addEventListener("pagehide", () => void persist());
 
 void (async () => {
   await restore();
-  if (key !== null) {
-    if (activeChat() === null) newChat();
-    await loadModels();
-  }
+  if (key !== null && activeChat() === null) newChat();
+  // Paint before any network: a slow or unreachable OpenRouter must not leave
+  // the panel blank. The picker shows the free router until the catalog lands.
   render();
+  if (key !== null) void loadModels();
 })();
