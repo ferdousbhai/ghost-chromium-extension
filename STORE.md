@@ -15,37 +15,43 @@ Ghost
 
 ## Short description (132 characters max)
 
-> An agent that works your tabs: chat in the side panel, or hand the tabs to a
-> ghost running on your own machine.
+> An agent across your tabs, on any OpenRouter model — free ones included. It
+> reads the page you're on, then clicks, types, and fills forms.
 
 ## Detailed description
 
-> Ghost puts an agent in the browser you already use — the one
-> with your logins, your sessions, and your open tabs.
+> **A helping hand across your tabs — on the model you choose.**
 >
-> Chat with it in the side panel. Ask it to open a page, read it, fill a form,
-> click through a flow, or screenshot what it found. It runs on your own
-> OpenRouter account, and the default model is free. Pick a paid one any time;
-> every turn shows which model answered and what it cost.
+> Ghost reads the page you're signed in to, then clicks, types, fills forms,
+> and follows links while you decide what happens next. No more copying,
+> pasting, and switching tabs: ask it in the side panel and watch it work.
 >
-> It works only in tabs it opened itself, and it never reads your disk: the one
-> relay operation that attaches local files to a page is not offered to the
-> chat agent at all. It never touches the tabs you opened,
-> and Chrome shows its own "is being debugged" banner in any tab it is working
-> in — dismiss the banner and it is locked out until that tab navigates. One
-> switch in the panel's menu pauses everything, instantly.
+> **Any model, your account.** Ghost runs on your own OpenRouter account, so
+> the picker lists every model OpenRouter offers that can call tools — Claude,
+> GPT, Gemini, Qwen, Llama, DeepSeek and the rest — and you pay OpenRouter's
+> rates, nothing more. **Start free:** the default is OpenRouter's free
+> router, which picks a capable free model for each request. Every turn shows
+> which model answered and what it cost.
 >
-> The one operation that runs JavaScript inside a page asks you first, every
-> single time, and shows you the code.
+> **Reach the web that has no API.** Internal tools, admin consoles, portals
+> behind your login — if you can open it in a tab, Ghost can work in it.
 >
-> If you also run Ghost (github.com/ferdousbhai/ghost) on the same computer,
-> this extension can lend the same tabs to a ghost there instead: pair once by
-> matching a six-digit code, and the connection is a loopback socket that never
-> leaves your machine.
+> **You stay in control.** Ghost works only in tabs it opened itself; it
+> never touches the tabs you opened, and Chrome shows its own "is being
+> debugged" banner in any tab it is working in — dismiss the banner and it is
+> locked out until that tab navigates. The one operation that runs JavaScript
+> inside a page asks you first, every time, and shows you the code. One
+> switch pauses everything, instantly. Conversations are separate, each with
+> its own tabs.
 >
-> No account with us. No servers of ours. No telemetry. Sign in to OpenRouter
-> once; the credential it issues and your conversations stay in this browser's
-> local storage.
+> **Also a relay for Ghost on your machine.** If you run Ghost
+> (github.com/ferdousbhai/ghost) on the same computer, its ghosts can drive
+> the same tabs: pair once by matching a six-digit code, over a loopback
+> socket that never leaves your machine.
+>
+> No account with us. No servers of ours. No telemetry. Open source. Sign in
+> to OpenRouter once; the credential it issues and your conversations stay in
+> this browser's local storage.
 
 ## Category
 
