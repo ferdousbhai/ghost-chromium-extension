@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ghost",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "An agent across your tabs, on any OpenRouter model \u2014 free ones included. It reads the page, then clicks, types, and fills forms.",
   "minimum_chrome_version": "125",
   "icons": {

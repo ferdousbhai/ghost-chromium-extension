@@ -1,9 +1,10 @@
 # Chrome Web Store listing kit
 
-**Status: submitted for review 2026-09-21** — item id
-`hiikecmfleghkggknndabdkmlmnohpbm`, version 0.5.2, public distribution. The
-`debugger` permission makes review manual; once it is listed, put the store
-URL in README.md's Install section and in ghost's docs/getting-started.md.
+**Status: listed** at
+<https://chromewebstore.google.com/detail/ghost/hiikecmfleghkggknndabdkmlmnohpbm>
+— item id `hiikecmfleghkggknndabdkmlmnohpbm`, public distribution; 0.5.2 was
+approved on 2026-09-22. The `debugger` permission makes every review manual,
+so expect each update to sit in review for a day or more.
 
 One product, one sentence: **an agent works your tabs**. Everything below tells
 that story. A reviewer who comes away thinking there are two products here —
@@ -123,7 +124,7 @@ Copy these into the store's "Why do you need this permission?" fields verbatim.
 - [x] OAuth connect and a real free-router turn verified by hand
       (2026-09-21). Still open: the paid-model funded/unfunded check.
 - [x] `contrib/package.sh` lists exactly the runtime files (no tests, docs, or scripts).
-- [x] `manifest.json` version bumped (0.5.2 submitted).
+- [x] `manifest.json` version bumped past the version the store has.
 - [x] Privacy policy URL in the listing:
       `https://github.com/ferdousbhai/ghost-chromium-extension/blob/main/PRIVACY.md`
 - [x] Screenshots (1280×800) in `store/screenshots/`: the side panel
