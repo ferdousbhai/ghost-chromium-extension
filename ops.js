@@ -76,6 +76,11 @@ const RING_LIMIT = 200;
  * over the socket they share.
  */
 const state = { tabs: new Map(), sessions: new Map(), retired: new Set() };
+/**
+ * In-flight attach attempts, by tab id: a second attach waits here, so a stale
+ * attempt's cleanup can never detach a newer generation of the same tab.
+ */
+const attachBarriers = new Map();
 const creatingSessions = new Map();
 let creatingTotal = 0;
 const recentRetired = new Set();
@@ -211,8 +216,6 @@ function endCreating(session) {
   else creatingSessions.delete(session);
   if (state.retired.has(session)) void sweepRetiredTabs().catch(() => {});
 }
-
-const attachBarriers = new Map();
 
 const SESSION_KEY = "ghostTabs";
 const SESSION_REVISION_KEY = "ghostTabsRevision";
@@ -372,13 +375,16 @@ async function setOwnershipSnapshot(snapshot) {
     snapshot,
   };
   ownershipPublicationRevision = publication.revision;
+  // A write that lands after its timeout only matters if it published something
+  // other than the current truth; otherwise storage already agrees with memory.
+  const repairIfStale = () => {
+    if (publication.revision !== ownershipPublicationRevision
+        || !sameSnapshot(snapshot, ownershipSnapshot())) scheduleOwnershipRepair();
+  };
   await boundedStorageMutation(
     chrome.storage.local.set({ [OWNERSHIP_FENCE_KEY]: publication }),
     "fencing browser ownership",
-    () => {
-      if (publication.revision !== ownershipPublicationRevision
-          || !sameSnapshot(snapshot, ownershipSnapshot())) scheduleOwnershipRepair();
-    },
+    repairIfStale,
   );
   await boundedStorageMutation(
     chrome.storage.session.set({
@@ -387,10 +393,7 @@ async function setOwnershipSnapshot(snapshot) {
       [BROWSER_SESSION_KEY]: browserSessionId,
     }),
     "saving browser ownership",
-    () => {
-      if (publication.revision !== ownershipPublicationRevision
-          || !sameSnapshot(snapshot, ownershipSnapshot())) scheduleOwnershipRepair();
-    },
+    repairIfStale,
   );
 }
 
@@ -431,6 +434,12 @@ async function persistOwnership() {
   }
 }
 
+/** Make the in-memory poison table exactly the set of claims storage reported. */
+function adoptPoisonClaims(claims) {
+  ownershipPoison.clear();
+  for (const [tab, session] of claims) ownershipPoison.set(tab, session);
+}
+
 async function persistPoison(session, tabId) {
   if (ownershipPoison.get(tabId) !== session) ownershipGeneration += 1;
   ownershipPoison.set(tabId, session);
@@ -462,15 +471,15 @@ function parsePoisonPublication(value) {
       || !Array.isArray(value.claims) || value.claims.length > MAX_STORED_TABS) {
     return undefined;
   }
-  const parsed = new Map();
+  const claimedTabs = new Set();
   for (const row of value.claims) {
     if (!Array.isArray(row) || row.length !== 2) return undefined;
     const [session, tab] = row;
     if (typeof session !== "string" || session === "" || session.length > MAX_OWNER_ID_LENGTH
-        || !Number.isSafeInteger(tab) || tab < 0 || tab > MAX_TAB_ID || parsed.has(tab)) {
+        || !Number.isSafeInteger(tab) || tab < 0 || tab > MAX_TAB_ID || claimedTabs.has(tab)) {
       return undefined;
     }
-    parsed.set(tab, session);
+    claimedTabs.add(tab);
   }
   return value;
 }
@@ -495,31 +504,37 @@ async function liveTabOrNull(tabId) {
   }
 }
 
-async function verifyLiveTabs(tabIds, deadline, description) {
-  const ids = [...tabIds];
-  const results = new Map();
+/** Run `handle` over every item, at most `concurrency` of them in flight at once. */
+async function runPooled(items, concurrency, handle) {
   let next = 0;
   async function worker() {
-    while (next < ids.length) {
-      const id = ids[next];
+    while (next < items.length) {
+      const index = next;
       next += 1;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw failed(
-          FAILURES.timeout,
-          `The browser did not finish ${description} within the total recovery deadline.`,
-        );
-      }
-      results.set(id, await withApiTimeout(
-        liveTabOrNull(id),
-        Math.min(RESTORE_TIMEOUT_MS, remaining),
-        `${description} tab ${id}`,
-      ));
+      await handle(items[index], index);
     }
   }
   await Promise.all(
-    Array.from({ length: Math.min(RESTORE_CONCURRENCY, ids.length) }, () => worker()),
+    Array.from({ length: Math.min(concurrency, items.length) }, () => worker()),
   );
+}
+
+async function verifyLiveTabs(tabIds, deadline, description) {
+  const results = new Map();
+  await runPooled([...tabIds], RESTORE_CONCURRENCY, async (id) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw failed(
+        FAILURES.timeout,
+        `The browser did not finish ${description} within the total recovery deadline.`,
+      );
+    }
+    results.set(id, await withApiTimeout(
+      liveTabOrNull(id),
+      Math.min(RESTORE_TIMEOUT_MS, remaining),
+      `${description} tab ${id}`,
+    ));
+  });
   return results;
 }
 
@@ -601,6 +616,16 @@ function selectStoredOwnership(stored, fenced, currentBrowserSession) {
   return sessionPublication.revision > currentFence.revision
     ? sessionPublication
     : currentFence;
+}
+
+/** Swap all three ownership tables at once, for restore and for its rollback. */
+function replaceOwnership({ tabs, sessions, retired }) {
+  state.tabs.clear();
+  state.sessions.clear();
+  state.retired.clear();
+  for (const [id, tab] of tabs) state.tabs.set(id, tab);
+  for (const [session, owned] of sessions) state.sessions.set(session, owned);
+  for (const session of retired) state.retired.add(session);
 }
 
 export function restoreTabsFromSession() {
@@ -744,8 +769,7 @@ export function restoreTabsFromSession() {
             "restoring uncertain browser ownership",
           );
         } catch (error) {
-          ownershipPoison.clear();
-          for (const [tab, session] of poisonClaims) ownershipPoison.set(tab, session);
+          adoptPoisonClaims(poisonClaims);
           await persistCurrentPoisonOrSchedule();
           const tab = poisonClaims.keys().next().value;
           throw failed(
@@ -758,8 +782,7 @@ export function restoreTabsFromSession() {
         for (const [tab, session] of uncertain) {
           if (verified.get(tab) !== null) additionalClaims.set(tab, session);
         }
-        ownershipPoison.clear();
-        for (const [tab, session] of poisonClaims) ownershipPoison.set(tab, session);
+        adoptPoisonClaims(poisonClaims);
       }
     }
     if (freshBrowserSession) {
@@ -767,11 +790,9 @@ export function restoreTabsFromSession() {
       return;
     }
     const applyGeneration = ownershipGeneration;
-    if (saved === null) {
-      if (additionalClaims.size === 0) {
-        if (ownershipPoison.size > 0) await persistOwnership();
-        return;
-      }
+    if (saved === null && additionalClaims.size === 0) {
+      if (ownershipPoison.size > 0) await persistOwnership();
+      return;
     }
     const restoredTabs = new Map();
     let verifiedTabs;
@@ -811,25 +832,21 @@ export function restoreTabsFromSession() {
       return;
     }
 
-    const previousTabs = new Map(state.tabs);
-    const previousSessions = new Map(state.sessions);
-    const previousRetired = new Set(state.retired);
-    state.tabs.clear();
-    state.sessions.clear();
-    state.retired.clear();
-    for (const [id, tab] of restoredTabs) state.tabs.set(id, tab);
-    for (const [session, owned] of restoredSessions) state.sessions.set(session, owned);
-    for (const session of restoredRetired) state.retired.add(session);
+    const previous = {
+      tabs: new Map(state.tabs),
+      sessions: new Map(state.sessions),
+      retired: new Set(state.retired),
+    };
+    replaceOwnership({
+      tabs: restoredTabs,
+      sessions: restoredSessions,
+      retired: restoredRetired,
+    });
     try {
       await persistOwnership();
       ownershipGeneration += 1;
     } catch (error) {
-      state.tabs.clear();
-      state.sessions.clear();
-      state.retired.clear();
-      for (const [id, tab] of previousTabs) state.tabs.set(id, tab);
-      for (const [session, owned] of previousSessions) state.sessions.set(session, owned);
-      for (const session of previousRetired) state.retired.add(session);
+      replaceOwnership(previous);
       throw failed(
         FAILURES.browserUnavailable,
         `Could not confirm restored browser ownership: ${error?.message ?? error}.`,
@@ -1267,37 +1284,28 @@ async function retireTabs(tabIds, timeoutMs) {
   const outcomes = new Array(ids.length);
   if (ids.length === 0) return outcomes;
   const deadline = Date.now() + Math.min(timeoutMs, RETIRE_TOTAL_TIMEOUT_MS);
-  let next = 0;
   aggregateRetirementDepth += 1;
   try {
-    async function worker() {
-      while (next < ids.length) {
-        const index = next;
-        next += 1;
-        const tabId = ids[index];
-        if (Date.now() >= deadline) {
-          outcomes[index] = {
-            status: "rejected",
-            reason: failed(
-              FAILURES.timeout,
-              `The shared browser retirement deadline expired before tab ${tabId} could be closed.`,
-            ),
-          };
-          continue;
-        }
-        try {
-          outcomes[index] = {
-            status: "fulfilled",
-            value: await retireTab(tabId, timeoutMs, deadline),
-          };
-        } catch (reason) {
-          outcomes[index] = { status: "rejected", reason };
-        }
+    await runPooled(ids, RETIRE_CONCURRENCY, async (tabId, index) => {
+      if (Date.now() >= deadline) {
+        outcomes[index] = {
+          status: "rejected",
+          reason: failed(
+            FAILURES.timeout,
+            `The shared browser retirement deadline expired before tab ${tabId} could be closed.`,
+          ),
+        };
+        return;
       }
-    }
-    await Promise.all(
-      Array.from({ length: Math.min(RETIRE_CONCURRENCY, ids.length) }, () => worker()),
-    );
+      try {
+        outcomes[index] = {
+          status: "fulfilled",
+          value: await retireTab(tabId, timeoutMs, deadline),
+        };
+      } catch (reason) {
+        outcomes[index] = { status: "rejected", reason };
+      }
+    });
   } finally {
     aggregateRetirementDepth -= 1;
   }
@@ -1346,34 +1354,37 @@ function pushRing(tab, ring, entry) {
   }
 }
 
-function bufferConsole(tab, params, isException) {
-  let level = "log";
-  let text = "";
-  let url;
-  let line;
+/** One console line, from either a `consoleAPICalled` or an `exceptionThrown`. */
+function consoleEntry(params, isException) {
   if (isException) {
-    level = "error";
     const details = params?.exceptionDetails ?? {};
-    text = details.exception?.description ?? details.text ?? "Uncaught exception";
-    url = details.url || undefined;
-    line = typeof details.lineNumber === "number" ? details.lineNumber : undefined;
-  } else {
-    level = typeof params?.type === "string" ? params.type : "log";
-    text = (Array.isArray(params?.args) ? params.args : [])
-      .map((arg) => {
-        if (arg == null) return "";
-        if (arg.value !== undefined) return String(arg.value);
-        if (typeof arg.description === "string") return arg.description;
-        if (typeof arg.unserializableValue === "string") return arg.unserializableValue;
-        return arg.type ?? "";
-      })
-      .join(" ");
-    const frame = params?.stackTrace?.callFrames?.[0];
-    if (frame) {
-      url = frame.url || undefined;
-      line = typeof frame.lineNumber === "number" ? frame.lineNumber : undefined;
-    }
+    return {
+      level: "error",
+      text: details.exception?.description ?? details.text ?? "Uncaught exception",
+      url: details.url || undefined,
+      line: typeof details.lineNumber === "number" ? details.lineNumber : undefined,
+    };
   }
+  const text = (Array.isArray(params?.args) ? params.args : [])
+    .map((arg) => {
+      if (arg == null) return "";
+      if (arg.value !== undefined) return String(arg.value);
+      if (typeof arg.description === "string") return arg.description;
+      if (typeof arg.unserializableValue === "string") return arg.unserializableValue;
+      return arg.type ?? "";
+    })
+    .join(" ");
+  const frame = params?.stackTrace?.callFrames?.[0];
+  return {
+    level: typeof params?.type === "string" ? params.type : "log",
+    text,
+    url: frame?.url || undefined,
+    line: typeof frame?.lineNumber === "number" ? frame.lineNumber : undefined,
+  };
+}
+
+function bufferConsole(tab, params, isException) {
+  const { level, text, url, line } = consoleEntry(params, isException);
   pushRing(tab, tab.consoleRing, {
     level,
     text,
@@ -1594,11 +1605,6 @@ async function tabSnapshot(tabId, targets = null) {
 }
 
 /**
- * The asking ghost-wide owner's tabs, with the metadata `tabSnapshot` can see.
- * `active` marks the one it drives, which is that owner's answer alone. One
- * `getTargets()` call serves the whole list.
- */
-/**
  * The `{ tabs, active }` shape every `tabs` op answers with. Owner-scoped and
  * fail closed like `status`: a frame whose session is not a string names no
  * workspace; only the in-process `allTabInfos` ever passes `null`.
@@ -1618,6 +1624,11 @@ export function allTabInfos() {
   return tabInfos(null, null);
 }
 
+/**
+ * The asking ghost-wide owner's tabs, with the metadata `tabSnapshot` can see.
+ * `active` marks the one it drives, which is that owner's answer alone. One
+ * `getTargets()` call serves the whole list.
+ */
 async function tabInfos(session, active) {
   const targets = await chrome.debugger.getTargets().catch(() => []);
   // A protocol owner sees the tabs its ghost opened. The popup asks with no
@@ -1958,6 +1969,23 @@ async function stopLoading(tabId) {
   await cdp(tabId, "Page.stopLoading").catch(() => {});
 }
 
+/** Wait out a navigation this op started, and abandon it if it outlasts the budget. */
+async function awaitLoadOrStop(tabId, timeoutMs) {
+  const loaded = await waitForLoad(tabId, timeoutMs);
+  if (!loaded) await stopLoading(tabId);
+}
+
+/**
+ * The session layer already vetted this URL; refusing again here is the point of
+ * a separate trust boundary. The extension does not have to believe the daemon
+ * to be safe to install.
+ */
+function requireHttpUrl(url) {
+  if (!/^https?:\/\//i.test(url)) {
+    throw failed(FAILURES.blockedUrl, "The relay only opens http and https URLs.");
+  }
+}
+
 /**
  * Shared body of `back`/`forward`: run the history move, and report whether it
  * changed the page. Chrome rejects when there is nowhere to go, which is a
@@ -2055,12 +2083,7 @@ const ops = {
     const session = requireOwningSession(args);
     const url = typeof args.url === "string" ? args.url.trim() : "";
     if (url === "") throw failed(FAILURES.invalidInput, "open needs a url.");
-    // The session layer already vetted this URL; refusing again here is the point
-    // of a separate trust boundary. The extension does not have to believe the
-    // daemon to be safe to install.
-    if (!/^https?:\/\//i.test(url)) {
-      throw failed(FAILURES.blockedUrl, "The relay only opens http and https URLs.");
-    }
+    requireHttpUrl(url);
 
     let tabId = claimedTab(args);
     let tab = null;
@@ -2092,10 +2115,7 @@ const ops = {
       tabId = tab.id;
     }
 
-    if (tab.status !== "complete") {
-      const loaded = await waitForLoad(tabId, timeoutMs);
-      if (!loaded) await stopLoading(tabId);
-    }
+    if (tab.status !== "complete") await awaitLoadOrStop(tabId, timeoutMs);
     return { page: await summary(tabId), id: String(tabId) };
   },
 
@@ -2409,20 +2429,16 @@ const ops = {
     if (op === "create") {
       const session = requireOwningSession(args);
       const url = typeof args.url === "string" ? args.url.trim() : "";
-      // The session layer vets a create URL like an open; recheck the scheme here
-      // too, unless it is the blank page a tab may legitimately start on.
-      if (url !== "" && url !== "about:blank" && !/^https?:\/\//i.test(url)) {
-        throw failed(FAILURES.blockedUrl, "The relay only opens http and https URLs.");
-      }
+      // A create URL is rechecked like an open's, unless it is the blank page a
+      // tab may legitimately start on.
+      const blank = url === "" || url === "about:blank";
+      if (!blank) requireHttpUrl(url);
       const tab = await createClaimedTab(
         session,
         { ...(url === "" ? {} : { url }), active: true },
         timeoutMs,
       );
-      if (tab.status !== "complete" && url !== "" && url !== "about:blank") {
-        const loaded = await waitForLoad(tab.id, timeoutMs);
-        if (!loaded) await stopLoading(tab.id);
-      }
+      if (tab.status !== "complete" && !blank) await awaitLoadOrStop(tab.id, timeoutMs);
       return {
         ...(await tabsAnswer(args.session, tab.id)),
         id: String(tab.id),

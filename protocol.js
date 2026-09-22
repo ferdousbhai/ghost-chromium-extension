@@ -86,29 +86,25 @@ export class RelayOpError extends Error {
   }
 }
 
-export const failed = (failure, message, details) =>
-  new RelayOpError(failure, message, details);
+export function failed(failure, message, details) {
+  return new RelayOpError(failure, message, details);
+}
 
-export function toErrorFrame(id, error) {
+/** Anything this extension did not raise deliberately reads as a navigation failure. */
+function errorBody(error) {
   if (error instanceof RelayOpError) {
     return {
-      t: "res",
-      id,
-      ok: false,
-      error: {
-        failure: error.failure,
-        message: error.message,
-        ...(error.details ? { details: error.details } : {}),
-      },
+      failure: error.failure,
+      message: error.message,
+      ...(error.details ? { details: error.details } : {}),
     };
   }
   return {
-    t: "res",
-    id,
-    ok: false,
-    error: {
-      failure: FAILURES.navigationFailed,
-      message: `The Ghost relay extension failed: ${error?.message ?? String(error)}`,
-    },
+    failure: FAILURES.navigationFailed,
+    message: `The Ghost relay extension failed: ${error?.message ?? String(error)}`,
   };
+}
+
+export function toErrorFrame(id, error) {
+  return { t: "res", id, ok: false, error: errorBody(error) };
 }

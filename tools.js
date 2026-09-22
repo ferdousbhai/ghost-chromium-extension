@@ -143,11 +143,6 @@ const SCHEMAS = {
     properties: { tab },
     required: ["tab"],
   },
-  upload: {
-    description: "Set the files on a file input. Paths are read by the browser from the owner's disk.",
-    properties: { tab, ...target, paths: { type: "array", items: { type: "string" } } },
-    required: ["tab", "paths"],
-  },
   resize: {
     description: "Resize the window holding the tab.",
     properties: { tab, width: { type: "integer" }, height: { type: "integer" } },

@@ -80,11 +80,10 @@ export function codeFromCallback(redirect) {
  * gone"; inventing a friendlier sentence would be inventing a diagnosis.
  */
 export function describeError(status, body) {
-  const message = typeof body?.error?.message === "string" && body.error.message !== ""
-    ? body.error.message
-    : typeof body?.error === "string" && body.error !== ""
-      ? body.error
-      : "";
+  const reported = body?.error;
+  let message = "";
+  if (typeof reported?.message === "string") message = reported.message;
+  else if (typeof reported === "string") message = reported;
   if (message !== "") return `OpenRouter: ${message}`;
   return `OpenRouter answered ${status} and said nothing else.`;
 }
@@ -245,7 +244,7 @@ export async function streamChat({ key, model, messages, tools, signal, onDelta 
   }
   return {
     content,
-    toolCalls: toolCalls.filter(Boolean).filter((call) => call.function.name !== ""),
+    toolCalls: toolCalls.filter((call) => call && call.function.name !== ""),
     model: answered,
     usage,
   };

@@ -147,7 +147,7 @@ export async function runTurn({
         result = { error: `The owner declined to run ${name} on this page. Use a different approach.` };
       } else {
         try {
-          result = await runTool(name, args ?? {});
+          result = await runTool(name, args);
         } catch (error) {
           result = { error: error?.message ?? String(error) };
         }

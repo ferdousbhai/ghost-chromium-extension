@@ -109,6 +109,11 @@ async function persist() {
   await chrome.storage.local.set({ [CHATS_STORE]: payload }).catch(() => {});
 }
 
+/** A stored setting is only a setting when it is a non-empty string. */
+function storedText(value, fallback) {
+  return typeof value === "string" && value !== "" ? value : fallback;
+}
+
 function validChat(value) {
   return typeof value?.id === "string" && Array.isArray(value.messages) && Array.isArray(value.record);
 }
@@ -117,12 +122,8 @@ async function restore() {
   const stored = await chrome.storage.local
     .get({ [KEY_STORE]: null, [MODEL_STORE]: null, [CHATS_STORE]: null, enabled: true })
     .catch(() => ({ enabled: true }));
-  key = typeof stored?.[KEY_STORE] === "string" && stored[KEY_STORE] !== ""
-    ? stored[KEY_STORE]
-    : null;
-  model = typeof stored?.[MODEL_STORE] === "string" && stored[MODEL_STORE] !== ""
-    ? stored[MODEL_STORE]
-    : DEFAULT_MODEL;
+  key = storedText(stored?.[KEY_STORE], null);
+  model = storedText(stored?.[MODEL_STORE], DEFAULT_MODEL);
   const saved = stored?.[CHATS_STORE];
   chats = Array.isArray(saved?.chats) ? saved.chats.filter(validChat) : [];
   activeId = chats.some((chat) => chat.id === saved?.active) ? saved.active : (chats[0]?.id ?? null);
@@ -167,8 +168,7 @@ async function dropChat(id) {
     .sendMessage({ type: "ghost-relay-local-close", conversation: id })
     .catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
   if (closed?.ok !== true) {
-    ui.notice.textContent = `The conversation is gone, but its tabs may not be: ${closed?.error ?? "the relay worker did not answer"}`;
-    ui.notice.hidden = false;
+    notice(`The conversation is gone, but its tabs may not be: ${closed?.error ?? "the relay worker did not answer"}`);
   }
 }
 
@@ -179,6 +179,12 @@ function touch(chat) {
 
 // -------------------------------------------------------------------- the UI
 
+/** The banner above the log: the one place anything non-fatal is said. */
+function notice(text) {
+  ui.notice.textContent = text;
+  ui.notice.hidden = false;
+}
+
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -187,14 +193,20 @@ function el(tag, className, text) {
 }
 
 function renderEntry(entry) {
-  if (entry.kind === "user" || entry.kind === "assistant") {
-    const turnNode = el("div", `turn ${entry.kind}`);
-    turnNode.append(el("div", "body", entry.text));
-    return turnNode;
+  switch (entry.kind) {
+    case "user":
+    case "assistant": {
+      const turnNode = el("div", `turn ${entry.kind}`);
+      turnNode.append(el("div", "body", entry.text));
+      return turnNode;
+    }
+    case "tool":
+      return el("div", `tool${entry.failed ? " bad" : ""}`, entry.text);
+    case "usage":
+      return el("div", "usage", entry.text);
+    default:
+      return el("div", "error", entry.text);
   }
-  if (entry.kind === "tool") return el("div", `tool${entry.failed ? " bad" : ""}`, entry.text);
-  if (entry.kind === "usage") return el("div", "usage", entry.text);
-  return el("div", "error", entry.text);
 }
 
 function whenLabel(at) {
@@ -303,17 +315,25 @@ function renderGhost(status) {
   const connected = status?.connected === true;
   const enabled = status?.enabled !== false;
   const paired = status?.paired === true;
-  ui.dot.className = `dot ${connected ? (enabled ? "on" : "paused") : ""}`;
-  ui.statusText.textContent = connected
-    ? (enabled ? "Connected to ghostd" : "Connected, paused")
-    : (paired ? "Not connected" : "Not paired");
-  ui.detail.textContent = status === null
-    ? "The relay worker did not answer."
-    : connected
-      ? (enabled
-        ? "A ghost can open a tab here and read, click, and type in it."
-        : "Paused: every request from the ghost is refused until you resume.")
-      : (status.lastError || (paired ? "Retrying. Is ghostd running?" : "Waiting for ghostd. Is it running?"));
+
+  let light = "";
+  if (connected) light = enabled ? "on" : "paused";
+  ui.dot.className = `dot ${light}`;
+
+  if (!connected) ui.statusText.textContent = paired ? "Not connected" : "Not paired";
+  else ui.statusText.textContent = enabled ? "Connected to ghostd" : "Connected, paused";
+
+  if (status === null) {
+    ui.detail.textContent = "The relay worker did not answer.";
+  } else if (!connected) {
+    ui.detail.textContent = status.lastError
+      || (paired ? "Retrying. Is ghostd running?" : "Waiting for ghostd. Is it running?");
+  } else {
+    ui.detail.textContent = enabled
+      ? "A ghost can open a tab here and read, click, and type in it."
+      : "Paused: every request from the ghost is refused until you resume.";
+  }
+
   const pairing = status !== null && !connected && !paired;
   ui.pair.hidden = !pairing;
   if (pairing) {
@@ -325,9 +345,13 @@ function renderGhost(status) {
   }
   const tabs = Array.isArray(status?.tabs) ? status.tabs.filter((tab) => tab.local !== true) : [];
   ui.ghostTabs.hidden = tabs.length === 0;
-  ui.ghostTabs.textContent = tabs.length === 0
-    ? ""
-    : `Ghost's ${tabs.length === 1 ? "tab" : `tabs (${tabs.length})`}: ${tabs.map((tab) => tab.title || tab.url || `Tab ${tab.id}`).join(", ")}`;
+  if (tabs.length === 0) {
+    ui.ghostTabs.textContent = "";
+  } else {
+    const heading = tabs.length === 1 ? "tab" : `tabs (${tabs.length})`;
+    const names = tabs.map((tab) => tab.title || tab.url || `Tab ${tab.id}`).join(", ");
+    ui.ghostTabs.textContent = `Ghost's ${heading}: ${names}`;
+  }
 }
 
 async function refreshGhost() {
@@ -364,13 +388,31 @@ async function updateRelaySettings(settings) {
   return response.settings;
 }
 
+async function retryPairing() {
+  await chrome.runtime.sendMessage({ type: "ghost-relay-pair" }).catch(() => {});
+  await refreshGhost();
+}
+
+async function saveGhostSettings() {
+  try {
+    await updateRelaySettings({
+      token: ui.token.value.trim(),
+      port: Number(ui.port.value) || ghostSettings.port,
+    });
+    ui.saved.hidden = false;
+    setTimeout(() => { ui.saved.hidden = true; }, 1_500);
+  } catch (error) {
+    ui.detail.textContent = `Could not update relay settings: ${error?.message ?? error}`;
+  }
+  await refreshGhost();
+}
+
 async function togglePause() {
   ui.menu.hidden = true;
   try {
     await updateRelaySettings({ enabled: paused });
   } catch (error) {
-    ui.notice.textContent = error?.message ?? String(error);
-    ui.notice.hidden = false;
+    notice(error?.message ?? String(error));
   }
 }
 
@@ -423,12 +465,17 @@ function confirmScript(chat, { name, args }) {
 
 // ------------------------------------------------------------------ the turn
 
+function costLabel(cost) {
+  if (typeof cost !== "number") return "cost unreported";
+  if (cost === 0) return "free";
+  return `$${cost.toFixed(6)}`;
+}
+
 function usageLine(answered, usage) {
   const tokens = usage?.total_tokens ?? null;
-  const cost = typeof usage?.cost === "number" ? usage.cost : null;
   const parts = [answered];
   if (tokens !== null) parts.push(`${tokens} tokens`);
-  parts.push(cost === null ? "cost unreported" : cost === 0 ? "free" : `$${cost.toFixed(6)}`);
+  parts.push(costLabel(usage?.cost));
   return parts.join(" · ");
 }
 
@@ -585,6 +632,12 @@ async function disconnect() {
   render();
 }
 
+function modelLabel(entry) {
+  if (entry.id === DEFAULT_MODEL) return "Free router";
+  if (entry.free) return `${entry.name} · free`;
+  return entry.name;
+}
+
 async function loadModels() {
   const fallback = [{ id: DEFAULT_MODEL, name: "Free router", free: true }];
   let models = fallback;
@@ -592,8 +645,7 @@ async function loadModels() {
     const listed = await listModels({ signal: AbortSignal.timeout(10_000) });
     if (listed.length > 0) models = listed;
   } catch {
-    ui.notice.textContent = "Could not load the model list; the free router is still available.";
-    ui.notice.hidden = false;
+    notice("Could not load the model list; the free router is still available.");
   }
   if (!models.some((entry) => entry.id === model)) {
     // Keep showing the id the next turn will actually send, rather than a
@@ -603,7 +655,7 @@ async function loadModels() {
   ui.model.replaceChildren(...models.map((entry) => {
     const option = document.createElement("option");
     option.value = entry.id;
-    option.textContent = entry.id === DEFAULT_MODEL ? "Free router" : entry.free ? `${entry.name} · free` : entry.name;
+    option.textContent = modelLabel(entry);
     option.selected = entry.id === model;
     return option;
   }));
@@ -639,24 +691,8 @@ ui.ghostMachine.addEventListener("click", () => {
   openGhostView();
 });
 ui.ghostBack.addEventListener("click", leaveGhostView);
-ui.retry.addEventListener("click", () => {
-  void chrome.runtime.sendMessage({ type: "ghost-relay-pair" }).catch(() => {}).then(() => refreshGhost());
-});
-ui.save.addEventListener("click", () => {
-  void (async () => {
-    try {
-      await updateRelaySettings({
-        token: ui.token.value.trim(),
-        port: Number(ui.port.value) || ghostSettings.port,
-      });
-      ui.saved.hidden = false;
-      setTimeout(() => { ui.saved.hidden = true; }, 1_500);
-    } catch (error) {
-      ui.detail.textContent = `Could not update relay settings: ${error?.message ?? error}`;
-    }
-    await refreshGhost();
-  })();
-});
+ui.retry.addEventListener("click", () => void retryPairing());
+ui.save.addEventListener("click", () => void saveGhostSettings());
 ui.oauth.addEventListener("click", () => void oauthConnect());
 ui.showCode.addEventListener("click", () => {
   ui.codePath.hidden = !ui.codePath.hidden;

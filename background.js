@@ -27,6 +27,7 @@
  * subprotocol list.
  */
 import {
+  FAILURES,
   PAIR_SUBPROTOCOL_PREFIX,
   PROTOCOL_VERSION,
   RELAY_PATH,
@@ -82,8 +83,6 @@ let settingsRevision = 0;
 let settingsDesired = null;
 let settingsRepairPending = false;
 let settingsRepairInFlight = null;
-let settingsMutationTail = Promise.resolve();
-let settingsStorageTail = Promise.resolve();
 let reconnectDelay = RECONNECT_MIN_MS;
 let reconnectTimer = null;
 let reconnectTimerIncompatible = false;
@@ -113,6 +112,33 @@ let protocolIncompatible = false;
 /** Per-protocol-session request-start ordering; durable tombstones live in ops. */
 const sessionTails = new Map();
 
+function describeError(error) {
+  return error?.message ?? String(error);
+}
+
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A one-at-a-time queue: the next task starts only once the previous one has
+ * settled. Two storage writes that overtake each other leave the older value on
+ * disk, so everything that must not regress runs through one of these tails,
+ * and a failed task never stalls the ones behind it.
+ */
+function makeQueue() {
+  let tail = Promise.resolve();
+  return function enqueue(work) {
+    const task = tail.then(work, work);
+    tail = task.then(() => undefined, () => undefined);
+    return task;
+  };
+}
+
+const queueSettingsWrite = makeQueue();
+const queueSettingsMutation = makeQueue();
+const queueLocalSessionsWrite = makeQueue();
+
 function normalizeSettings(stored = {}) {
   return {
     port: Number(stored.port) || DEFAULT_PORT,
@@ -128,19 +154,24 @@ function sameSettings(left, right) {
     && left.enabled === right.enabled;
 }
 
+/**
+ * Three answers, and the caller depends on the difference: the fence itself,
+ * `null` for "nothing stored yet" (the normal first run), and `undefined` for
+ * "stored something this worker refuses to trust".
+ */
 function parseSettingsFence(value) {
   if (value === null || value === undefined) return null;
-  if (typeof value !== "object" || Array.isArray(value)
-      || Object.keys(value).sort().join(",") !== "revision,settings,version"
-      || value.version !== SETTINGS_FENCE_VERSION
-      || !Number.isSafeInteger(value.revision) || value.revision < 1
-      || typeof value.settings !== "object" || value.settings === null
-      || Array.isArray(value.settings)
-      || Object.keys(value.settings).sort().join(",") !== "enabled,port,token"
-      || !Number.isSafeInteger(value.settings.port)
-      || value.settings.port < 1 || value.settings.port > 65_535
-      || typeof value.settings.token !== "string"
-      || typeof value.settings.enabled !== "boolean") return undefined;
+  if (!isPlainObject(value)) return undefined;
+  if (Object.keys(value).sort().join(",") !== "revision,settings,version") return undefined;
+  if (value.version !== SETTINGS_FENCE_VERSION) return undefined;
+  if (!Number.isSafeInteger(value.revision) || value.revision < 1) return undefined;
+  const { settings } = value;
+  if (!isPlainObject(settings)) return undefined;
+  if (Object.keys(settings).sort().join(",") !== "enabled,port,token") return undefined;
+  if (!Number.isSafeInteger(settings.port) || settings.port < 1 || settings.port > 65_535) {
+    return undefined;
+  }
+  if (typeof settings.token !== "string" || typeof settings.enabled !== "boolean") return undefined;
   return value;
 }
 
@@ -159,13 +190,10 @@ function selectSettingsFence(primary, backup) {
 }
 
 function queueSettingsFence(publication) {
-  const write = async () => {
+  return queueSettingsWrite(async () => {
     await settingsStorage.set({ [SETTINGS_FENCE_KEY]: publication });
     await settingsStorage.set({ [SETTINGS_FENCE_BACKUP_KEY]: publication });
-  };
-  const task = settingsStorageTail.then(write, write);
-  settingsStorageTail = task.then(() => undefined, () => undefined);
-  return task;
+  });
 }
 
 function scheduleSettingsRepair() {
@@ -234,12 +262,9 @@ function withPreparationTimeout(promise, timeoutMs, message) {
   });
 }
 
-function loadSettings() {
-  if (settingsCache !== null) return Promise.resolve(settingsCache);
-  if (settingsInFlight !== null) return settingsInFlight;
-
-  const generation = settingsGeneration;
-  const attempt = withPreparationTimeout(
+/** The durable fence wins over the raw keys, and repairs them when they differ. */
+async function readSettings() {
+  const stored = await withPreparationTimeout(
     settingsStorage.get({
       port: DEFAULT_PORT,
       token: "",
@@ -249,40 +274,46 @@ function loadSettings() {
     }),
     SETTINGS_TIMEOUT_MS,
     "Chromium did not return the relay settings in time.",
-  )
-    .then((stored) => {
-        const fence = selectSettingsFence(
-          stored[SETTINGS_FENCE_KEY],
-          stored[SETTINGS_FENCE_BACKUP_KEY],
-        );
-        if (fence === undefined) {
-          throw new Error("Stored relay settings recovery is invalid; reload the extension.");
-        }
-        const raw = normalizeSettings(stored);
-        const settings = fence?.settings ?? raw;
-        if (fence !== null) {
-          settingsRevision = Math.max(settingsRevision, fence.revision);
-          settingsDesired = settings;
-          if (!sameSettings(raw, settings)) scheduleSettingsRepair();
-        } else {
-          settingsDesired ??= settings;
-        }
-        return { settings: { ...settings, unavailable: null }, cacheable: true };
-      })
-    .catch((error) => ({
-        settings: {
-          ...normalizeSettings(),
-          unavailable: error?.message ?? String(error),
-        },
-        cacheable: false,
-      }))
-    .then(({ settings, cacheable }) => {
-      if (generation !== settingsGeneration) return loadSettings();
+  );
+  const fence = selectSettingsFence(
+    stored[SETTINGS_FENCE_KEY],
+    stored[SETTINGS_FENCE_BACKUP_KEY],
+  );
+  if (fence === undefined) {
+    throw new Error("Stored relay settings recovery is invalid; reload the extension.");
+  }
+  const raw = normalizeSettings(stored);
+  const settings = fence?.settings ?? raw;
+  if (fence === null) {
+    settingsDesired ??= settings;
+  } else {
+    settingsRevision = Math.max(settingsRevision, fence.revision);
+    settingsDesired = settings;
+    if (!sameSettings(raw, settings)) scheduleSettingsRepair();
+  }
+  return { ...settings, unavailable: null };
+}
+
+function loadSettings() {
+  if (settingsCache !== null) return Promise.resolve(settingsCache);
+  if (settingsInFlight !== null) return settingsInFlight;
+
+  const generation = settingsGeneration;
+  const attempt = (async () => {
+    let settings;
+    let cacheable = true;
+    try {
+      settings = await readSettings();
+    } catch (error) {
+      settings = { ...normalizeSettings(), unavailable: describeError(error) };
       // A transient Chrome storage failure must not pin unpaired defaults for
       // the rest of this worker's lifetime; retry on the next caller instead.
-      if (cacheable) settingsCache = settings;
-      return settings;
-    });
+      cacheable = false;
+    }
+    if (generation !== settingsGeneration) return loadSettings();
+    if (cacheable) settingsCache = settings;
+    return settings;
+  })();
   settingsInFlight = attempt;
   const clearAttempt = () => {
     if (settingsInFlight === attempt) settingsInFlight = null;
@@ -291,15 +322,9 @@ function loadSettings() {
   return attempt;
 }
 
-function serializeSettingsMutation(work) {
-  const task = settingsMutationTail.then(work, work);
-  settingsMutationTail = task.then(() => undefined, () => undefined);
-  return task;
-}
-
 function updateRelaySettings(patch) {
-  return serializeSettingsMutation(async () => {
-    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+  return queueSettingsMutation(async () => {
+    if (!isPlainObject(patch)) {
       throw new Error("The relay settings update must be an object.");
     }
     const keys = Object.keys(patch);
@@ -399,21 +424,21 @@ const BADGE_LOOKS = {
   off: { text: "off", color: "#8b8b8b" },
 };
 
+/**
+ * Cosmetic calls never own connection progress: Chrome may leave any of these
+ * Promises pending while the action UI is rebuilding.
+ */
+function paint(call) {
+  void Promise.resolve().then(call).catch(() => {});
+}
+
 function setBadge(status, title) {
   const look = BADGE_LOOKS[status];
-  // Cosmetic calls never own connection progress: Chrome may leave any of these
-  // Promises pending while the action UI is rebuilding.
-  void Promise.resolve()
-    .then(() => actionApi.setBadgeText({ text: look.text }))
-    .catch(() => {});
-  void Promise.resolve()
-    .then(() => actionApi.setBadgeBackgroundColor({ color: look.color }))
-    .catch(() => {});
+  paint(() => actionApi.setBadgeText({ text: look.text }));
+  paint(() => actionApi.setBadgeBackgroundColor({ color: look.color }));
   // The badge has room for two characters; the tooltip is where the sentence
   // goes. `setTitle` is absent in the test harness, hence the optional call.
-  void Promise.resolve()
-    .then(() => actionApi.setTitle?.({ title }))
-    .catch(() => {});
+  paint(() => actionApi.setTitle?.({ title }));
 }
 
 /**
@@ -442,16 +467,30 @@ function badgeFor({ connected, enabled, paired, chatReady, incompatible }) {
   return { status: "on", title: "Ghost — chat ready · no ghost paired" };
 }
 
+/** Ours, open, and past a compatible welcome — the only state worth calling up. */
+function isConnected() {
+  return ws !== null && welcomedSocket === ws && ws.readyState === WebSocket.OPEN;
+}
+
+/** A socket already open or on its way: a second dial would orphan it. */
+function hasLiveSocket() {
+  return ws !== null
+    && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING);
+}
+
+function stopPing() {
+  if (pingTimer === null) return;
+  clearInterval(pingTimer);
+  pingTimer = null;
+}
+
 function sendTo(socket, frame) {
   if (ws === socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
 }
 
-function send(frame) {
-  if (welcomedSocket !== null && welcomedSocket === ws) sendTo(welcomedSocket, frame);
-}
-
 function notice(event, data) {
-  send({ t: "event", event, ...(data ? { data } : {}) });
+  if (!isConnected()) return;
+  sendTo(welcomedSocket, { t: "event", event, ...(data ? { data } : {}) });
 }
 
 async function refreshBadge() {
@@ -463,10 +502,8 @@ async function refreshBadge() {
   // A close and a storage change can race; the one that started last is the
   // one that knows the current state.
   if (generation !== badgeGeneration) return;
-  const connected = unavailable === null
-    && ws !== null && welcomedSocket === ws && ws.readyState === WebSocket.OPEN;
   const { status, title } = badgeFor({
-    connected,
+    connected: unavailable === null && isConnected(),
     enabled,
     paired: token !== "",
     chatReady,
@@ -474,7 +511,6 @@ async function refreshBadge() {
   });
   setBadge(status, title);
 }
-
 
 function cancelReconnect() {
   if (reconnectTimer === null) return;
@@ -525,9 +561,57 @@ function ensureOwnershipRestored() {
   return attempt;
 }
 
+/**
+ * Open one socket to the daemon and wire it up, whichever credential it carries:
+ * a token for a paired browser, a six-digit code for one asking to pair. Returns
+ * the socket, or `null` when the constructor itself refused the dial.
+ *
+ * A browser WebSocket cannot set headers, so the credential rides in the one
+ * field it can set. The daemon accepts it there, or in a query string for
+ * non-browser clients; the subprotocol keeps it out of anything that logs URLs.
+ */
+function dial(port, credential, { onReady, onClosed }) {
+  const url = `ws://127.0.0.1:${port}${RELAY_PATH}`;
+  let socket;
+  try {
+    socket = new WebSocket(url, [SUBPROTOCOL, credential]);
+  } catch (error) {
+    lastError = `Could not open ${url}: ${describeError(error)}`;
+    scheduleReconnect();
+    return null;
+  }
+  ws = socket;
+  welcomedSocket = null;
+
+  socket.onopen = () => {
+    if (ws !== socket) {
+      socket.close(1000, "superseded");
+      return;
+    }
+    onReady();
+  };
+
+  socket.onmessage = (event) => {
+    if (typeof event.data === "string") void handleFrame(socket, event.data);
+  };
+
+  socket.onerror = () => {
+    // Funnel every failure through one path; onclose does the reconnect.
+    socket.close();
+  };
+
+  socket.onclose = (event) => {
+    // A newer socket already took over: this close belongs to a dead one.
+    if (ws !== socket) return;
+    ws = null;
+    onClosed(socket, event);
+  };
+  return socket;
+}
+
 async function connectOnce(epoch) {
   if (protocolIncompatible) return;
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (hasLiveSocket()) return;
   const settings = await loadSettings();
   if (epoch !== connectEpoch) return;
   if (settings.unavailable !== null) {
@@ -551,67 +635,28 @@ async function connectOnce(epoch) {
   await repairBrowserPersistence();
   if (epoch !== connectEpoch) return;
 
-  // A browser WebSocket cannot set headers, so the token rides in the one field
-  // it can set. The daemon accepts it there, or in a query string for non-browser
-  // clients; the subprotocol keeps it out of anything that logs URLs.
-  const url = `ws://127.0.0.1:${settings.port}${RELAY_PATH}`;
-  let socket;
-  try {
-    socket = new WebSocket(url, [SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX + settings.token]);
-  } catch (error) {
-    lastError = `Could not open ${url}: ${error?.message ?? error}`;
-    scheduleReconnect();
-    return;
-  }
-  ws = socket;
-  welcomedSocket = null;
-
-  socket.onopen = () => {
-    if (ws !== socket) {
-      socket.close(1000, "superseded");
-      return;
-    }
-    // A socket is not admitted yet. Protocol 4 waits for the daemon's
-    // incarnation-bearing welcome and retires claims from an earlier daemon
-    // process before sending hello.
-    void refreshBadge();
-  };
-
-  socket.onmessage = (event) => {
-    if (typeof event.data === "string") void handleFrame(socket, event.data);
-  };
-
-  socket.onerror = () => {
-    // Funnel every failure through one path; onclose does the reconnect.
-    socket.close();
-  };
-
-  socket.onclose = (event) => {
-    // A newer socket already took over: this close belongs to a dead one.
-    if (ws !== socket) return;
-    if (pairingSocket === socket) {
-      pairingSocket = null;
-      ws = null;
-      onPairingClosed(event);
-      return;
-    }
-    ws = null;
-    if (welcomedSocket === socket) welcomedSocket = null;
-    if (pingTimer !== null) {
-      clearInterval(pingTimer);
-      pingTimer = null;
-    }
-    if (event?.code === 4000 || (event?.reason && event.code !== 1000 && event.code !== 1001)) {
-      lastError = event.reason || `The daemon closed the relay (code ${event.code}).`;
-    } else if (event?.code === 1006) {
-      lastError = "ghostd is not answering on that port. Is it running?";
-    }
-    void refreshBadge();
-    // Let go of the debugger so the owner's tab is not left with a banner over
-    // a relay that is no longer there.
-    void releaseAllTabs();
-    scheduleReconnect();
-  };
+  dial(settings.port, TOKEN_SUBPROTOCOL_PREFIX + settings.token, {
+    onReady() {
+      // A socket is not admitted yet. Protocol 4 waits for the daemon's
+      // incarnation-bearing welcome and retires claims from an earlier daemon
+      // process before sending hello.
+      void refreshBadge();
+    },
+    onClosed(socket, event) {
+      if (welcomedSocket === socket) welcomedSocket = null;
+      stopPing();
+      if (event?.code === 4000 || (event?.reason && event.code !== 1000 && event.code !== 1001)) {
+        lastError = event.reason || `The daemon closed the relay (code ${event.code}).`;
+      } else if (event?.code === 1006) {
+        lastError = "ghostd is not answering on that port. Is it running?";
+      }
+      void refreshBadge();
+      // Let go of the debugger so the owner's tab is not left with a banner over
+      // a relay that is no longer there.
+      void releaseAllTabs();
+      scheduleReconnect();
+    },
+  });
 }
 
 function connect() {
@@ -625,7 +670,7 @@ function connect() {
     // own recoverable failures. Keep this boundary anyway: a future async setup
     // step must not leave the single-flight latch permanently rejected.
     if (epoch !== connectEpoch) return;
-    lastError = `Could not prepare the relay connection: ${error?.message ?? error}`;
+    lastError = `Could not prepare the relay connection: ${describeError(error)}`;
     // No badge refresh here: a preparation that failed has not changed what the
     // badge says, and re-reading storage that just failed is how a broken read
     // turns into a read storm. The keepalive alarm re-lights it.
@@ -642,36 +687,38 @@ function connect() {
   return attempt;
 }
 
+function refuse(socket, id, message) {
+  sendTo(socket, {
+    t: "res",
+    id,
+    ok: false,
+    error: { failure: FAILURES.browserUnavailable, message },
+  });
+}
+
 async function answerRequest(socket, frame) {
   const settings = await loadSettings();
-  if (settings.unavailable !== null && frame.op !== "status") {
-    sendTo(socket, {
-      t: "res",
-      id: frame.id,
-      ok: false,
-      error: {
-        failure: "browser_unavailable",
-        message:
-          `Chromium could not verify the relay settings: ${settings.unavailable} `
-          + "Retry after the extension finishes restoring them.",
-      },
-    });
-    return false;
-  }
-  const { enabled } = settings;
-  if (!enabled && frame.op !== "status") {
-    sendTo(socket, {
-      t: "res",
-      id: frame.id,
-      ok: false,
-      error: {
-        failure: "browser_unavailable",
-        message:
-          "The Ghost relay is paused. The owner can resume it from the "
-          + "Ghost side panel's menu in Chromium.",
-      },
-    });
-    return false;
+  // `status` is exempt from both refusals below: answering it is how a ghost
+  // finds out that the relay is unreadable or paused.
+  if (frame.op !== "status") {
+    if (settings.unavailable !== null) {
+      refuse(
+        socket,
+        frame.id,
+        `Chromium could not verify the relay settings: ${settings.unavailable} `
+        + "Retry after the extension finishes restoring them.",
+      );
+      return;
+    }
+    if (!settings.enabled) {
+      refuse(
+        socket,
+        frame.id,
+        "The Ghost relay is paused. The owner can resume it from the "
+        + "Ghost side panel's menu in Chromium.",
+      );
+      return;
+    }
   }
 
   let operation;
@@ -679,7 +726,7 @@ async function answerRequest(socket, frame) {
     operation = startOp(frame.op, frame.args ?? {}, frame.timeoutMs ?? 30_000);
   } catch (error) {
     sendTo(socket, toErrorFrame(frame.id, error));
-    return false;
+    return;
   }
   try {
     const result = await operation.response;
@@ -723,39 +770,18 @@ async function dialForPairing(port) {
     pairingCode = newPairingCode();
     void chrome.storage.session.set({ [PAIRING_CODE_KEY]: pairingCode }).catch(() => {});
   }
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-  const url = `ws://127.0.0.1:${port}${RELAY_PATH}`;
-  let socket;
-  try {
-    socket = new WebSocket(url, [SUBPROTOCOL, PAIR_SUBPROTOCOL_PREFIX + pairingCode]);
-  } catch (error) {
-    lastError = `Could not open ${url}: ${error?.message ?? error}`;
-    scheduleReconnect();
-    return;
-  }
-  ws = socket;
-  welcomedSocket = null;
-  pairingSocket = socket;
-  socket.onopen = () => {
-    if (ws !== socket) {
-      socket.close(1000, "superseded");
-      return;
-    }
-    lastError = PAIRING_WAITING_MESSAGE;
-    void refreshBadge();
-  };
-  socket.onmessage = (event) => {
-    if (typeof event.data === "string") void handleFrame(socket, event.data);
-  };
-  socket.onerror = () => {
-    socket.close();
-  };
-  socket.onclose = (event) => {
-    if (ws !== socket) return;
-    ws = null;
-    pairingSocket = null;
-    onPairingClosed(event);
-  };
+  if (hasLiveSocket()) return;
+  const socket = dial(port, PAIR_SUBPROTOCOL_PREFIX + pairingCode, {
+    onReady() {
+      lastError = PAIRING_WAITING_MESSAGE;
+      void refreshBadge();
+    },
+    onClosed(_socket, event) {
+      pairingSocket = null;
+      onPairingClosed(event);
+    },
+  });
+  if (socket !== null) pairingSocket = socket;
 }
 
 async function restorePairingCode() {
@@ -797,7 +823,8 @@ async function acceptPairing(socket, token) {
   try {
     await updateRelaySettings({ token });
   } catch (error) {
-    lastError = `Ghost allowed this browser but the token could not be saved: ${error?.message ?? error}`;
+    lastError =
+      `Ghost allowed this browser but the token could not be saved: ${describeError(error)}`;
     return;
   }
   // The settings change re-dials as a paired client; this socket is done.
@@ -831,51 +858,56 @@ async function handleFrame(socket, raw) {
     // `pairing` frames are the daemon keeping this worker alive; nothing to do.
     return;
   }
-  if (frame?.t === "welcome") {
-    if (frame.protocol !== PROTOCOL_VERSION) {
-      protocolIncompatible = true;
-      lastError =
-        `ghostd speaks relay protocol ${frame.protocol}; this extension speaks `
-        + `${PROTOCOL_VERSION}. Update whichever is older.`;
-      socket.close(4000, lastError);
-      return;
-    }
-    try {
-      await repairBrowserPersistence();
-      await reconcileDaemonIncarnation(frame.incarnation);
-      await repairBrowserPersistence();
-    } catch (error) {
-      if (ws !== socket) return;
-      lastError = error?.message ?? String(error);
-      socket.close(4000, lastError.slice(0, 120));
-      return;
-    }
-    if (ws !== socket) return;
-    sendTo(socket, {
-      t: "hello",
-      protocol: PROTOCOL_VERSION,
-      agent: `ghost-relay/${chrome.runtime.getManifest().version}`,
-      browser: /Chrom(e|ium)\/[\d.]+/.exec(navigator.userAgent)?.[0] ?? "Chromium",
-    });
-    // A compatible daemon has greeted us: only now is the connection truly good,
-    // so only now is the backoff safe to reset.
-    protocolIncompatible = false;
-    reconnectDelay = RECONNECT_MIN_MS;
-    cancelReconnect();
-    welcomedSocket = socket;
-    lastError = "";
-    clearInterval(pingTimer ?? undefined);
-    // Not liveness — this is what keeps the service worker from being reaped
-    // between two of the ghost's tool calls.
-    pingTimer = setInterval(() => notice("ping", null), PING_INTERVAL_MS);
-    void refreshBadge();
-    return;
-  }
+  if (frame?.t === "welcome") return answerWelcome(socket, frame);
   if (frame?.t !== "req" || typeof frame.id !== "number") return;
   if (welcomedSocket !== socket) return;
   return queueRequest(socket, frame);
 }
 
+/**
+ * The daemon's `welcome`, which is what admits this socket: the version has to
+ * match, and any claims left by an earlier daemon process are retired before
+ * `hello` goes back.
+ */
+async function answerWelcome(socket, frame) {
+  if (frame.protocol !== PROTOCOL_VERSION) {
+    protocolIncompatible = true;
+    lastError =
+      `ghostd speaks relay protocol ${frame.protocol}; this extension speaks `
+      + `${PROTOCOL_VERSION}. Update whichever is older.`;
+    socket.close(4000, lastError);
+    return;
+  }
+  try {
+    await repairBrowserPersistence();
+    await reconcileDaemonIncarnation(frame.incarnation);
+    await repairBrowserPersistence();
+  } catch (error) {
+    if (ws !== socket) return;
+    lastError = describeError(error);
+    socket.close(4000, lastError.slice(0, 120));
+    return;
+  }
+  if (ws !== socket) return;
+  sendTo(socket, {
+    t: "hello",
+    protocol: PROTOCOL_VERSION,
+    agent: `ghost-relay/${chrome.runtime.getManifest().version}`,
+    browser: /Chrom(e|ium)\/[\d.]+/.exec(navigator.userAgent)?.[0] ?? "Chromium",
+  });
+  // A compatible daemon has greeted us: only now is the connection truly good,
+  // so only now is the backoff safe to reset.
+  protocolIncompatible = false;
+  reconnectDelay = RECONNECT_MIN_MS;
+  cancelReconnect();
+  welcomedSocket = socket;
+  lastError = "";
+  stopPing();
+  // Not liveness — this is what keeps the service worker from being reaped
+  // between two of the ghost's tool calls.
+  pingTimer = setInterval(() => notice("ping", null), PING_INTERVAL_MS);
+  void refreshBadge();
+}
 
 installOpsListeners(notice);
 
@@ -909,10 +941,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     ws = null;
     if (welcomedSocket === oldSocket) welcomedSocket = null;
     oldSocket?.close(1000, "settings changed");
-    if (pingTimer !== null) {
-      clearInterval(pingTimer);
-      pingTimer = null;
-    }
+    stopPing();
     void releaseAllTabs();
     reconnectDelay = RECONNECT_MIN_MS;
     void connect();
@@ -959,7 +988,6 @@ const LOCAL_SESSIONS_KEY = "ghostLocalSessions";
 const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 let localSessions = null;
 let localSessionsInFlight = null;
-let localSessionsTail = Promise.resolve();
 
 function loadLocalSessions() {
   if (localSessions !== null) return Promise.resolve(localSessions);
@@ -972,7 +1000,7 @@ function loadLocalSessions() {
       // A storage failure means fresh workspaces, not a failed chat.
     }
     const map = new Map();
-    if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+    if (isPlainObject(stored)) {
       for (const [conversation, session] of Object.entries(stored)) {
         if (CONVERSATION_ID.test(conversation) && isLocalSession(session)) map.set(conversation, session);
       }
@@ -989,9 +1017,9 @@ function loadLocalSessions() {
 }
 
 function persistLocalSessions(map) {
-  const write = () => settingsStorage.set({ [LOCAL_SESSIONS_KEY]: Object.fromEntries(map) }).catch(() => {});
-  localSessionsTail = localSessionsTail.then(write, write);
-  return localSessionsTail;
+  return queueLocalSessionsWrite(
+    () => settingsStorage.set({ [LOCAL_SESSIONS_KEY]: Object.fromEntries(map) }).catch(() => {}),
+  );
 }
 
 function requireConversation(conversation) {
@@ -1042,74 +1070,77 @@ async function runLocalOp(conversation, op, args, timeoutMs) {
   return runOp(op, { ...args, session }, timeoutMs);
 }
 
-chrome.runtime.onMessage.addListener((message, sender, respond) => {
-  if (isPanelSender(sender)) {
-    if (message?.type === "ghost-relay-local-op") {
-      void runLocalOp(
-        message.conversation,
-        message.op,
-        message.args ?? {},
-        Number.isSafeInteger(message.timeoutMs) ? message.timeoutMs : 30_000,
-      ).then(
-        (result) => respond({ ok: true, result }),
-        (error) => respond({ ok: false, error: error?.message ?? String(error) }),
-      );
-      return true;
-    }
-    if (message?.type === "ghost-relay-local-close") {
-      void closeLocalConversation(message.conversation).then(
-        () => respond({ ok: true }),
-        (error) => respond({ ok: false, error: error?.message ?? String(error) }),
-      );
-      return true;
-    }
-  } else {
-    return undefined;
+/** Answer the panel when `work` settles; a rejection becomes its error string. */
+function answerPanel(respond, work, toReply = () => ({ ok: true })) {
+  void work.then(
+    (value) => respond(toReply(value)),
+    (error) => respond({ ok: false, error: describeError(error) }),
+  );
+}
+
+async function reportStatus(respond) {
+  const settings = await loadSettings();
+  let tabs = [];
+  try {
+    // The panel is the machine owner's surface, so it lists every ghost's
+    // tabs — through the in-process view, never the owner-scoped wire op.
+    tabs = await allTabInfos();
+  } catch {
+    // No tab yet is the normal case.
   }
-  if (message?.type === "ghost-relay-settings-update") {
-    void updateRelaySettings(message.settings).then(
-      (settings) => respond({ ok: true, settings }),
-      (error) => respond({
-        ok: false,
-        error: error?.message ?? String(error),
-      }),
-    );
-    return true;
-  }
-  if (message?.type === "ghost-relay-pair") {
-    void retryPairing().then(() => respond({ ok: true }), () => respond({ ok: false }));
-    return true;
-  }
-  if (message?.type !== "ghost-relay-status") return undefined;
-  void (async () => {
-    const settings = await loadSettings();
-    let tabs = [];
-    try {
-      // The panel is the machine owner's surface, so it lists every ghost's
-      // tabs — through the in-process view, never the owner-scoped wire op.
-      tabs = await allTabInfos();
-    } catch {
-      // No tab yet is the normal case.
-    }
-    respond({
-      connected: ws !== null && welcomedSocket === ws && ws.readyState === WebSocket.OPEN,
-      paired: settings.token !== "",
-      pairingCode: settings.token === "" ? pairingCode : null,
-      pairingDenied: settings.token === "" && pairingDenied,
-      token: settings.token,
-      enabled: settings.enabled,
-      port: settings.port,
-      lastError,
-      tabs,
-    });
-  })().catch(() => {
-    // respond itself can throw once the panel's channel is gone; the panel's
-    // own deadline already covers a missing reply.
-    try {
-      respond(null);
-    } catch {}
+  respond({
+    connected: isConnected(),
+    paired: settings.token !== "",
+    pairingCode: settings.token === "" ? pairingCode : null,
+    pairingDenied: settings.token === "" && pairingDenied,
+    token: settings.token,
+    enabled: settings.enabled,
+    port: settings.port,
+    lastError,
+    tabs,
   });
-  return true;
+}
+
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (!isPanelSender(sender)) return undefined;
+  switch (message?.type) {
+    case "ghost-relay-local-op":
+      answerPanel(
+        respond,
+        runLocalOp(
+          message.conversation,
+          message.op,
+          message.args ?? {},
+          Number.isSafeInteger(message.timeoutMs) ? message.timeoutMs : 30_000,
+        ),
+        (result) => ({ ok: true, result }),
+      );
+      return true;
+    case "ghost-relay-local-close":
+      answerPanel(respond, closeLocalConversation(message.conversation));
+      return true;
+    case "ghost-relay-settings-update":
+      answerPanel(
+        respond,
+        updateRelaySettings(message.settings),
+        (settings) => ({ ok: true, settings }),
+      );
+      return true;
+    case "ghost-relay-pair":
+      void retryPairing().then(() => respond({ ok: true }), () => respond({ ok: false }));
+      return true;
+    case "ghost-relay-status":
+      void reportStatus(respond).catch(() => {
+        // respond itself can throw once the panel's channel is gone; the panel's
+        // own deadline already covers a missing reply.
+        try {
+          respond(null);
+        } catch {}
+      });
+      return true;
+    default:
+      return undefined;
+  }
 });
 
 // The toolbar icon opens the side panel; there is no popup. Absent in the test

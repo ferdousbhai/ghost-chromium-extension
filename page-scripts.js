@@ -102,6 +102,27 @@ export const MAX_FIND_RESULTS = 100;
 export const MAX_FIND_SCAN_ELEMENTS = 10_000;
 
 /**
+ * The selector half of every resolve: the document first, then each open shadow
+ * root, which `document.querySelector` does not cross. `undefined` means the
+ * selector itself is invalid, `null` that nothing matched — each caller turns
+ * those into its own shape of answer. Needs {@link WALK} injected alongside it.
+ */
+const QUERY = `
+  const ghostQuerySelector = (selector) => {
+    let found = null;
+    try { found = document.querySelector(selector); } catch { return undefined; }
+    if (!found) {
+      ghostWalk((node) => {
+        if (found) return false;
+        if (!node.shadowRoot) return;
+        try { found = node.shadowRoot.querySelector(selector); } catch {}
+      }, ${MAX_FIND_SCAN_ELEMENTS});
+    }
+    return found;
+  };
+`;
+
+/**
  * Syntax that cannot safely cross the document-querySelectorAll → bounded
  * Element.matches boundary. Quotes are opaque, so attribute values containing
  * these characters keep working; comments and escapes outside them are CSS-token
@@ -312,20 +333,15 @@ export const FIND_ELEMENTS_SCRIPT = `({ query, limit }) => {
  */
 export const RESOLVE_SCRIPT = `({ ref, selector, clickable }) => {
   ${WALK}
+  ${QUERY}
   ${REGISTRY}
   let el = null;
   if (ref) {
     el = ghostResolveRef(ref);
     if (!el) return { found: false, reason: "stale-ref" };
   } else {
-    try { el = document.querySelector(selector); } catch { return { found: false, reason: "bad-selector" }; }
-    if (!el) {
-      ghostWalk((node) => {
-        if (el) return false;
-        if (!node.shadowRoot) return;
-        try { el = node.shadowRoot.querySelector(selector); } catch {}
-      }, ${MAX_FIND_SCAN_ELEMENTS});
-    }
+    el = ghostQuerySelector(selector);
+    if (el === undefined) return { found: false, reason: "bad-selector" };
     if (!el) return { found: false, reason: "no-match" };
   }
 
@@ -390,19 +406,14 @@ export const RESOLVE_SCRIPT = `({ ref, selector, clickable }) => {
  */
 export const FOCUS_AND_CLEAR_SCRIPT = `({ ref, selector }) => {
   ${WALK}
+  ${QUERY}
   ${REGISTRY}
   let el = null;
   if (ref) {
     el = ghostResolveRef(ref);
   } else {
-    try { el = document.querySelector(selector); } catch { return { found: false, reason: "bad-selector" }; }
-    if (!el) {
-      ghostWalk((node) => {
-        if (el) return false;
-        if (!node.shadowRoot) return;
-        try { el = node.shadowRoot.querySelector(selector); } catch {}
-      }, ${MAX_FIND_SCAN_ELEMENTS});
-    }
+    el = ghostQuerySelector(selector);
+    if (el === undefined) return { found: false, reason: "bad-selector" };
   }
   if (!el) return { found: false, reason: ref ? "stale-ref" : "no-match" };
 
@@ -444,16 +455,10 @@ export const FOCUS_AND_CLEAR_SCRIPT = `({ ref, selector }) => {
  */
 export const RESOLVE_NODE_SCRIPT = `({ ref, selector }) => {
   ${WALK}
+  ${QUERY}
   ${REGISTRY}
   if (ref) return ghostResolveRef(ref);
-  let el = null;
-  try { el = document.querySelector(selector); } catch { return null; }
-  if (!el) {
-    ghostWalk((node) => {
-      if (el) return false;
-      if (!node.shadowRoot) return;
-      try { el = node.shadowRoot.querySelector(selector); } catch {}
-    }, ${MAX_FIND_SCAN_ELEMENTS});
-  }
-  return el;
+  // An invalid selector and no match are the same answer here: the caller turns
+  // a null node into its stale-ref / not-found failure.
+  return ghostQuerySelector(selector) ?? null;
 }`;
