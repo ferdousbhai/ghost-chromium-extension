@@ -141,17 +141,21 @@ test("an error that arrives mid-stream is thrown, never left looking like an end
   );
 });
 
-test("the model list keeps only what can drive a tab, free ones first", async () => {
+test("the model list keeps only what can drive a tab, the default then free ones first", async () => {
   globalThis.fetch = async () => jsonResponse({
     data: [
-      { id: "z/paid", name: "Z Paid", pricing: { prompt: "0.001", completion: "0.002" }, supported_parameters: ["tools"] },
-      { id: "a/free", name: "A Free", pricing: { prompt: "0", completion: "0" }, supported_parameters: ["tools"] },
+      { id: "z/paid", name: "Zed: Z Paid", pricing: { prompt: "0.001", completion: "0.002" }, supported_parameters: ["tools"] },
+      { id: "a/free:free", name: "Acme: A Free (free)", pricing: { prompt: "0", completion: "0" }, supported_parameters: ["tools"] },
+      { id: DEFAULT_MODEL, name: "Router", pricing: { prompt: "0", completion: "0" }, supported_parameters: ["tools"] },
       { id: "n/no-tools", name: "No Tools", pricing: { prompt: "0", completion: "0" }, supported_parameters: [] },
     ],
   });
   const models = await listModels();
-  assert.deepEqual(models.map((entry) => entry.id), ["a/free", "z/paid"]);
-  assert.deepEqual(models.map((entry) => entry.free), [true, false]);
+  assert.deepEqual(models.map((entry) => entry.id), [DEFAULT_MODEL, "a/free:free", "z/paid"]);
+  assert.deepEqual(models.map((entry) => entry.free), [true, true, false]);
+  // The vendor prefix and the "(free)" tag are fields, not part of the name.
+  assert.deepEqual(models.map((entry) => [entry.name, entry.vendor]),
+    [["Free router", "openrouter"], ["A Free", "a"], ["Z Paid", "z"]]);
 });
 
 test("a spent authorization code fails with a sentence that says why", async () => {

@@ -24,6 +24,7 @@ import {
   exchangeCode,
   KEY_STORE,
   listModels,
+  modelEntry,
   streamChat,
 } from "./openrouter.js";
 import { toolDefinitions } from "./tools.js";
@@ -39,17 +40,25 @@ const MAX_STORE_BYTES = 3_000_000;
 const OP_TIMEOUT_MS = 60_000;
 
 const ui = Object.fromEntries([
-  "toolbar", "history", "newChat", "more", "menu", "pauseToggle", "ghostMachine", "deleteChat",
+  "toolbar", "history", "newChat", "menu", "pauseToggle", "ghostMachine", "deleteChat",
   "disconnect", "paused", "notice", "connect", "oauth", "showCode", "codePath", "openAuth",
   "manual", "manualSave", "connectError", "ghostView", "ghostBack", "dot", "statusText",
   "detail", "ghostTabs", "pair", "pairCode", "retry", "token", "port", "save", "saved",
-  "empty", "log", "historyList", "composerBar", "input", "model", "send", "stop",
+  "empty", "log", "historyList", "composerBar", "input", "model", "modelName", "modelMenu",
+  "modelSearch", "modelList", "modelNone", "send", "stop",
 ].map((id) => [id, document.getElementById(id)]));
 
 const tools = toolDefinitions();
 
 let key = null;
 let model = DEFAULT_MODEL;
+const FREE_ROUTER = modelEntry(DEFAULT_MODEL, "", true);
+/**
+ * The catalog as the picker draws it, in listModels' order: one row per entry,
+ * built once per catalog; typing only hides some.
+ */
+let pickerRows = [];
+let activeRow = null;
 /** Newest first. Each: { id, title, updatedAt, messages, record }. */
 let chats = [];
 let activeId = null;
@@ -209,6 +218,24 @@ function renderEntry(entry) {
   }
 }
 
+/**
+ * Consecutive tool calls share one `.tools` block, so the log's gap falls
+ * between blocks and the calls' rules join into one down the side.
+ */
+function renderLog(record) {
+  const nodes = [];
+  for (const entry of record) {
+    const node = renderEntry(entry);
+    if (entry.kind !== "tool") {
+      nodes.push(node);
+      continue;
+    }
+    if (nodes.at(-1)?.className !== "tools") nodes.push(el("div", "tools"));
+    nodes.at(-1).append(node);
+  }
+  return nodes;
+}
+
 function whenLabel(at) {
   const minutes = Math.round((Date.now() - at) / 60_000);
   if (minutes < 1) return "now";
@@ -250,6 +277,7 @@ function render() {
   ui.paused.hidden = !paused;
   ui.pauseToggle.textContent = paused ? "Resume Ghost" : "Pause Ghost";
   ui.model.disabled = turn !== null;
+  if (turn !== null) ui.modelMenu.hidePopover();
   ui.send.hidden = busy;
   ui.stop.hidden = !busy;
   // The wire has no cancel: a page op already handed to Chromium finishes. Stop
@@ -261,7 +289,7 @@ function render() {
 
   if (view === "history") renderHistory();
   if (showLog) {
-    ui.log.replaceChildren(...chat.record.map(renderEntry));
+    ui.log.replaceChildren(...renderLog(chat.record));
     if (pendingConfirm !== null && pendingConfirm.chat.id === chat.id) ui.log.append(pendingConfirm.node);
     ui.log.scrollTop = ui.log.scrollHeight;
   }
@@ -408,7 +436,6 @@ async function saveGhostSettings() {
 }
 
 async function togglePause() {
-  ui.menu.hidden = true;
   try {
     await updateRelaySettings({ enabled: paused });
   } catch (error) {
@@ -627,20 +654,12 @@ async function useCode() {
 async function disconnect() {
   stop();
   key = null;
-  ui.menu.hidden = true;
   await chrome.storage.local.remove(KEY_STORE).catch(() => {});
   render();
 }
 
-function modelLabel(entry) {
-  if (entry.id === DEFAULT_MODEL) return "Free router";
-  if (entry.free) return `${entry.name} · free`;
-  return entry.name;
-}
-
 async function loadModels() {
-  const fallback = [{ id: DEFAULT_MODEL, name: "Free router", free: true }];
-  let models = fallback;
+  let models = [FREE_ROUTER];
   try {
     const listed = await listModels({ signal: AbortSignal.timeout(10_000) });
     if (listed.length > 0) models = listed;
@@ -650,15 +669,66 @@ async function loadModels() {
   if (!models.some((entry) => entry.id === model)) {
     // Keep showing the id the next turn will actually send, rather than a
     // catalog entry the picker only appears to have chosen.
-    models = [{ id: model, name: `${model} — no longer listed`, free: false }, ...models];
+    models = [{ ...modelEntry(model, model, false), stale: true }, ...models];
   }
-  ui.model.replaceChildren(...models.map((entry) => {
-    const option = document.createElement("option");
-    option.value = entry.id;
-    option.textContent = modelLabel(entry);
-    option.selected = entry.id === model;
-    return option;
-  }));
+  setCatalog(models);
+}
+
+function renderModelButton() {
+  const entry = pickerRows.find(({ row }) => row.value === model)?.entry;
+  ui.modelName.textContent = entry?.name ?? model;
+  ui.model.title = `Model: ${model}`;
+}
+
+/** Entries are { id, name, vendor, free, stale? }. */
+function setCatalog(models) {
+  const nodes = [];
+  let heading = null;
+  pickerRows = models.map((entry) => {
+    const group = entry.stale ? "No longer listed" : entry.free ? "Free" : "Paid";
+    if (heading?.textContent !== group) {
+      heading = el("div", "group", group);
+      nodes.push(heading);
+    }
+    const row = el("button", entry.id === model ? "option selected" : "option");
+    row.type = "button";
+    row.value = entry.id;
+    row.title = entry.id;
+    row.append(el("span", "name", entry.name), el("span", "vendor", entry.vendor));
+    nodes.push(row);
+    return { entry, row, heading, haystack: `${entry.name} ${entry.id}`.toLowerCase() };
+  });
+  ui.modelList.replaceChildren(...nodes);
+  renderModelButton();
+}
+
+function filterPicker() {
+  const query = ui.modelSearch.value.trim().toLowerCase();
+  const headings = new Set();
+  for (const { row, heading, haystack } of pickerRows) {
+    row.hidden = !haystack.includes(query);
+    if (!row.hidden) headings.add(heading);
+  }
+  for (const { heading } of pickerRows) heading.hidden = !headings.has(heading);
+  ui.modelNone.hidden = headings.size > 0;
+}
+
+const visibleRows = () => pickerRows.map(({ row }) => row).filter((row) => !row.hidden);
+
+function markRow(row) {
+  activeRow?.classList.remove("active");
+  activeRow = row;
+  row?.classList.add("active");
+  row?.scrollIntoView({ block: "nearest" });
+}
+
+function chooseModel(id) {
+  model = id;
+  void chrome.storage.local.set({ [MODEL_STORE]: model }).catch(() => {});
+  for (const { row } of pickerRows) row.classList.toggle("selected", row.value === model);
+  ui.modelMenu.hidePopover();
+  renderModelButton();
+  ui.input.focus();
 }
 
 // ------------------------------------------------------------------- wiring
@@ -666,29 +736,24 @@ async function loadModels() {
 ui.send.addEventListener("click", () => void send());
 ui.stop.addEventListener("click", stop);
 ui.newChat.addEventListener("click", () => {
-  ui.menu.hidden = true;
   if (view === "ghost") leaveGhostView();
   newChat();
 });
 ui.history.addEventListener("click", () => {
-  ui.menu.hidden = true;
   if (view === "ghost") leaveGhostView();
   view = view === "history" ? "chat" : "history";
   render();
 });
-ui.more.addEventListener("click", () => {
-  ui.menu.hidden = !ui.menu.hidden;
-});
 ui.deleteChat.addEventListener("click", () => {
-  ui.menu.hidden = true;
   const chat = activeChat();
   if (chat !== null) void dropChat(chat.id);
 });
 ui.disconnect.addEventListener("click", () => void disconnect());
 ui.pauseToggle.addEventListener("click", () => void togglePause());
-ui.ghostMachine.addEventListener("click", () => {
-  ui.menu.hidden = true;
-  openGhostView();
+ui.ghostMachine.addEventListener("click", openGhostView);
+// Every item in the menu is an action; taking one closes the menu.
+ui.menu.addEventListener("click", (event) => {
+  if (event.target.closest("button")) ui.menu.hidePopover();
 });
 ui.ghostBack.addEventListener("click", leaveGhostView);
 ui.retry.addEventListener("click", () => void retryPairing());
@@ -709,15 +774,45 @@ ui.input.addEventListener("input", () => {
   ui.input.style.height = "auto";
   ui.input.style.height = `${Math.min(ui.input.scrollHeight, 160)}px`;
 });
-ui.model.addEventListener("change", () => {
-  model = ui.model.value;
-  void chrome.storage.local.set({ [MODEL_STORE]: model }).catch(() => {});
+// Both popovers are native (`popover` + `popovertarget`): the browser opens
+// them, closes one when the other opens, and dismisses on Escape or a click
+// elsewhere. The picker only fills itself as it opens.
+ui.modelMenu.addEventListener("beforetoggle", (event) => {
+  if (event.newState !== "open") return;
+  ui.modelSearch.value = "";
+  filterPicker();
 });
-document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    if (!ui.menu.hidden) ui.menu.hidden = true;
-    else if (turn !== null) stop();
+ui.modelMenu.addEventListener("toggle", (event) => {
+  if (event.newState !== "open") return;
+  markRow(pickerRows.find(({ row }) => row.value === model)?.row ?? null);
+  ui.modelSearch.focus();
+});
+ui.modelList.addEventListener("click", (event) => {
+  const row = event.target.closest(".option");
+  if (row) chooseModel(row.value);
+});
+ui.modelList.addEventListener("mousemove", (event) => {
+  const row = event.target.closest(".option");
+  if (row && row !== activeRow) markRow(row);
+});
+ui.modelSearch.addEventListener("input", () => {
+  filterPicker();
+  markRow(visibleRows()[0] ?? null);
+});
+ui.modelSearch.addEventListener("keydown", (event) => {
+  const step = { ArrowDown: 1, ArrowUp: -1 }[event.key];
+  const rows = visibleRows();
+  if (step !== undefined && rows.length > 0) {
+    event.preventDefault();
+    markRow(rows[(rows.indexOf(activeRow) + step + rows.length) % rows.length]);
+  } else if (event.key === "Enter" && activeRow !== null && !activeRow.hidden) {
+    event.preventDefault();
+    chooseModel(activeRow.value);
   }
+});
+// Escape closes an open popover first; only with none open does it stop a turn.
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && turn !== null && !document.querySelector(":popover-open")) stop();
 });
 
 // Pause is one switch for both sides: the popup flips it, and a turn in flight
@@ -738,6 +833,7 @@ window.addEventListener("pagehide", () => void persist());
 
 void (async () => {
   await restore();
+  setCatalog([FREE_ROUTER]);
   if (key !== null && activeChat() === null) newChat();
   // Paint before any network: a slow or unreachable OpenRouter must not leave
   // the panel blank. The picker shows the free router until the catalog lands.

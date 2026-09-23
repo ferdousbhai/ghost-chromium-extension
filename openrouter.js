@@ -122,6 +122,21 @@ export async function exchangeCode({ code, verifier, signal }) {
 }
 
 /**
+ * One catalog entry. OpenRouter names read "Vendor: Model (free)"; the vendor
+ * and the price are fields here, so the name is just the model's.
+ */
+export function modelEntry(id, name, free) {
+  return {
+    id,
+    name: id === DEFAULT_MODEL
+      ? "Free router"
+      : name.replace(/^[^:/]+:\s+/, "").replace(/\s*\(free\)$/i, "") || id,
+    vendor: id.split("/")[0],
+    free,
+  };
+}
+
+/**
  * The catalog, narrowed to what this agent can actually drive: a model with no
  * tool calling cannot click anything, so listing it would only produce a turn
  * that ends in an apology.
@@ -135,15 +150,13 @@ export async function listModels({ signal } = {}) {
     .filter((row) => Array.isArray(row?.supported_parameters)
       && row.supported_parameters.includes("tools")
       && typeof row.id === "string")
-    .map((row) => ({
-      id: row.id,
-      name: typeof row.name === "string" && row.name !== "" ? row.name : row.id,
-      free: row.pricing?.prompt === "0" && row.pricing?.completion === "0",
-    }));
-  // Free first, then by name: the default path is the one that costs nothing,
-  // so it should also be the one at the top of the list.
-  models.sort((left, right) =>
-    (Number(right.free) - Number(left.free)) || left.name.localeCompare(right.name));
+    .map((row) => modelEntry(row.id, typeof row.name === "string" ? row.name : "",
+      row.pricing?.prompt === "0" && row.pricing?.completion === "0"));
+  // The default, then free, then by name: the default path is the one that
+  // costs nothing, so it should also be the one at the top of the list.
+  const isDefault = (entry) => Number(entry.id === DEFAULT_MODEL);
+  models.sort((left, right) => (isDefault(right) - isDefault(left))
+    || (Number(right.free) - Number(left.free)) || left.name.localeCompare(right.name));
   return models;
 }
 

@@ -7,6 +7,7 @@
  * whose buttons decide whether the page op runs at all.
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { afterEach, test } from "node:test";
 
 const originals = {
@@ -37,6 +38,7 @@ class FakeNode {
     this.listeners = new Map();
     this.style = {};
     this.scrollHeight = 0;
+    this.popoverOpen = false;
   }
 
   addEventListener(event, listener) {
@@ -76,7 +78,42 @@ class FakeNode {
     return null;
   }
 
+  get classList() {
+    const names = () => this.className.split(" ").filter(Boolean);
+    return {
+      add: (name) => { if (!names().includes(name)) this.className = [...names(), name].join(" "); },
+      remove: (name) => { this.className = names().filter((entry) => entry !== name).join(" "); },
+      toggle: (name, on) => { this.className = [...names().filter((entry) => entry !== name), ...(on ? [name] : [])].join(" "); },
+      contains: (name) => names().includes(name),
+    };
+  }
+
+  /** One `.class` or tag selector, up the parent chain. */
+  closest(selector) {
+    for (let node = this; node; node = node.parent) {
+      if (selector.startsWith(".") ? node.classList.contains(selector.slice(1)) : node.tag === selector) return node;
+    }
+    return null;
+  }
+
   focus() {}
+
+  scrollIntoView() {}
+
+  /** The native popover, as `popovertarget` drives it. */
+  showPopover() {
+    this.listeners.get("beforetoggle")?.({ newState: "open" });
+    this.popoverOpen = true;
+    this.listeners.get("toggle")?.({ newState: "open" });
+  }
+
+  hidePopover() {
+    this.popoverOpen = false;
+  }
+
+  matches(selector) {
+    return selector === ":popover-open" && this.popoverOpen;
+  }
 
   click() {
     this.listeners.get("click")?.({});
@@ -87,21 +124,26 @@ class FakeNode {
   }
 }
 
-const PANEL_IDS = [
-  "toolbar", "history", "newChat", "more", "menu", "pauseToggle", "ghostMachine", "deleteChat",
-  "disconnect", "paused", "notice", "connect", "oauth", "showCode", "codePath", "openAuth",
-  "manual", "manualSave", "connectError", "ghostView", "ghostBack", "dot", "statusText",
-  "detail", "ghostTabs", "pair", "pairCode", "retry", "token", "port", "save", "saved",
-  "empty", "log", "historyList", "composerBar", "input", "model", "send", "stop",
-];
+/**
+ * Every element the markup gives an id, and whether it ships `hidden`, so the
+ * fake has what the panel looks up and starts where the real panel does.
+ */
+const PANEL_ELEMENTS = [...readFileSync(new URL("../sidepanel.html", import.meta.url), "utf8")
+  .matchAll(/<[^>]*\bid="([^"]+)"([^>]*)>/g)]
+  .map(([tag, id]) => [id, /\shidden[\s>/]/.test(tag)]);
 
 function panelDocument() {
-  const elements = Object.fromEntries(PANEL_IDS.map((id) => [id, new FakeNode("div", id)]));
+  const elements = Object.fromEntries(PANEL_ELEMENTS.map(([id, hidden]) => {
+    const node = new FakeNode("div", id);
+    node.hidden = hidden;
+    return [id, node];
+  }));
   const listeners = new Map();
   return {
     elements,
     activeElement: null,
     getElementById: (id) => elements[id],
+    querySelector: (selector) => Object.values(elements).find((node) => node.matches(selector)) ?? null,
     createElement: (tag) => new FakeNode(tag),
     createTextNode: (text) => ({ textContent: text, text }),
     addEventListener: (event, listener) => listeners.set(event, listener),
@@ -174,6 +216,13 @@ function setUp({ key = "sk-or-test", ops = async () => ({ ok: true, result: {} }
 
 const load = (label) => import(`../sidepanel.js?${label}=${Date.now()}-${Math.random()}`);
 
+/** Tick until `check` holds, for flows whose hop count is not the point. */
+async function until(check, times = 200) {
+  for (let turn = 0; turn < times && !check(); turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 async function settle(times = 6) {
   for (let turn = 0; turn < times; turn += 1) {
     await new Promise((resolve) => setImmediate(resolve));
@@ -192,6 +241,45 @@ test("an unconnected panel offers a way to connect and no way to chat", async ()
   assert.equal(document.elements.toolbar.hidden, true);
   // Only OAuth: one click, or OAuth's own paste-the-code mode. No key box.
   assert.equal(document.elements.manual.placeholder ?? "Paste the code", "Paste the code");
+});
+
+test("the model picker groups the catalog, filters it, and remembers the choice", async () => {
+  const { document, local } = setUp();
+  const tools = ["tools"];
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: [
+      { id: "openrouter/free", name: "Free router", supported_parameters: tools,
+        pricing: { prompt: "0", completion: "0" } },
+      { id: "qwen/qwen3-coder:free", name: "Qwen: Qwen3 Coder (free)", supported_parameters: tools,
+        pricing: { prompt: "0", completion: "0" } },
+      { id: "anthropic/claude-sonnet-5", name: "Anthropic: Claude Sonnet 5", supported_parameters: tools,
+        pricing: { prompt: "0.000003", completion: "0.000015" } },
+    ] }),
+  });
+  await load("picker");
+  await settle();
+  const { modelName, modelMenu, modelSearch, modelList } = document.elements;
+
+  assert.equal(modelName.textContent, "Free router");
+  modelMenu.showPopover(); // what the button's popovertarget does
+
+  const shown = (name) => modelList.children.filter((node) => !node.hidden && node.classList.contains(name));
+  const groups = () => shown("group").map((node) => node.textContent);
+  const options = () => shown("option");
+  assert.deepEqual(groups(), ["Free", "Paid"]);
+  assert.deepEqual(options().map((node) => node.children[0].textContent), ["Free router", "Qwen3 Coder", "Claude Sonnet 5"]);
+  assert.match(options()[0].className, /selected/);
+
+  modelSearch.value = "sonnet";
+  modelSearch.listeners.get("input")();
+  assert.deepEqual(groups(), ["Paid"]);
+  modelSearch.listeners.get("keydown")({ key: "Enter", preventDefault() {} });
+
+  assert.equal(modelMenu.matches(":popover-open"), false);
+  assert.equal(modelName.textContent, "Claude Sonnet 5");
+  assert.equal(local.store.get("openRouterModel"), "anthropic/claude-sonnet-5");
 });
 
 test("a turn shows the tool calls it made, and what the answer cost", async () => {
@@ -389,7 +477,7 @@ test("a one-click failure reveals the manual path instead of pointing at a close
   await settle();
 
   document.elements.oauth.listeners.get("click")();
-  await settle(10);
+  await until(() => !document.elements.connectError.hidden);
   assert.equal(document.elements.connectError.hidden, false);
   assert.equal(document.elements.codePath.hidden, false);
   assert.equal(document.elements.oauth.disabled, true, "the failed button is not offered again");

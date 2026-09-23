@@ -64,7 +64,7 @@ try {
   await shot("1-conversation");
   panel = await findPanel(); log("opening menu"); await evalIn(panel, `document.getElementById("more").click(); true`); await sleep(500);
   await shot("3-menu");
-  panel = await findPanel(); await evalIn(panel, `document.getElementById("menu").hidden = true; true`);
+  panel = await findPanel(); await evalIn(panel, `document.getElementById("menu").hidePopover(); true`);
   // The consent card, staged with the panel's own markup and styles.
   await evalIn(panel, `(() => { const log = document.getElementById("log"); const node = document.createElement("div"); node.className = "confirm";
     node.innerHTML = '<div class="who">javascript — run this in the page?</div><pre>document.querySelector("h1").textContent</pre><div class="row"><button class="primary" type="button">Run it</button><button type="button">Don\\'t</button></div>';
