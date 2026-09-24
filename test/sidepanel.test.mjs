@@ -216,12 +216,22 @@ function setUp({ key = "sk-or-test", ops = async () => ({ ok: true, result: {} }
 
 const load = (label) => import(`../sidepanel.js?${label}=${Date.now()}-${Math.random()}`);
 
-/** Tick until `check` holds, for flows whose hop count is not the point. */
-async function until(check, times = 200) {
-  for (let turn = 0; turn < times && !check(); turn += 1) {
+/**
+ * Tick until `check` holds: a test waits for the state it asserts on, never
+ * for a guessed number of hops, so an extra `await` in the panel is not a
+ * failure. Returns what `check` found; throws if the state never arrives.
+ */
+async function until(check, what = String(check), times = 500) {
+  for (let turn = 0; turn < times; turn += 1) {
+    const got = check();
+    if (got) return got;
     await new Promise((resolve) => setImmediate(resolve));
   }
+  throw new Error(`never happened: ${what}`);
 }
+
+/** Clicking Send shows Stop at once; Stop hides again when the turn is over. */
+const turnEnds = (document) => until(() => document.elements.stop.hidden, "the turn ends");
 
 async function settle(times = 6) {
   for (let turn = 0; turn < times; turn += 1) {
@@ -317,7 +327,7 @@ test("a turn shows the tool calls it made, and what the answer cost", async () =
   await settle();
   document.elements.input.value = "open example.com";
   document.elements.send.listeners.get("click")();
-  await settle(40);
+  await turnEnds(document);
 
   assert.deepEqual(calls, [["open", { url: "https://example.com/" }]]);
   const shown = document.elements.log.children.map((node) => node.text);
@@ -367,15 +377,13 @@ test("page script runs only when the owner presses the card's allow button", asy
     await settle();
     document.elements.input.value = "read the title with script";
     document.elements.send.listeners.get("click")();
-    await settle(20);
-
-    const card = document.elements.log.children.find((node) => node.className === "confirm");
-    assert.ok(card, `${label}: the card is shown before anything runs`);
+    const card = await until(() => document.elements.log.children.find((node) => node.className === "confirm"),
+      `${label}: the card is shown before anything runs`);
     assert.deepEqual(runs, [], `${label}: nothing ran while the card was open`);
     assert.ok(card.text.includes("document.title"), `${label}: the card shows the exact code`);
 
     card.querySelector(".row").children[button].click();
-    await settle(20);
+    await turnEnds(document);
     assert.deepEqual(runs, expected === 1 ? ["javascript"] : [],
       `${label}: the button decided whether the op ran`);
   }
@@ -383,11 +391,13 @@ test("page script runs only when the owner presses the card's allow button", asy
 
 /** A fetch that streams nothing and ends only when its signal is aborted. */
 function hangingFetch() {
+  let started = 0;
   let aborted = 0;
   const fetch = async (url, options) => {
     if (String(url).includes("/models")) {
       return { ok: true, status: 200, json: async () => ({ data: [] }) };
     }
+    started += 1;
     return {
       ok: true,
       status: 200,
@@ -402,7 +412,7 @@ function hangingFetch() {
       json: async () => ({}),
     };
   };
-  return { fetch, count: () => aborted };
+  return { fetch, started: () => started, count: () => aborted };
 }
 
 test("pause arriving from the menu switch stops the turn in flight", async () => {
@@ -414,16 +424,15 @@ test("pause arriving from the menu switch stops the turn in flight", async () =>
   await settle();
   document.elements.input.value = "do something slow";
   document.elements.send.listeners.get("click")();
-  await settle(10);
+  await until(() => hanging.started() === 1, "the request is in flight");
   assert.equal(document.elements.stop.hidden, false, "a turn is in flight");
   assert.equal(hanging.count(), 0);
 
   storageListeners[0]({ enabled: { newValue: false } }, "local");
-  await settle(20);
+  await turnEnds(document);
 
   assert.equal(hanging.count(), 1, "the in-flight request was aborted by the pause");
   assert.equal(document.elements.paused.hidden, false);
-  assert.equal(document.elements.stop.hidden, true, "the turn ended");
   assert.ok(document.elements.log.children.some((node) => node.text.includes("Resume Ghost from the menu")));
 });
 
@@ -436,14 +445,13 @@ test("Stop aborts the request and says it is stopping until the turn ends", asyn
   await settle();
   document.elements.input.value = "do something slow";
   document.elements.send.listeners.get("click")();
-  await settle(10);
+  await until(() => hanging.started() === 1, "the request is in flight");
 
   document.elements.stop.listeners.get("click")();
   assert.equal(document.elements.stop.textContent, "Stopping…");
   assert.equal(document.elements.stop.disabled, true);
-  await settle(20);
+  await turnEnds(document);
   assert.equal(hanging.count(), 1);
-  assert.equal(document.elements.stop.hidden, true);
 });
 
 test("persisted history is cut at turn boundaries and keeps the system prompt", async () => {
@@ -477,8 +485,7 @@ test("a one-click failure reveals the manual path instead of pointing at a close
   await settle();
 
   document.elements.oauth.listeners.get("click")();
-  await until(() => !document.elements.connectError.hidden);
-  assert.equal(document.elements.connectError.hidden, false);
+  await until(() => !document.elements.connectError.hidden, "the connect error shows");
   assert.equal(document.elements.codePath.hidden, false);
   assert.equal(document.elements.oauth.disabled, true, "the failed button is not offered again");
 });
@@ -501,19 +508,16 @@ test("conversations are separate: new chat, history, delete closes that chat's t
 
   document.elements.input.value = "first";
   document.elements.send.listeners.get("click")();
-  await settle(30);
-  const first = local.store.get("localChats");
-  assert.equal(first.chats.length, 1);
-  assert.equal(first.chats[0].title, "first");
+  const titles = () => local.store.get("localChats")?.chats.map((chat) => chat.title).join();
+  await until(() => titles() === "first", "the first conversation is saved with its title");
 
   document.elements.newChat.listeners.get("click")();
   await settle();
   assert.equal(document.elements.empty.hidden, false, "a new conversation starts empty");
   document.elements.input.value = "second";
   document.elements.send.listeners.get("click")();
-  await settle(30);
+  await until(() => titles() === "second,first", "the second conversation is saved with its title");
   const both = local.store.get("localChats");
-  assert.deepEqual(both.chats.map((chat) => chat.title), ["second", "first"]);
 
   document.elements.history.listeners.get("click")();
   await settle();
@@ -526,7 +530,7 @@ test("conversations are separate: new chat, history, delete closes that chat's t
   assert.ok(document.elements.log.children.some((node) => node.text.includes("first")));
 
   document.elements.deleteChat.listeners.get("click")();
-  await settle(10);
+  await until(() => sent.some((message) => message.type === "ghost-relay-local-close"), "the workspace is closed");
   const closes = sent.filter((message) => message.type === "ghost-relay-local-close");
   assert.equal(closes.length, 1);
   assert.equal(closes[0].conversation, both.chats[1].id, "the deleted conversation's workspace is retired");
