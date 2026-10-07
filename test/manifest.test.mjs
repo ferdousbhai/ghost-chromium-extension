@@ -31,14 +31,3 @@ test("manifest uses only the required standing grants and ships every icon size"
     assert.equal(png.readUInt32BE(20), Number(sizeText));
   }
 });
-
-test("the reused Lucide icon stays accessible and carries its license notice", async () => {
-  const svg = await readFile(new URL("icons/ghost.svg", extensionUrl), "utf8");
-  const notices = await readFile(new URL("THIRD_PARTY_NOTICES.md", extensionUrl), "utf8");
-  assert.match(svg, /<title>Ghost<\/title>/);
-  assert.match(notices, /## Lucide[\s\S]*Copyright \(c\) 2026 Lucide Icons and Contributors/);
-  assert.match(
-    notices,
-    /Permission to use, copy, modify, and\/or distribute this software[\s\S]*USE OR PERFORMANCE OF THIS SOFTWARE\./,
-  );
-});

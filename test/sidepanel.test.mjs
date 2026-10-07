@@ -68,10 +68,9 @@ class FakeNode {
   }
 
   querySelector(selector) {
-    const wanted = selector.replace(".", "");
     for (const child of this.children) {
       if (!(child instanceof FakeNode)) continue;
-      if (child.className.split(" ").includes(wanted)) return child;
+      if (child.matches(selector)) return child;
       const deeper = child.querySelector(selector);
       if (deeper) return deeper;
     }
@@ -88,10 +87,9 @@ class FakeNode {
     };
   }
 
-  /** One `.class` or tag selector, up the parent chain. */
   closest(selector) {
     for (let node = this; node; node = node.parent) {
-      if (selector.startsWith(".") ? node.classList.contains(selector.slice(1)) : node.tag === selector) return node;
+      if (node.matches(selector)) return node;
     }
     return null;
   }
@@ -111,8 +109,11 @@ class FakeNode {
     this.popoverOpen = false;
   }
 
+  /** The one selector matcher: a single `.class`, tag, or `:popover-open`. */
   matches(selector) {
-    return selector === ":popover-open" && this.popoverOpen;
+    if (selector === ":popover-open") return this.popoverOpen;
+    if (selector.startsWith(".")) return this.classList.contains(selector.slice(1));
+    return this.tag === selector;
   }
 
   click() {
@@ -230,20 +231,24 @@ async function until(check, what = String(check), times = 500) {
   throw new Error(`never happened: ${what}`);
 }
 
+/**
+ * Load the panel and wait for its first paint: the connect screen or the
+ * composer, whichever the stored key calls for. Startup reads storage first.
+ */
+async function boot(label, document) {
+  const panel = await load(label);
+  await until(() => !document.elements.connect.hidden || !document.elements.composerBar.hidden, "the panel paints");
+  return panel;
+}
+
 /** Clicking Send shows Stop at once; Stop hides again when the turn is over. */
 const turnEnds = (document) => until(() => document.elements.stop.hidden, "the turn ends");
 
-async function settle(times = 6) {
-  for (let turn = 0; turn < times; turn += 1) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-}
 
 test("an unconnected panel offers a way to connect and no way to chat", async () => {
   const { document } = setUp({ key: null });
   globalThis.fetch = async () => { throw new Error("must not call OpenRouter before connecting"); };
-  await load("unconnected");
-  await settle();
+  await boot("unconnected", document);
 
   assert.equal(document.elements.connect.hidden, false);
   assert.equal(document.elements.composerBar.hidden, true);
@@ -269,8 +274,8 @@ test("the model picker groups the catalog, filters it, and remembers the choice"
     ] }),
   });
   await load("picker");
-  await settle();
   const { modelName, modelMenu, modelSearch, modelList } = document.elements;
+  await until(() => modelList.children.some((node) => node.value === "anthropic/claude-sonnet-5"), "the catalog lands");
 
   assert.equal(modelName.textContent, "Free router");
   modelMenu.showPopover(); // what the button's popovertarget does
@@ -289,7 +294,7 @@ test("the model picker groups the catalog, filters it, and remembers the choice"
 
   assert.equal(modelMenu.matches(":popover-open"), false);
   assert.equal(modelName.textContent, "Claude Sonnet 5");
-  assert.equal(local.store.get("openRouterModel"), "anthropic/claude-sonnet-5");
+  await until(() => local.store.get("openRouterModel") === "anthropic/claude-sonnet-5", "the choice is saved");
 });
 
 test("a turn shows the tool calls it made, and what the answer cost", async () => {
@@ -323,8 +328,7 @@ test("a turn shows the tool calls it made, and what the answer cost", async () =
     };
   };
 
-  await load("turn");
-  await settle();
+  await boot("turn", document);
   document.elements.input.value = "open example.com";
   document.elements.send.listeners.get("click")();
   await turnEnds(document);
@@ -373,8 +377,7 @@ test("page script runs only when the owner presses the card's allow button", asy
       };
     };
 
-    await load(`confirm-${label}`);
-    await settle();
+    await boot(`confirm-${label}`, document);
     document.elements.input.value = "read the title with script";
     document.elements.send.listeners.get("click")();
     const card = await until(() => document.elements.log.children.find((node) => node.className === "confirm"),
@@ -420,8 +423,7 @@ test("pause arriving from the menu switch stops the turn in flight", async () =>
   const hanging = hangingFetch();
   globalThis.fetch = hanging.fetch;
 
-  await load("paused");
-  await settle();
+  await boot("paused", document);
   document.elements.input.value = "do something slow";
   document.elements.send.listeners.get("click")();
   await until(() => hanging.started() === 1, "the request is in flight");
@@ -441,8 +443,7 @@ test("Stop aborts the request and says it is stopping until the turn ends", asyn
   const hanging = hangingFetch();
   globalThis.fetch = hanging.fetch;
 
-  await load("stop");
-  await settle();
+  await boot("stop", document);
   document.elements.input.value = "do something slow";
   document.elements.send.listeners.get("click")();
   await until(() => hanging.started() === 1, "the request is in flight");
@@ -481,8 +482,7 @@ test("a one-click failure reveals the manual path instead of pointing at a close
   const { document } = setUp({ key: null });
   chrome.identity.launchWebAuthFlow = async () => "https://abc.chromiumapp.org/?error=denied";
   globalThis.fetch = async () => { throw new Error("must not be reached"); };
-  await load("oauth-failure");
-  await settle();
+  await boot("oauth-failure", document);
 
   document.elements.oauth.listeners.get("click")();
   await until(() => !document.elements.connectError.hidden, "the connect error shows");
@@ -503,8 +503,7 @@ test("conversations are separate: new chat, history, delete closes that chat's t
       json: async () => ({}),
     };
   };
-  await load("conversations");
-  await settle();
+  await boot("conversations", document);
 
   document.elements.input.value = "first";
   document.elements.send.listeners.get("click")();
@@ -512,7 +511,6 @@ test("conversations are separate: new chat, history, delete closes that chat's t
   await until(() => titles() === "first", "the first conversation is saved with its title");
 
   document.elements.newChat.listeners.get("click")();
-  await settle();
   assert.equal(document.elements.empty.hidden, false, "a new conversation starts empty");
   document.elements.input.value = "second";
   document.elements.send.listeners.get("click")();
@@ -520,12 +518,10 @@ test("conversations are separate: new chat, history, delete closes that chat's t
   const both = local.store.get("localChats");
 
   document.elements.history.listeners.get("click")();
-  await settle();
   assert.equal(document.elements.historyList.hidden, false);
   const rows = document.elements.historyList.children.filter((node) => node.tag === "button");
   assert.deepEqual(rows.map((row) => row.text), ["secondnow", "firstnow"]);
   rows[1].click();
-  await settle();
   assert.equal(document.elements.historyList.hidden, true);
   assert.ok(document.elements.log.children.some((node) => node.text.includes("first")));
 
@@ -540,40 +536,34 @@ test("conversations are separate: new chat, history, delete closes that chat's t
 test("disconnect forgets the key and puts the connect panel back", async () => {
   const { document, local } = setUp();
   globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) });
-  await load("disconnect");
-  await settle();
+  await boot("disconnect", document);
   assert.equal(document.elements.connect.hidden, true);
 
   document.elements.disconnect.listeners.get("click")();
-  await settle();
+  await until(() => !document.elements.connect.hidden, "the connect panel returns");
 
   assert.equal(local.store.has("openRouterKey"), false);
-  assert.equal(document.elements.connect.hidden, false);
   assert.equal(document.elements.composerBar.hidden, true);
 });
 
 test("the menu pauses Ghost, and the pairing screen shows the code the HUD shows", async () => {
   const { document, sent } = setUp();
   globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) });
-  await load("menu");
-  await settle();
+  await boot("menu", document);
 
   assert.equal(document.elements.pauseToggle.textContent, "Pause Ghost");
   document.elements.pauseToggle.listeners.get("click")();
-  await settle();
-  const update = sent.find((message) => message.type === "ghost-relay-settings-update");
+  const update = await until(() => sent.find((message) => message.type === "ghost-relay-settings-update"), "the pause is sent");
   assert.deepEqual(update.settings, { enabled: false }, "pause is the same switch the ghost obeys");
 
   document.elements.ghostMachine.listeners.get("click")();
-  await settle();
+  await until(() => document.elements.pairCode.textContent === "246 810", "the pairing code shows");
   assert.equal(document.elements.ghostView.hidden, false);
   assert.equal(document.elements.composerBar.hidden, true);
   assert.equal(document.elements.statusText.textContent, "Not paired");
-  assert.equal(document.elements.pairCode.textContent, "246 810");
   assert.equal(document.elements.pair.hidden, false);
 
   document.elements.ghostBack.listeners.get("click")();
-  await settle();
   assert.equal(document.elements.ghostView.hidden, true);
   assert.equal(document.elements.composerBar.hidden, false);
 });

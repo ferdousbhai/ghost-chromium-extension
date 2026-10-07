@@ -776,7 +776,7 @@ ui.input.addEventListener("input", () => {
 });
 // Both popovers are native (`popover` + `popovertarget`): the browser opens
 // them, closes one when the other opens, and dismisses on Escape or a click
-// elsewhere. The picker only fills itself as it opens.
+// elsewhere. Opening the picker clears the search, so every row shows.
 ui.modelMenu.addEventListener("beforetoggle", (event) => {
   if (event.newState !== "open") return;
   ui.modelSearch.value = "";
