@@ -56,11 +56,11 @@ if (!local && ghostRepo === null) {
 const ghostModule = (path) => import(join(ghostRepo ?? "", path));
 const { RelayHub, attachRelay } = local ? {} : await ghostModule("packages/daemon/dist/relay.js");
 const {
-  browserSessionFor,
   closeAllBrowserSessions = async () => {},
   closeBrowserSession,
   relayBackend,
 } = local ? {} : await ghostModule("packages/extensions/dist/index.js");
+const { browserSessionFor } = local ? {} : await ghostModule("packages/extensions/dist/extensions/browser-session.js");
 const { createServer } = await import("node:http");
 
 const TOKEN = "0123456789abcdef".repeat(4);
@@ -87,11 +87,10 @@ const bodyDone = new Promise((resolve) => { resolveBodyDone = resolve; });
 const signalRequested = new Promise((resolve) => { resolveSignalRequested = resolve; });
 
 /**
- * A page to type into, served from loopback.
+ * Controlled navigation and typing pages, served from loopback.
  *
- * `type` is the one verb a public page cannot exercise honestly — a real search
- * box means a network round trip and someone else's markup changing under the
- * test. This one is three inputs and a form, and it proves the parts that are
+ * Public pages add network failures and markup changes to input assertions.
+ * This fixture supplies a link and a form, and it proves the parts that are
  * genuinely hard: `Input.insertText` into a focused field, the native-setter
  * clear that a controlled input will believe, and Enter actually submitting.
  */
@@ -103,6 +102,7 @@ const FIXTURE_HTML = `<!doctype html><meta charset=utf-8><title>Relay fixture</t
   <button type="submit">Go</button>
 </form>
 <p id="note">A page with a field in it.</p>
+<a href="?clicked=1">Learn more</a>
 </body>`;
 
 async function findChromium() {
@@ -391,7 +391,6 @@ async function ghostSmoke(binary) {
   //    bookkeeping, and the read budget are all in the path.
   const sessionOptions = {
     backend: relayBackend({ transport: hub }),
-    idleTimeoutMs: 0,
     actionTimeoutMs: 30_000,
     // The typing step below serves its own fixture on loopback rather than
     // asserting against someone else's search page, and the URL policy refuses
@@ -401,43 +400,6 @@ async function ghostSmoke(binary) {
   throwIfSignalRequested();
   const session = browserSessionFor(ghostHome, sessionOptions);
 
-  const opened = await session.open("https://example.com");
-  record("open", opened.url.includes("example.com"), `${opened.url} — ${opened.title}`);
-
-  const read = await session.read({ maxChars: 400 });
-  record(
-    "read",
-    read.text.toLowerCase().includes("documentation examples"),
-    `${read.totalLength} chars, title ${JSON.stringify(read.title)}`,
-  );
-
-  // `find` answers with the page it searched alongside the matches, so the model
-  // is told where the refs came from; the matches are one field of that.
-  const { matches } = await session.find("Learn more", { limit: 5 });
-  record(
-    "find",
-    matches.length > 0 && matches[0].ref === "e1",
-    matches.map((m) => `${m.ref}<${m.tag}> ${JSON.stringify(m.text.slice(0, 30))}`).join(", "),
-  );
-
-  const clicked = await session.click({ ref: "e1" });
-  record("click a link", clicked.url !== opened.url, `now at ${clicked.url}`);
-
-  const shot = await session.screenshot();
-  const bytes = (await readFile(shot.path)).length;
-  const isPng = (await readFile(shot.path)).subarray(0, 8)
-    .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
-  record(
-    "screenshot",
-    isPng && bytes > 1000,
-    `${bytes} bytes of temporary PNG at ${shot.path}`,
-  );
-
-  const back = await session.back();
-  record("back", back.moved && back.url.includes("example.com"), `${back.url}`);
-
-  // 5. Typing, against a local fixture so the assertion is about the relay and
-  //    not about someone else's search page.
   throwIfSignalRequested();
   fixtureServer = createServer((request, response) => {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -451,12 +413,49 @@ async function ghostSmoke(binary) {
   throwIfSignalRequested();
   const fixtureUrl = `http://127.0.0.1:${fixtureServer.address().port}/`;
 
+  const opened = await session.open(fixtureUrl);
+  record("open", opened.url === fixtureUrl, `${opened.url} — ${opened.title}`);
+
+  const read = await session.read({ maxChars: 400 });
+  record(
+    "read",
+    read.text.includes("A page with a field"),
+    `${read.totalLength} chars, title ${JSON.stringify(read.title)}`,
+  );
+
+  // `find` answers with the page it searched alongside the matches, so the model
+  // is told where the refs came from; the matches are one field of that.
+  const { matches } = await session.find("Learn more", { limit: 5 });
+  record(
+    "find",
+    matches.length > 0 && typeof matches[0].ref === "string",
+    matches.map((m) => `${m.ref}<${m.tag}> ${JSON.stringify(m.text.slice(0, 30))}`).join(", "),
+  );
+
+  const clicked = await session.click({ ref: matches[0].ref });
+  record("click a link", clicked.url !== opened.url, `now at ${clicked.url}`);
+
+  const shot = await session.screenshot();
+  const bytes = (await readFile(shot.path)).length;
+  const isPng = (await readFile(shot.path)).subarray(0, 8)
+    .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  record(
+    "screenshot",
+    isPng && bytes > 1000,
+    `${bytes} bytes of temporary PNG at ${shot.path}`,
+  );
+
+  const back = await session.back();
+  record("back", back.moved && back.url === fixtureUrl, `${back.url}`);
+
+  // 5. Typing, against a local fixture so the assertion is about the relay and
+  //    not about someone else's search page.
   await session.open(fixtureUrl, { allowLocal: true });
   const { matches: fields } = await session.find("input#q", { limit: 3 });
   record("find a field by selector", fields.length === 1 && fields[0].value === "prefilled text",
     fields.map((m) => `${m.ref}<${m.tag}> value=${JSON.stringify(m.value ?? "")}`).join(", "));
 
-  const typed = await session.type({ ref: "e1", text: "letterpress", submit: false });
+  const typed = await session.type({ ref: fields[0].ref, text: "letterpress", submit: false });
   const { matches: afterType } = await session.find("input#q", { limit: 1 });
   record(
     "type replaces the field's value",
@@ -464,7 +463,7 @@ async function ghostSmoke(binary) {
     `value is now ${JSON.stringify(afterType[0]?.value ?? "")}`,
   );
 
-  const submitted = await session.type({ ref: "e1", text: "typewriter", submit: true });
+  const submitted = await session.type({ ref: afterType[0].ref, text: "typewriter", submit: true });
   record(
     "submit with Enter",
     submitted.submitted && submitted.url.includes("q=typewriter"),
