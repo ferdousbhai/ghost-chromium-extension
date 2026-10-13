@@ -58,6 +58,21 @@ cancel frame, and the extension does not pretend a late CDP command was aborted.
 `randomUUID()` per ghost, and `close` retires that id permanently. Tabs are
 isolated per workspace, and a workspace never sees another's tabs.
 
+`find` refs identify elements in their document's isolated world. Repeated finds
+reuse a surviving element's ref and assign distinct refs to new elements; an
+empty find does not invalidate earlier refs. Each document has a random ref
+prefix, so navigation, including a same-URL reload, cannot reuse an earlier
+document's refs. Navigation destroys that registry.
+Ref-targeted operations require the original element to remain connected to its
+document; detached elements are stale even while JavaScript still retains them.
+Operations resolve that element or report it stale, never
+reuse its ref for another element in that document. Typing requires focus on the
+target itself before clearing, including contenteditable fields. After clearing
+fires input handlers, the target must remain connected and focused before text
+insertion is authorized. Only writable, enabled text controls (textarea and
+input types text/search/tel/url/email/password/number) or contenteditable surfaces
+are cleared; other input types and readonly controls are refused unchanged.
+
 ## What is not on the wire
 
 The side panel's own agent uses the same ops through the same `ops.js`, in a

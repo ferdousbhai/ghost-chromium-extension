@@ -28,7 +28,7 @@
  * oh-my-pi, hardened into the isolated world.
  *
  * Resolution goes straight through `byRef` (a `WeakRef`), then verifies the node
- * is still the exact one `find` minted the ref for and still the tag it described,
+ * is still connected, the exact one `find` minted the ref for and the tag it described,
  * before anyone acts on it. That rejects a collected, different, or tag-changed
  * node; it cannot detect a page semantically changing the same surviving same-tag
  * element, which remains ordinary live-DOM behavior.
@@ -169,6 +169,13 @@ const REGISTRY = `
       reg = { v: 1, byEl: new WeakMap(), byRef: new Map() };
       globalThis.__ghostRegistry = reg;
     }
+    // Namespacing prevents a reload at the same URL from giving a new element
+    // an old document's ref. getRandomValues is available on HTTP pages too.
+    if (!reg.prefix) {
+      const nonce = crypto.getRandomValues(new Uint8Array(16));
+      reg.prefix = "e" + Array.from(nonce, (byte) => byte.toString(16).padStart(2, "0")).join("") + ":";
+      reg.nextRef = 1;
+    }
     return reg;
   };
   const ghostResolveRef = (ref) => {
@@ -178,9 +185,9 @@ const REGISTRY = `
     const el = entry.el.deref();
     // The node must still be alive, still carry this exact ref, and still be the
     // tag find described. A page cannot forge an entry here — the table is in
-    // this isolated world. A collected, different, or tag-changed node is stale;
+    // this isolated world. A collected, detached, different, or tag-changed node is stale;
     // the same surviving same-tag node remains live even if its meaning changed.
-    if (!el || reg.byEl.get(el) !== ref) return null;
+    if (!el || !el.isConnected || reg.byEl.get(el) !== ref) return null;
     if (el.tagName.toLowerCase() !== entry.tag) return null;
     return el;
   };
@@ -208,19 +215,14 @@ export const READ_PAGE_SCRIPT = `() => {
 /**
  * Find elements by CSS selector, or — when the query is not a selector that matches
  * anything — by visible text and accessible attributes. Same two-pass strategy and
- * same "deepest text match only" rule the session layer's refs assume, so `e1` means the
+ * same "deepest text match only" rule the session layer's refs assume, so an element ref means the
  * same thing to the model in either mode.
  */
 export const FIND_ELEMENTS_SCRIPT = `({ query, limit }) => {
   ${WALK}
   ${DESCRIBE}
   ${REGISTRY}
-  // Each find is the new truth: replace the whole table so a ref the last find
-  // minted can never resolve again. It lives in this isolated world, so the page
-  // cannot pre-seed a ref to steal a later click.
   const reg = ghostRegistry();
-  reg.byEl = new WeakMap();
-  reg.byRef = new Map();
 
   const resultLimit = Math.min(
     ${MAX_FIND_RESULTS},
@@ -231,7 +233,8 @@ export const FIND_ELEMENTS_SCRIPT = `({ query, limit }) => {
   const describe = (el, cachedText) => {
     if (!el || seen.has(el) || results.length >= resultLimit) return;
     seen.add(el);
-    const ref = "e" + (results.length + 1);
+    let ref = reg.byEl.get(el);
+    if (!ref) ref = reg.prefix + reg.nextRef++;
     const described = ghostDescribe(el, ref, cachedText);
     reg.byEl.set(el, ref);
     reg.byRef.set(ref, { el: new WeakRef(el), tag: described.tag });
@@ -421,24 +424,38 @@ export const FOCUS_AND_CLEAR_SCRIPT = `({ ref, selector }) => {
   if (tag === "select") {
     return { found: true, editable: false, reason: "select", tag };
   }
+  const textInput = tag === "input"
+    && ["text", "search", "tel", "url", "email", "password", "number"].includes(el.type);
+  const textControl = textInput || tag === "textarea";
+  if ((tag === "input" && !textInput) || (!textControl && !el.isContentEditable)) {
+    return { found: true, editable: false, reason: "not-a-field", tag };
+  }
+  if (textControl && el.readOnly) {
+    return { found: true, editable: false, reason: "readonly", tag };
+  }
+  if (el.disabled) {
+    return { found: true, editable: false, reason: "disabled", tag };
+  }
   try { el.focus({ preventScroll: false }); } catch {}
   // For an element inside an open shadow root, document.activeElement is the
   // host; the element's own root reports the real focus target.
-  if (el.getRootNode().activeElement !== el && !el.isContentEditable) {
+  if (el.getRootNode().activeElement !== el) {
     return { found: true, editable: false, reason: "not-focusable", tag };
   }
 
-  if (typeof el.value === "string") {
+  if (textControl) {
     const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
     if (setter) setter.call(el, "");
     else el.value = "";
     el.dispatchEvent(new Event("input", { bubbles: true }));
-  } else if (el.isContentEditable) {
+  } else {
     el.textContent = "";
     el.dispatchEvent(new Event("input", { bubbles: true }));
-  } else {
-    return { found: true, editable: false, reason: "not-a-field", tag };
+  }
+  // Clearing dispatches page handlers, which can move focus or remove the field.
+  if (!el.isConnected || el.getRootNode().activeElement !== el) {
+    return { found: true, editable: false, reason: "not-focusable", tag };
   }
   return { found: true, editable: true, tag };
 }`;

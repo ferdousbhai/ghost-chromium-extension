@@ -28,7 +28,7 @@ check the dashboard you never log out of.
 
 ```
 ghost tool call                      (in github.com/ferdousbhai/ghost)
-  → GhostBrowserSession        url policy, ref bookkeeping, read budget, idle timer
+  → GhostBrowserSession        url policy, ref bookkeeping, read budget, explicit close
     → RelayBrowserBackend      packages/extensions/.../browser-relay-backend.ts
       → RelayHub               packages/daemon/src/relay.ts, ws://127.0.0.1:7717/relay
         → this extension       background.js dials OUT, ops.js drives the named tab
@@ -317,14 +317,16 @@ keeps the ghost's workspace intact.
 
 ## Element refs
 
-`find` mints `e1`, `e2`, … without writing attributes or expandos onto the
-owner's DOM. Its isolated world keeps element → ref in a `WeakMap` and ref →
+`find` mints opaque document-prefixed refs without writing attributes or expandos
+onto the owner's DOM. Its isolated world keeps element → ref in a `WeakMap` and ref →
 element in a `Map` of `WeakRef` records. Resolution is an O(1) lookup followed by
-identity and tag checks: a collected, different, or tag-changed node cannot take
+connectivity, identity and tag checks: a collected, detached, different, or
+tag-changed node cannot take
 over a ref. A page can still semantically change the same surviving same-tag
-element, as with any live DOM. Each `find` replaces the registry, and navigation
-destroys the isolated world; only refs from the current results on the current
-document resolve.
+element, as with any live DOM. Repeated finds reuse each element's ref and mint
+unique ids for new elements; empty finds preserve earlier refs. Navigation
+destroys the isolated world; a random document prefix prevents stale refs from
+resolving after a reload at the same URL.
 
 The relay keeps `find` bounded by walking at most 10,000 elements and returning
 at most 100. Its CSS-selector path deliberately rejects `:scope`, the CSS nesting

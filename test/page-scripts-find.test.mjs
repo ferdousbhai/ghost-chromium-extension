@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import vm from "node:vm";
 import { test } from "node:test";
 
 import {
   callScript,
   FIND_ELEMENTS_SCRIPT,
+  FOCUS_AND_CLEAR_SCRIPT,
   MAX_FIND_RESULTS,
   MAX_FIND_SCAN_ELEMENTS,
+  RESOLVE_NODE_SCRIPT,
   unsupportedFindSyntax,
 } from "../page-scripts.js";
 
@@ -17,6 +20,9 @@ class FakeElement {
     this.attributes = attributes;
     this.children = children;
     this.disabled = false;
+    this.readOnly = false;
+    this.type = attributes.type ?? "text";
+    this.isConnected = true;
     this.shadowRoot = null;
     this.selectors = new Set(selectors);
     this.textReads = 0;
@@ -32,6 +38,10 @@ class FakeElement {
 
   get textContent() {
     return this._text;
+  }
+
+  set textContent(text) {
+    this._text = text;
   }
 
   getAttribute(name) {
@@ -53,7 +63,7 @@ class FakeElement {
   }
 }
 
-function runFind(elements, query, limit) {
+function createPage(elements, url = "http://example.test/") {
   let walkerCreations = 0;
   const document = {
     documentElement: elements[0] ?? null,
@@ -79,11 +89,21 @@ function runFind(elements, query, limit) {
       return { visibility: "visible", display: "block" };
     },
   };
-  const result = vm.runInNewContext(
-    callScript(FIND_ELEMENTS_SCRIPT, { query, limit }),
-    { document, window },
-  );
-  return { result, walkerCreations };
+  const context = vm.createContext({ document, window, crypto: webcrypto, location: { href: url } });
+  return {
+    find(query, limit) {
+      const result = vm.runInContext(callScript(FIND_ELEMENTS_SCRIPT, { query, limit }), context);
+      return { result, walkerCreations };
+    },
+    resolve(ref) {
+      return vm.runInContext(callScript(RESOLVE_NODE_SCRIPT, { ref }), context);
+    },
+    context,
+  };
+}
+
+function runFind(elements, query, limit) {
+  return createPage(elements).find(query, limit);
 }
 
 test("text find keeps ordering and reads layout-backed text once per element", () => {
@@ -101,12 +121,12 @@ test("text find keeps ordering and reads layout-backed text once per element", (
 
   assert.equal(walkerCreations, 1);
   assert.deepEqual(
-    Array.from(result, ({ ref, tag, text, name }) => ({ ref, tag, text, name })),
+    Array.from(result, ({ tag, text, name }) => ({ tag, text, name })),
     [
-      { ref: "e1", tag: "button", text: "Needle action", name: undefined },
-      { ref: "e2", tag: "input", text: "", name: "Needle field" },
-      { ref: "e3", tag: "span", text: "Needle child", name: undefined },
-      { ref: "e4", tag: "p", text: "Needle copy", name: undefined },
+      { tag: "button", text: "Needle action", name: undefined },
+      { tag: "input", text: "", name: "Needle field" },
+      { tag: "span", text: "Needle child", name: undefined },
+      { tag: "p", text: "Needle copy", name: undefined },
     ],
   );
   assert.equal(parent.rectReads, 0, "a non-result must not pay geometry/style layout cost");
@@ -198,4 +218,180 @@ test("shadow traversal keeps recursive order and shares one visit budget", () =>
   );
   assert.equal(shadowMatches.at(-1).textReads, 1);
   assert.equal(afterHost.textReads, 0, "the document walker must share the shadow visit budget");
+});
+
+
+test("successive and empty finds preserve unique refs for the original elements", () => {
+  const button = new FakeElement("button", "Save");
+  const field = new FakeElement("input", "", { value: "" });
+  const link = new FakeElement("a", "Help");
+  const page = createPage([button, field, link]);
+  const first = page.find("button", 20).result;
+  assert.match(first[0].ref, /^e[0-9a-f]{32}:1$/);
+  const second = page.find("input", 20).result;
+  assert.match(second[0].ref, /^e[0-9a-f]{32}:2$/);
+  assert.notEqual(first[0].ref, second[0].ref);
+  assert.equal(page.find("missing text", 20).result.length, 0);
+  assert.equal(page.resolve(first[0].ref), button);
+  assert.equal(page.resolve(second[0].ref), field);
+  assert.equal(page.find("button", 20).result[0].ref, first[0].ref);
+  const third = page.find("a", 20).result[0].ref;
+  assert.match(third, /^e[0-9a-f]{32}:3$/);
+  assert.equal(page.resolve(third), link);
+  assert.equal(page.resolve("e999"), null);
+  const registry = vm.runInContext("globalThis.__ghostRegistry", page.context);
+  assert.equal(registry.byRef.get(first[0].ref).el.deref(), button);
+  assert.equal(Object.hasOwn(button, "__ghostRef"), false);
+});
+
+test("an existing registry preserves legacy refs and namespaces new refs after code reload", () => {
+  const button = new FakeElement("button", "Save");
+  const field = new FakeElement("input", "");
+  const page = createPage([button, field]);
+  page.context.legacyElement = button;
+  vm.runInContext(`globalThis.__ghostRegistry = {
+    v: 1,
+    byEl: new WeakMap([[legacyElement, "e1"]]),
+    byRef: new Map([["e1", { el: new WeakRef(legacyElement), tag: "button" }]]),
+  }`, page.context);
+  const ref = page.find("input", 20).result[0].ref;
+  assert.match(ref, /^e[0-9a-f]{32}:1$/);
+  assert.equal(page.resolve("e1"), button);
+  assert.equal(page.resolve(ref), field);
+  assert.equal(page.find("button", 20).result[0].ref, "e1");
+});
+
+test("a same-URL reload cannot resolve an earlier document's ref to its new element", () => {
+  const url = "http://example.test/same-page";
+  const before = new FakeElement("button", "Save");
+  const after = new FakeElement("button", "Delete");
+  const firstPage = createPage([before], url);
+  const secondPage = createPage([after], url);
+  const oldRef = firstPage.find("button", 20).result[0].ref;
+  const newRef = secondPage.find("button", 20).result[0].ref;
+  assert.notEqual(oldRef, newRef);
+  assert.equal(firstPage.resolve(oldRef), before);
+  assert.equal(secondPage.resolve(oldRef), null);
+  assert.equal(secondPage.resolve(newRef), after);
+});
+
+
+test("detached refs are stale before focus, including contenteditable fields", () => {
+  const editor = new FakeElement("div", "Draft", { attributes: { contenteditable: "true" } });
+  editor.isContentEditable = true;
+  editor.focus = () => { throw new Error("detached contenteditable must never be focused"); };
+  const upload = new FakeElement("input", "", { attributes: { type: "file" } });
+  const page = createPage([editor, upload]);
+  const editorRef = page.find("div", 20).result[0].ref;
+  const uploadRef = page.find("input", 20).result[0].ref;
+  assert.equal(page.resolve(editorRef), editor);
+  assert.equal(page.resolve(uploadRef), upload);
+
+  editor.isConnected = false;
+  upload.isConnected = false;
+  assert.equal(page.resolve(editorRef), null);
+  assert.equal(page.resolve(uploadRef), null);
+  const focused = vm.runInContext(callScript(FOCUS_AND_CLEAR_SCRIPT, { ref: editorRef }), page.context);
+  assert.equal(focused.found, false);
+  assert.equal(focused.reason, "stale-ref");
+  assert.equal(editor.textContent, "Draft");
+});
+
+
+test("contenteditable must own focus itself before clearing its descendants", () => {
+  const editor = new FakeElement("div", "Draft");
+  editor.value = "component metadata";
+  editor.isContentEditable = true;
+  editor.focus = () => {};
+  const root = { activeElement: new FakeElement("input", "Unrelated") };
+  editor.getRootNode = () => root;
+  const descendant = new FakeElement("span", "Draft child");
+  editor.contains = (element) => element === descendant;
+  let events = 0;
+  editor.dispatchEvent = () => { events += 1; };
+  const page = createPage([editor]);
+  page.context.Event = class { constructor(type) { this.type = type; } };
+  const ref = page.find("div", 20).result[0].ref;
+  const failed = vm.runInContext(callScript(FOCUS_AND_CLEAR_SCRIPT, { ref }), page.context);
+  assert.equal(failed.found, true);
+  assert.equal(failed.editable, false);
+  assert.equal(failed.reason, "not-focusable");
+  assert.equal(editor.textContent, "Draft");
+  assert.equal(events, 0);
+
+  root.activeElement = descendant;
+  const descendantFocused = vm.runInContext(callScript(FOCUS_AND_CLEAR_SCRIPT, { ref }), page.context);
+  assert.equal(descendantFocused.editable, false);
+  assert.equal(descendantFocused.reason, "not-focusable");
+  assert.equal(editor.textContent, "Draft");
+  assert.equal(events, 0);
+
+  root.activeElement = editor;
+  const succeeded = vm.runInContext(callScript(FOCUS_AND_CLEAR_SCRIPT, { ref }), page.context);
+  assert.equal(succeeded.editable, true);
+  assert.equal(editor.textContent, "");
+  assert.equal(events, 1);
+  assert.equal(editor.value, "component metadata");
+});
+
+
+test("clearing a field must not authorize typing after an input handler redirects focus", () => {
+  const editor = new FakeElement("div", "Draft");
+  editor.isContentEditable = true;
+  editor.focus = () => {};
+  const root = { activeElement: editor };
+  editor.getRootNode = () => root;
+  editor.dispatchEvent = () => { root.activeElement = new FakeElement("input", "Unrelated"); };
+  const page = createPage([editor]);
+  page.context.Event = class { constructor(type) { this.type = type; } };
+  const ref = page.find("div", 20).result[0].ref;
+  const result = vm.runInContext(callScript(FOCUS_AND_CLEAR_SCRIPT, { ref }), page.context);
+  assert.equal(editor.textContent, "");
+  assert.equal(result.editable, false);
+  assert.equal(result.reason, "not-focusable");
+});
+
+
+for (const tag of ["input", "textarea"]) {
+  test(`readonly ${tag} is rejected before focus or clearing`, () => {
+    const field = new FakeElement(tag, "", { value: "Keep this" });
+    field.readOnly = true;
+    field.focus = () => { throw new Error("readonly field must not be focused"); };
+    field.dispatchEvent = () => { throw new Error("readonly field must not dispatch input"); };
+    const page = createPage([field]);
+    const ref = page.find(tag, 20).result[0].ref;
+    const result = vm.runInContext(callScript(FOCUS_AND_CLEAR_SCRIPT, { ref }), page.context);
+    assert.equal(result.editable, false);
+    assert.equal(result.reason, "readonly");
+    assert.equal(field.value, "Keep this");
+  });
+}
+
+for (const type of ["checkbox", "radio", "button", "submit", "reset", "file", "hidden", "image", "color", "range", "date", "datetime-local", "month", "time", "week"]) {
+  test(`non-text input type ${type} is rejected without invoking its setter`, () => {
+    const field = new FakeElement("input", "", { attributes: { type } });
+    Object.defineProperty(field, "value", {
+      get: () => "Keep this",
+      set: () => { throw new Error("non-text value setter must never be called"); },
+    });
+    field.focus = () => { throw new Error("non-text input must not be focused"); };
+    const page = createPage([field]);
+    const ref = page.find("input", 20).result[0].ref;
+    const result = vm.runInContext(callScript(FOCUS_AND_CLEAR_SCRIPT, { ref }), page.context);
+    assert.equal(result.editable, false);
+    assert.equal(result.reason, "not-a-field");
+    assert.equal(field.value, "Keep this");
+  });
+}
+
+test("disabled text field is rejected before clearing", () => {
+  const field = new FakeElement("input", "", { value: "Keep this" });
+  field.disabled = true;
+  field.focus = () => { throw new Error("disabled field must not be focused"); };
+  const page = createPage([field]);
+  const ref = page.find("input", 20).result[0].ref;
+  const result = vm.runInContext(callScript(FOCUS_AND_CLEAR_SCRIPT, { ref }), page.context);
+  assert.equal(result.editable, false);
+  assert.equal(result.reason, "disabled");
+  assert.equal(field.value, "Keep this");
 });
