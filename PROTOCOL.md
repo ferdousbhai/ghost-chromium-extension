@@ -72,6 +72,8 @@ fires input handlers, the target must remain connected and focused before text
 insertion is authorized. Only writable, enabled text controls (textarea and
 input types text/search/tel/url/email/password/number) or contenteditable surfaces
 are cleared; other input types and readonly controls are refused unchanged.
+Writable state is rechecked after focus handlers, before clearing, and after
+input handlers, before authorizing insertion.
 
 ## What is not on the wire
 

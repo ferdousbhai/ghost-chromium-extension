@@ -421,26 +421,24 @@ export const FOCUS_AND_CLEAR_SCRIPT = `({ ref, selector }) => {
   if (!el) return { found: false, reason: ref ? "stale-ref" : "no-match" };
 
   const tag = el.tagName.toLowerCase();
-  if (tag === "select") {
-    return { found: true, editable: false, reason: "select", tag };
-  }
-  const textInput = tag === "input"
-    && ["text", "search", "tel", "url", "email", "password", "number"].includes(el.type);
-  const textControl = textInput || tag === "textarea";
-  if ((tag === "input" && !textInput) || (!textControl && !el.isContentEditable)) {
-    return { found: true, editable: false, reason: "not-a-field", tag };
-  }
-  if (textControl && el.readOnly) {
-    return { found: true, editable: false, reason: "readonly", tag };
-  }
-  if (el.disabled) {
-    return { found: true, editable: false, reason: "disabled", tag };
-  }
+  const textControl = tag === "input" || tag === "textarea";
+  const fieldProblem = () => {
+    if (tag === "select") return "select";
+    if ((tag === "input" && !["text", "search", "tel", "url", "email", "password", "number"].includes(el.type))
+      || (!textControl && !el.isContentEditable)) return "not-a-field";
+    if (textControl && el.readOnly) return "readonly";
+    if (el.disabled) return "disabled";
+    if (!el.isConnected) return "not-focusable";
+    return null;
+  };
+  let problem = fieldProblem();
+  if (problem) return { found: true, editable: false, reason: problem, tag };
   try { el.focus({ preventScroll: false }); } catch {}
   // For an element inside an open shadow root, document.activeElement is the
   // host; the element's own root reports the real focus target.
-  if (el.getRootNode().activeElement !== el) {
-    return { found: true, editable: false, reason: "not-focusable", tag };
+  problem = fieldProblem();
+  if (problem || el.getRootNode().activeElement !== el) {
+    return { found: true, editable: false, reason: problem || "not-focusable", tag };
   }
 
   if (textControl) {
@@ -453,9 +451,10 @@ export const FOCUS_AND_CLEAR_SCRIPT = `({ ref, selector }) => {
     el.textContent = "";
     el.dispatchEvent(new Event("input", { bubbles: true }));
   }
-  // Clearing dispatches page handlers, which can move focus or remove the field.
-  if (!el.isConnected || el.getRootNode().activeElement !== el) {
-    return { found: true, editable: false, reason: "not-focusable", tag };
+  // Clearing dispatches page handlers, which can move focus or change the field.
+  problem = fieldProblem();
+  if (problem || el.getRootNode().activeElement !== el) {
+    return { found: true, editable: false, reason: problem || "not-focusable", tag };
   }
   return { found: true, editable: true, tag };
 }`;

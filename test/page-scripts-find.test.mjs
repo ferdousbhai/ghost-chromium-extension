@@ -395,3 +395,39 @@ test("disabled text field is rejected before clearing", () => {
   assert.equal(result.reason, "disabled");
   assert.equal(field.value, "Keep this");
 });
+
+
+for (const phase of ["focus", "input"]) {
+  for (const [property, value, reason] of [
+    ["readOnly", true, "readonly"],
+    ["disabled", true, "disabled"],
+    ["type", "file", "not-a-field"],
+  ]) {
+    test(`${property} changed by ${phase} handler is revalidated before further mutation`, () => {
+      const field = new FakeElement("input", "", { value: "Keep this" });
+      const root = { activeElement: field };
+      field.getRootNode = () => root;
+      field.focus = () => { if (phase === "focus") field[property] = value; };
+      let events = 0;
+      field.dispatchEvent = () => {
+        events += 1;
+        if (phase === "input") field[property] = value;
+      };
+      const page = createPage([field]);
+      let setters = 0;
+      class NativeInput {}
+      Object.defineProperty(NativeInput.prototype, "value", {
+        set(value) { setters += 1; this.value = value; },
+      });
+      page.context.HTMLInputElement = NativeInput;
+      page.context.Event = class { constructor(type) { this.type = type; } };
+      const ref = page.find("input", 20).result[0].ref;
+      const result = vm.runInContext(callScript(FOCUS_AND_CLEAR_SCRIPT, { ref }), page.context);
+      assert.equal(result.editable, false);
+      assert.equal(result.reason, reason);
+      assert.equal(setters, phase === "focus" ? 0 : 1);
+      assert.equal(events, phase === "focus" ? 0 : 1);
+      assert.equal(field.value, phase === "focus" ? "Keep this" : "");
+    });
+  }
+}
