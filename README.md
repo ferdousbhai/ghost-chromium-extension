@@ -1,3 +1,11 @@
+# Archived
+
+This project is retired. Local Ghost and SummonGhost now use
+[agent-browser](https://agent-browser.dev/) through Bash against the owner's
+signed-in Chromium. Ghost no longer serves the relay or pairing API.
+The code and documentation below are historical; the side-panel agent is no
+longer maintained.
+
 # Ghost (Chromium extension)
 
 The extension is named **Ghost** — that is what Chrome shows in the side
